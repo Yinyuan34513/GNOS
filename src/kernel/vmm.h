@@ -45,6 +45,12 @@
  * pointer, and we refuse to touch it. */
 #define USER_LIMIT       0x0000800000000000ULL
 
+/* True if [p, p+len) lies entirely inside the user half.  A null pointer or
+ * a range that wraps/overruns USER_LIMIT is rejected -- this is the gate every
+ * syscall that touches a user buffer goes through.  Defined in vmm.c so the
+ * network ioctl path (net.c) can use it too. */
+int user_ptr_ok(uint64_t p, uint64_t len);
+
 typedef struct addrspace {
     uint64_t pml4_phys;
 } addrspace_t;
@@ -72,6 +78,10 @@ int vmm_alloc_range(addrspace_t *as, uint64_t vaddr, uint64_t size,
 
 /* Physical address backing `vaddr`, or 0 if unmapped. */
 uint64_t vmm_resolve(addrspace_t *as, uint64_t vaddr);
+
+/* Map a physical MMIO region into the kernel address space with the
+ * uncacheable attribute device registers require; returns its virtual base. */
+uint64_t vmm_map_mmio(uint64_t phys, uint64_t size);
 
 /* Drop the mapping for [vaddr, vaddr+size), freeing the backing frames.
  * 1 on success.  Intermediate page tables are left in place. */

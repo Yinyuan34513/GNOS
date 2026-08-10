@@ -42,3 +42,20 @@ echo GNOS rc: ttytest exited with status $?
 # lets a cut-off read() finish.  All of it is non-interactive.
 /bin/sigtest.elf
 echo GNOS rc: sigtest exited with status $?
+
+# ---- network bring-up (BusyBox tools) -----------------------------------
+# Every ping here is bounded by -c: BusyBox's fancy ping otherwise runs until
+# interrupted, and there is nobody at the keyboard during `make test`.  -W
+# bounds the wait for a reply too, so an unreachable address costs seconds
+# rather than hanging the boot.
+echo GNOS rc: networking
+/usr/bin/hostname -F /etc/hostname
+echo "--- hostname ---"
+/usr/bin/hostname
+/usr/bin/ifconfig -a
+echo "--- ping loopback ---"
+/usr/bin/ping -c2 -W2 127.0.0.1
+echo "--- ping gateway (QEMU user-net 10.0.2.2) ---"
+/usr/bin/ping -c2 -W2 10.0.2.2
+echo GNOS rc: networking done
+

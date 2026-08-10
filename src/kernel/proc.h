@@ -42,6 +42,7 @@ typedef enum {
     WAIT_CHILD,
     WAIT_TTY,
     WAIT_PIPE,
+    WAIT_NET,
 } wait_reason_t;
 
 /* Signal numbers, wait() flags and the rest of the user-visible constants
@@ -77,6 +78,12 @@ typedef struct proc {
     wait_reason_t wait_reason;
     int           wait_pid;         /* which child waitpid() is after, -1 = any */
     uint64_t      wake_tick;        /* timer tick to wake at, 0 = no deadline */
+
+    /* ITIMER_REAL, in scheduler ticks.  It counts wall-clock time, so unlike
+     * wake_tick it keeps running while the process is descheduled -- which is
+     * the point of alarm(): interrupting a call that is stuck. */
+    uint64_t      itimer_expire;    /* tick to raise SIGALRM at, 0 = off */
+    uint64_t      itimer_interval;  /* re-arm period in ticks, 0 = one-shot */
 
     addrspace_t  *as;
     uint64_t      kstack_top;

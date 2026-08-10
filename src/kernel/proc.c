@@ -913,6 +913,17 @@ void sched_expire_timeouts(void)
     uint64_t now = timer_ticks();
     for (int i = 0; i < MAX_PROCS; i++) {
         proc_t *p = &g_procs[i];
+
+        /* ITIMER_REAL fires regardless of what state its owner is in, so it
+         * is checked before the sleeper test rather than inside it.  Re-arm
+         * from `now` and not from the old deadline: a periodic timer whose
+         * process was starved should not then fire in a burst catching up. */
+        if (p->itimer_expire && now >= p->itimer_expire) {
+            p->itimer_expire = p->itimer_interval ? now + p->itimer_interval
+                                                  : 0;
+            proc_signal(p, SIGALRM);
+        }
+
         if (p->state == PROC_BLOCKED && p->wake_tick && now >= p->wake_tick)
             sched_wake(p);
     }

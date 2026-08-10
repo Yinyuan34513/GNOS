@@ -1,0 +1,10 @@
+# Minimal /etc/services — enough for the tools and daemons that probe it.
+ftp             21/tcp
+ssh             22/tcp
+telnet          23/tcp
+smtp            25/tcp
+domain          53/tcp
+domain          53/udp
+http            80/tcp
+https           443/tcp
+ntp             123/udp

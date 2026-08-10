@@ -16,4 +16,9 @@ void timer_init(unsigned hz);
 /* Ticks since boot. */
 uint64_t timer_ticks(void);
 
+/* Busy-wait for a real number of milliseconds.  Works before timer_init(),
+ * with interrupts still masked, because it polls PIT channel 2 rather than
+ * counting IRQ 0.  Drivers use it where a device specifies a settling time. */
+void timer_delay_ms(unsigned ms);
+
 #endif

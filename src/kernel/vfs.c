@@ -25,6 +25,7 @@
 #include "vfs.h"
 #include "ext2.h"
 #include "proc.h"
+#include "sock.h"
 #include "kstring.h"
 #include "debugcon.h"
 
@@ -352,6 +353,7 @@ static void fill_stat(const vfs_node_t *n, lstat_t *st)
     case VFS_DIR:      type = 0x4000; perms = 0755; break; /* S_IFDIR */
     case VFS_CHARDEV:  type = 0x2000; perms = 0600; break; /* S_IFCHR */
     case VFS_PIPE:     type = 0x1000; perms = 0600; break; /* S_IFIFO */
+    case VFS_SOCKET:   type = 0xC000; perms = 0777; break; /* S_IFSOCK */
     default:           type = 0x8000; perms = 0644; break; /* S_IFREG */
     }
     if ((n->e2.mode & 0x0FFF) != 0)
@@ -538,6 +540,20 @@ const vfs_ops_t *vfs_file_ops(int h)
     return f ? f->node.ops : NULL;
 }
 
+int vfs_file_flags(int h)
+{
+    vfs_file_t *f = get(h);
+    return f ? f->flags : 0;
+}
+
+void vfs_file_setfl(int h, int nonblock)
+{
+    vfs_file_t *f = get(h);
+    if (!f)
+        return;
+    f->flags = (f->flags & ~O_NONBLOCK) | (nonblock ? O_NONBLOCK : 0);
+}
+
 int vfs_chmod(const char *path, uint32_t mode)
 {
     vfs_node_t n;
@@ -599,6 +615,35 @@ int vfs_pipe(int *read_handle, int *write_handle)
     return 0;
 }
 
+/* read()/write() on a socket are recvfrom()/sendto() with no address; the
+ * socket index rides in node.priv, which is why sock.c can implement these
+ * two without ever seeing the open-file table. */
+static const vfs_ops_t g_sock_ops = { sock_node_read, sock_node_write };
+
+int vfs_socket(int sock_index)
+{
+    int h = slot_alloc();
+    if (h < 0)
+        return h;
+
+    memset(&g_files[h], 0, sizeof(g_files[h]));
+    g_files[h].refs  = 1;
+    g_files[h].flags = O_RDWR;
+    strncpy(g_files[h].node.name, "socket", VFS_NAME_MAX - 1);
+    g_files[h].node.kind = VFS_SOCKET;
+    g_files[h].node.ops  = &g_sock_ops;
+    g_files[h].node.priv = (void *)(uintptr_t)sock_index;
+    return h;
+}
+
+int vfs_file_sock(int h)
+{
+    vfs_file_t *f = get(h);
+    if (!f || f->node.kind != VFS_SOCKET)
+        return -1;
+    return (int)(uintptr_t)f->node.priv;
+}
+
 void vfs_file_ref(int h)
 {
     vfs_file_t *f = get(h);
@@ -620,6 +665,16 @@ void vfs_file_unref(int h)
     vfs_file_t *f = get(h);
     if (!f)
         return;
+
+    /* The last descriptor onto a socket closes it -- and for TCP that is not
+     * a bookkeeping detail, it is what sends the FIN. */
+    if (f->node.kind == VFS_SOCKET) {
+        if (--f->refs <= 0) {
+            f->refs = 0;
+            sock_close((int)(uintptr_t)f->node.priv);
+        }
+        return;
+    }
 
     if (f->node.kind == VFS_PIPE) {
         pipe_t *p = (pipe_t *)f->node.priv;
@@ -656,8 +711,11 @@ int32_t vfs_file_read(int h, void *buf, uint32_t len)
     if (!f->node.ops || !f->node.ops->read)
         return -E_INVAL;
 
+    /* Only files and directories have a position at all; a device, a pipe
+     * and a socket are streams, and advancing an offset on them would be
+     * inventing a number nobody can use. */
     int32_t n = f->node.ops->read(&f->node, f->pos, buf, len);
-    if (n > 0 && f->node.kind != VFS_CHARDEV && f->node.kind != VFS_PIPE)
+    if (n > 0 && (f->node.kind == VFS_FILE || f->node.kind == VFS_DIR))
         f->pos += (uint32_t)n;
     return n;
 }
@@ -673,7 +731,7 @@ int32_t vfs_file_write(int h, const void *buf, uint32_t len)
         return -E_INVAL;
 
     int32_t n = f->node.ops->write(&f->node, f->pos, buf, len);
-    if (n > 0 && f->node.kind != VFS_CHARDEV && f->node.kind != VFS_PIPE) {
+    if (n > 0 && (f->node.kind == VFS_FILE || f->node.kind == VFS_DIR)) {
         f->pos += (uint32_t)n;
         if (f->pos > f->node.size)
             f->node.size = f->pos;
@@ -686,7 +744,8 @@ int64_t vfs_file_seek(int h, int64_t off, int whence)
     vfs_file_t *f = get(h);
     if (!f)
         return -E_BADF;
-    if (f->node.kind == VFS_PIPE || f->node.kind == VFS_CHARDEV)
+    if (f->node.kind == VFS_PIPE || f->node.kind == VFS_CHARDEV ||
+        f->node.kind == VFS_SOCKET)
         return -E_INVAL;
 
     int64_t base;

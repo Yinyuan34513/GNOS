@@ -10,5 +10,6 @@ void dbg_putc(char c);
 void dbg_puts(const char *s);
 void dbg_puts_dec(uint32_t v);
 void dbg_puts_hex(uint64_t v);
+void dbg_puts_hexn(uint64_t v, int digits);
 
 #endif

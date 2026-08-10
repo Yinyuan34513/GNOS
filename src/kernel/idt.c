@@ -169,6 +169,19 @@ void isr_dispatch(regs_t *r)
             dbg_puts_dec((uint32_t)r->vector);
             dbg_puts(" rip=");
             dbg_puts_hex(r->rip);
+            /* CR2 and the stack say far more than RIP alone: a jump through a
+             * null function pointer and a wild data write both arrive here as
+             * "vector=14", and only the faulting address tells them apart. */
+            if (r->vector == 14) {
+                uint64_t cr2;
+                asm volatile("mov %%cr2, %0" : "=r"(cr2));
+                dbg_puts(" cr2=");
+                dbg_puts_hex(cr2);
+                dbg_puts(" err=");
+                dbg_puts_hex(r->errcode);
+            }
+            dbg_puts(" rsp=");
+            dbg_puts_hex(r->rsp);
             dbg_puts("\r\n");
             proc_signal(proc_current(), SIGSEGV);
             proc_check_signals(r);

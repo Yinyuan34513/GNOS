@@ -13,6 +13,8 @@
 #define PTE_P    0x001
 #define PTE_RW   0x002
 #define PTE_U    0x004
+#define PTE_PWT  0x008   /* write-through */
+#define PTE_PCD  0x010   /* cache-disable (set => uncacheable) */
 #define PTE_PS   0x080
 #define PTE_NX   (1ULL << 63)
 #define PTE_ADDR 0x000FFFFFFFFFF000ULL
@@ -222,6 +224,40 @@ uint64_t vmm_resolve(addrspace_t *as, uint64_t vaddr)
     return (*pte & PTE_ADDR) + (vaddr & 0xFFF);
 }
 
+/*
+ * Map a physical MMIO region into the kernel's own address space with the
+ * cache-disable (uncacheable) attribute device registers need, and return
+ * its virtual base.  Device registers must not be cached or writes can be
+ * coalesced/lost and reads can return stale values -- the HHDM direct map is
+ * write-back, so it is wrong for this.  We carve a private virtual arena
+ * above the HHDM and page the region in one page at a time.
+ */
+#define MMIO_BASE  0xFFFFA00000000000ULL
+uint64_t vmm_map_mmio(uint64_t phys, uint64_t size)
+{
+    static uint64_t mmio_next = MMIO_BASE;
+
+    /* A bad BAR-sizing calculation produces an enormous "size", and mapping
+     * it would eat every free frame on page tables before failing.  No device
+     * we drive needs more than a few hundred KiB of registers. */
+    if (size == 0 || size > (16ULL << 20))
+        return 0;
+
+    uint64_t base = mmio_next;
+    mmio_next += (size + 0xFFF) & ~0xFFFULL;
+
+    addrspace_t k = { .pml4_phys = g_kernel_pml4_phys };
+    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
+        uint64_t *pte = walk(&k, (base + off) & ~0xFFFULL, 1, 0);
+        if (!pte)
+            return 0;
+        *pte = ((phys + off) & PTE_ADDR) | PTE_P | PTE_RW | PTE_PCD |
+               PTE_PWT | PTE_NX;
+        asm volatile("invlpg (%0)" :: "r"(base + off) : "memory");
+    }
+    return base;
+}
+
 int vmm_unmap(addrspace_t *as, uint64_t vaddr, uint64_t size)
 {
     uint64_t start = vaddr & ~0xFFFULL;
@@ -285,6 +321,15 @@ int vmm_copy_to_user(addrspace_t *as, uint64_t dst, const void *src, uint64_t n)
         n   -= chunk;
     }
     return 1;
+}
+
+int user_ptr_ok(uint64_t p, uint64_t len)
+{
+    if (p == 0)
+        return 0;
+    if (p >= USER_LIMIT || len > USER_LIMIT)
+        return 0;
+    return p + len <= USER_LIMIT;
 }
 
 /* Recursively release the lower half of a page-table tree. */

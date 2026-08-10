@@ -18,6 +18,8 @@
 #include "gdt.h"
 #include "vfs.h"
 #include "proc.h"
+#include "sock.h"
+#include "net.h"
 #include "signal.h"
 #include "vmm.h"
 #include "tty.h"
@@ -40,14 +42,8 @@ static void wrmsr(uint32_t msr, uint64_t val)
 
 #define MAX_ARGV    16
 
-static int user_ptr_ok(uint64_t p, uint64_t len)
-{
-    if (p == 0)
-        return 0;
-    if (p >= USER_LIMIT || len > USER_LIMIT)
-        return 0;
-    return p + len <= USER_LIMIT;
-}
+/* user_ptr_ok() now lives in vmm.c (the network ioctl path needs it too);
+ * it is declared in vmm.h, which this file includes. */
 
 /* ---- path resolution --------------------------------------------------
  *
@@ -256,8 +252,25 @@ static int64_t sys_fcntl(int fd, int cmd, uint64_t arg)
     }
     case F_GETFD:  return 0;          /* no FD_CLOEXEC tracking yet */
     case F_SETFD:  return 0;
-    case F_GETFL:  return 0;          /* access mode only caller cares about */
-    case F_SETFL:  return 0;
+    case F_GETFL: {
+        /* Access mode (the low two bits) plus, for sockets, the O_NONBLOCK
+         * bit that lives in the socket itself.  musl and BusyBox read this to
+         * decide whether a connect()/accept()/recv() will block. */
+        int fl = vfs_file_flags(h) & 3;
+        int s = vfs_file_sock(h);
+        if (s >= 0 && sock_is_nonblock(s))
+            fl |= O_NONBLOCK;
+        return fl;
+    }
+    case F_SETFL: {
+        int s = vfs_file_sock(h);
+        if (s >= 0)
+            sock_set_nonblock(s, (arg & O_NONBLOCK) != 0);
+        /* Track O_NONBLOCK the same way the kernel does for files: keep the
+         * access mode and flip only the settable bit. */
+        vfs_file_setfl(h, (int)(arg & O_NONBLOCK));
+        return 0;
+    }
     default:       return -E_NOSYS;
     }
 }
@@ -432,6 +445,10 @@ static int64_t sys_getcwd(uint64_t ubuf, uint64_t size)
 }
 
 /* ---- odds and ends a full libc expects -------------------------------- */
+/* Hostname, a single small buffer.  Processes are all root here, so there is
+ * no permission check to skip. */
+static char g_hostname[64] = "gnos";
+
 /*
  * uname(63).  The strings are what a program prints, and occasionally what a
  * configure-style script branches on, so they name this kernel honestly
@@ -445,11 +462,152 @@ static int64_t sys_uname(uint64_t ubuf)
     utsname_t *u = (utsname_t *)(uintptr_t)ubuf;
     memset(u, 0, sizeof(*u));
     strncpy(u->sysname,  "GNOS",     UTS_LEN - 1);
-    strncpy(u->nodename, "gnos",     UTS_LEN - 1);
+    strncpy(u->nodename, g_hostname,  UTS_LEN - 1);
     strncpy(u->release,  "0.1",       UTS_LEN - 1);
     strncpy(u->version,  "GNOS 0.1", UTS_LEN - 1);
     strncpy(u->machine,  "x86_64",    UTS_LEN - 1);
     return 0;
+}
+
+static int64_t sys_sethostname(uint64_t uname, uint64_t len)
+{
+    if (len > sizeof(g_hostname) - 1)
+        return -E_INVAL;
+    if (!user_ptr_ok(uname, len))
+        return -E_FAULT;
+    memset(g_hostname, 0, sizeof(g_hostname));
+    memcpy(g_hostname, (const void *)(uintptr_t)uname, len);
+    /* Drop a trailing NUL if the caller included one. */
+    if (len && g_hostname[len - 1] == '\0')
+        g_hostname[len - 1] = '\0';
+    return 0;
+}
+
+static int64_t sys_gethostname(uint64_t ubuf, uint64_t sz)
+{
+    if (sz < 1)
+        return -E_INVAL;
+    if (!user_ptr_ok(ubuf, 1))
+        return -E_FAULT;
+    size_t n = strlen(g_hostname);
+    size_t copy = (n < (size_t)sz) ? n : (size_t)sz - 1;
+    char *u = (char *)(uintptr_t)ubuf;
+    memcpy(u, g_hostname, copy);
+    if (copy < (size_t)sz)
+        u[copy] = '\0';
+    return 0;
+}
+
+/* ---- interval timers --------------------------------------------------
+ * setitimer(38)/getitimer(36)/alarm(37), ITIMER_REAL only.
+ *
+ * musl has no alarm(2) on x86-64 -- it writes alarm() in terms of
+ * setitimer(ITIMER_REAL) -- so without 38 a program as ordinary as `ping`
+ * dies on ENOSYS before it sends a packet.  ITIMER_VIRTUAL and ITIMER_PROF
+ * need per-process CPU-time accounting the scheduler does not keep, so they
+ * are refused outright rather than quietly aliased onto real time, which
+ * would make a profiler report confident nonsense.
+ */
+#define ITIMER_REAL     0
+
+typedef struct { int64_t tv_sec; int64_t tv_usec; } ktimeval_t;
+typedef struct { ktimeval_t it_interval; ktimeval_t it_value; } kitimerval_t;
+
+/* A tick is 10 ms (SCHED_HZ is 100).  Round up: a sub-tick delay truncated to
+ * zero would read back as "disarmed" and the signal would never arrive. */
+static uint64_t tv_to_ticks(const ktimeval_t *tv)
+{
+    return (uint64_t)tv->tv_sec * 100 + ((uint64_t)tv->tv_usec + 9999) / 10000;
+}
+
+static void ticks_to_tv(uint64_t ticks, ktimeval_t *tv)
+{
+    tv->tv_sec  = (int64_t)(ticks / 100);
+    tv->tv_usec = (int64_t)(ticks % 100) * 10000;
+}
+
+/* How long is left on p's timer, in ticks; 0 when it is not armed. */
+static uint64_t itimer_remaining(const proc_t *p, uint64_t now)
+{
+    if (!p->itimer_expire || p->itimer_expire <= now)
+        return 0;
+    return p->itimer_expire - now;
+}
+
+static int64_t sys_setitimer(uint64_t which, uint64_t unew, uint64_t uold)
+{
+    if (which != ITIMER_REAL)
+        return -E_INVAL;
+
+    proc_t *p = proc_current();
+    if (!p)
+        return -E_INVAL;
+
+    /* Copy the new setting in before writing the old one out: callers are
+     * allowed to pass the same buffer for both, and overwriting it first
+     * would arm the timer from the value we just clobbered. */
+    kitimerval_t nv;
+    if (unew) {
+        if (!user_ptr_ok(unew, sizeof(nv)))
+            return -E_FAULT;
+        memcpy(&nv, (const void *)(uintptr_t)unew, sizeof(nv));
+        if (nv.it_value.tv_sec < 0 || nv.it_value.tv_usec < 0 ||
+            nv.it_interval.tv_sec < 0 || nv.it_interval.tv_usec < 0 ||
+            nv.it_value.tv_usec >= 1000000 || nv.it_interval.tv_usec >= 1000000)
+            return -E_INVAL;
+    }
+
+    uint64_t now = timer_ticks();
+
+    if (uold) {
+        if (!user_ptr_ok(uold, sizeof(kitimerval_t)))
+            return -E_FAULT;
+        kitimerval_t ov;
+        ticks_to_tv(itimer_remaining(p, now), &ov.it_value);
+        ticks_to_tv(p->itimer_interval, &ov.it_interval);
+        memcpy((void *)(uintptr_t)uold, &ov, sizeof(ov));
+    }
+
+    if (unew) {
+        uint64_t val = tv_to_ticks(&nv.it_value);
+        p->itimer_interval = tv_to_ticks(&nv.it_interval);
+        p->itimer_expire   = val ? now + val : 0;
+    }
+    return 0;
+}
+
+static int64_t sys_getitimer(uint64_t which, uint64_t ucur)
+{
+    if (which != ITIMER_REAL)
+        return -E_INVAL;
+    if (!user_ptr_ok(ucur, sizeof(kitimerval_t)))
+        return -E_FAULT;
+
+    proc_t *p = proc_current();
+    if (!p)
+        return -E_INVAL;
+
+    kitimerval_t cur;
+    ticks_to_tv(itimer_remaining(p, timer_ticks()), &cur.it_value);
+    ticks_to_tv(p->itimer_interval, &cur.it_interval);
+    memcpy((void *)(uintptr_t)ucur, &cur, sizeof(cur));
+    return 0;
+}
+
+/* alarm(37).  Returns the seconds left on the previous alarm, rounded up as
+ * Linux does, so `remaining = alarm(0)` never reports 0 for a live timer. */
+static int64_t sys_alarm(uint64_t seconds)
+{
+    proc_t *p = proc_current();
+    if (!p)
+        return -E_INVAL;
+
+    uint64_t now  = timer_ticks();
+    uint64_t left = (itimer_remaining(p, now) + 99) / 100;
+
+    p->itimer_interval = 0;
+    p->itimer_expire   = seconds ? now + seconds * 100 : 0;
+    return (int64_t)left;
 }
 
 /* umask(95): remembered and inherited, but never enforced -- we have no
@@ -541,6 +699,281 @@ static int64_t sys_pipe(uint64_t ufds)
     return 0;
 }
 
+/* ---- sockets -----------------------------------------------------------
+ *
+ * This is a translation layer and nothing else: user pointers become kernel
+ * values, network byte order becomes host order, and a socket index becomes a
+ * file descriptor.  Every decision about what a socket *does* lives in sock.c.
+ *
+ * Two of Linux's conventions are worth naming, because both are easy to get
+ * subtly wrong and neither fails loudly.  First, an address length arrives by
+ * value on the way in (bind, connect, sendto) but by pointer on the way out
+ * (accept, recvfrom, getsockname), because the out direction has to say how
+ * much room the answer needed.  Second, what it reports is the *full* size of
+ * the address even when the caller's buffer was too small: the address gets
+ * truncated, the length does not.  getaddrinfo() checks that number.
+ */
+
+/* fd -> socket index, or a negative errno.  ENOTSOCK rather than EBADF for a
+ * descriptor that exists but is a file: that distinction is the only clue a
+ * program gets that it passed the wrong fd rather than a closed one. */
+static int fd_sock(int fd)
+{
+    int h = fd_handle(fd);
+    if (h < 0)
+        return -E_BADF;
+    int s = vfs_file_sock(h);
+    return s < 0 ? -E_NOTSOCK : s;
+}
+
+/* Read a sockaddr_in in; `alen` is a plain length. */
+static int sa_in(uint64_t uaddr, uint64_t alen, uint32_t *ip, uint16_t *port)
+{
+    if (!uaddr || alen < sizeof(sockaddr_in_t))
+        return -E_INVAL;
+    if (!user_ptr_ok(uaddr, sizeof(sockaddr_in_t)))
+        return -E_FAULT;
+
+    sockaddr_in_t sa;
+    memcpy(&sa, (const void *)(uintptr_t)uaddr, sizeof(sa));
+    if (sa.sin_family != AF_INET)
+        return -E_AFNOSUPPORT;
+
+    *ip   = net_ntohl(sa.sin_addr);
+    *port = net_ntohs(sa.sin_port);
+    return 0;
+}
+
+/* Write a sockaddr_in out.  A null address or length pointer is not an
+ * error: it is how accept() and recvfrom() say "I do not care who it was". */
+static int sa_out(uint64_t uaddr, uint64_t ualen, uint32_t ip, uint16_t port)
+{
+    if (!uaddr || !ualen)
+        return 0;
+    if (!user_ptr_ok(ualen, sizeof(uint32_t)))
+        return -E_FAULT;
+
+    uint32_t room;
+    memcpy(&room, (const void *)(uintptr_t)ualen, sizeof(room));
+    if (room > sizeof(sockaddr_in_t))
+        room = (uint32_t)sizeof(sockaddr_in_t);
+    if (room && !user_ptr_ok(uaddr, room))
+        return -E_FAULT;
+
+    sockaddr_in_t sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port   = net_htons(port);
+    sa.sin_addr   = net_htonl(ip);
+    if (room)
+        memcpy((void *)(uintptr_t)uaddr, &sa, room);
+
+    uint32_t full = (uint32_t)sizeof(sockaddr_in_t);
+    memcpy((void *)(uintptr_t)ualen, &full, sizeof(full));
+    return 0;
+}
+
+/*
+ * Hand a freshly created socket to the process.  On failure the socket is
+ * closed here rather than leaked: by this point it may already own a TCP
+ * connection, and nobody else has a name for it.
+ */
+static int64_t sock_to_fd(int s)
+{
+    proc_t *p = proc_current();
+    if (!p) {
+        sock_close(s);
+        return -E_INVAL;
+    }
+
+    int h = vfs_socket(s);
+    if (h < 0) {
+        sock_close(s);
+        return h;
+    }
+
+    int fd = fd_alloc(p, h);
+    if (fd < 0) {
+        vfs_file_unref(h);            /* the last unref closes the socket */
+        return fd;
+    }
+    return fd;
+}
+
+static int64_t sys_socket(int domain, int type, int protocol)
+{
+    int s = sock_create(domain, type, protocol);
+    if (s < 0)
+        return s;
+    return sock_to_fd(s);
+}
+
+static int64_t sys_bind(int fd, uint64_t uaddr, uint64_t alen)
+{
+    int s = fd_sock(fd);
+    if (s < 0)
+        return s;
+
+    uint32_t ip;
+    uint16_t port;
+    int r = sa_in(uaddr, alen, &ip, &port);
+    return r < 0 ? r : sock_bind(s, ip, port);
+}
+
+static int64_t sys_connect(int fd, uint64_t uaddr, uint64_t alen)
+{
+    int s = fd_sock(fd);
+    if (s < 0)
+        return s;
+
+    uint32_t ip;
+    uint16_t port;
+    int r = sa_in(uaddr, alen, &ip, &port);
+    return r < 0 ? r : sock_connect(s, ip, port);
+}
+
+static int64_t sys_listen(int fd, int backlog)
+{
+    int s = fd_sock(fd);
+    return s < 0 ? s : sock_listen(s, backlog);
+}
+
+/* accept(43) is accept4(288) with no flags. */
+static int64_t sys_accept(int fd, uint64_t uaddr, uint64_t ualen, int flags)
+{
+    int s = fd_sock(fd);
+    if (s < 0)
+        return s;
+
+    uint32_t ip   = 0;
+    uint16_t port = 0;
+    int ns = sock_accept(s, &ip, &port);
+    if (ns < 0)
+        return ns;
+    if (flags & SOCK_NONBLOCK)
+        sock_set_nonblock(ns, 1);
+
+    int64_t nfd = sock_to_fd(ns);
+    if (nfd < 0)
+        return nfd;
+
+    /* The connection is up and the descriptor exists; a bad address pointer
+     * cannot un-accept either, so the fd is the answer regardless. */
+    sa_out(uaddr, ualen, ip, port);
+    return nfd;
+}
+
+static int64_t sys_sendto(int fd, uint64_t ubuf, uint64_t len, int flags,
+                          uint64_t uaddr, uint64_t alen)
+{
+    int s = fd_sock(fd);
+    if (s < 0)
+        return s;
+    if (len && !user_ptr_ok(ubuf, len))
+        return -E_FAULT;
+
+    uint32_t ip   = 0;
+    uint16_t port = 0;
+    if (uaddr) {
+        int r = sa_in(uaddr, alen, &ip, &port);
+        if (r < 0)
+            return r;
+    }
+    return sock_sendto(s, (const void *)(uintptr_t)ubuf, (uint32_t)len, flags,
+                       ip, port);
+}
+
+static int64_t sys_recvfrom(int fd, uint64_t ubuf, uint64_t len, int flags,
+                            uint64_t uaddr, uint64_t ualen)
+{
+    int s = fd_sock(fd);
+    if (s < 0)
+        return s;
+    if (len && !user_ptr_ok(ubuf, len))
+        return -E_FAULT;
+
+    uint32_t ip   = 0;
+    uint16_t port = 0;
+    int n = sock_recvfrom(s, (void *)(uintptr_t)ubuf, (uint32_t)len, flags,
+                          &ip, &port);
+    if (n < 0)
+        return n;
+
+    int r = sa_out(uaddr, ualen, ip, port);
+    return r < 0 ? r : n;
+}
+
+static int64_t sys_shutdown(int fd, int how)
+{
+    int s = fd_sock(fd);
+    return s < 0 ? s : sock_shutdown(s, how);
+}
+
+/* getsockname(51) and getpeername(52) differ only in which end they name. */
+static int64_t sys_getsockname(int fd, uint64_t uaddr, uint64_t ualen, int peer)
+{
+    int s = fd_sock(fd);
+    if (s < 0)
+        return s;
+    if (!uaddr || !ualen)
+        return -E_INVAL;
+
+    uint32_t ip   = 0;
+    uint16_t port = 0;
+    int r = sock_getname(s, &ip, &port, peer);
+    return r < 0 ? r : sa_out(uaddr, ualen, ip, port);
+}
+
+/* Option values are small -- every one anybody sets is an int -- so a fixed
+ * bounce buffer is enough and keeps user memory out of sock.c entirely. */
+#define SOCKOPT_MAX 128
+
+static int64_t sys_setsockopt(int fd, int level, int name, uint64_t uval,
+                              uint64_t len)
+{
+    int s = fd_sock(fd);
+    if (s < 0)
+        return s;
+    if (len > SOCKOPT_MAX)
+        return -E_INVAL;
+    if (len && !user_ptr_ok(uval, len))
+        return -E_FAULT;
+
+    uint8_t tmp[SOCKOPT_MAX];
+    if (len)
+        memcpy(tmp, (const void *)(uintptr_t)uval, (uint32_t)len);
+    return sock_setsockopt(s, level, name, tmp, (uint32_t)len);
+}
+
+static int64_t sys_getsockopt(int fd, int level, int name, uint64_t uval,
+                              uint64_t ulen)
+{
+    int s = fd_sock(fd);
+    if (s < 0)
+        return s;
+    if (!user_ptr_ok(ulen, sizeof(uint32_t)))
+        return -E_FAULT;
+
+    uint32_t room;
+    memcpy(&room, (const void *)(uintptr_t)ulen, sizeof(room));
+    if (room > SOCKOPT_MAX)
+        room = SOCKOPT_MAX;
+    if (!user_ptr_ok(uval, room))
+        return -E_FAULT;
+
+    uint8_t  tmp[SOCKOPT_MAX];
+    uint32_t got = room;
+    int r = sock_getsockopt(s, level, name, tmp, &got);
+    if (r < 0)
+        return r;
+
+    if (got > room)
+        got = room;
+    memcpy((void *)(uintptr_t)uval, tmp, got);
+    memcpy((void *)(uintptr_t)ulen, &got, sizeof(got));
+    return 0;
+}
+
 /* ---- execve argument vector ------------------------------------------- */
 /*
  * Validate the user's argv and flatten it into a kernel-side array of
@@ -615,45 +1048,31 @@ static int64_t sys_tgkill(int tgid, int tid, int sig)
 }
 
 /*
- * poll(7) / ppoll(271): the only event sources this teaching OS has are the
- * keyboard tty and pipes, so "is this fd readable?" is all we ever answer.
- * We report POLLIN/POLLHUP/POLLNVAL only -- POLLOUT on the tty is never the
- * point of a poll here, and busybox ash's line editor polls the terminal for
- * readability and then reads it (which blocks) on return.
+ * poll(7) / ppoll(271) / select(23).  The event sources are the keyboard
+ * tty, pipes and sockets; everything else (a file on disk) is always ready,
+ * because a read of it cannot block.
  *
- * `utmo` is either NULL (block forever) or a struct timespec {sec, nsec}.  A
- * zero timespec means "return immediately", which is how non-blocking callers
- * probe for input.  `sigset` (the ppoll sigmask) is ignored: we deliver
- * signals on the normal return-to-user path regardless.
+ * This is the shared core: `p` points at `nfds` pollfd records of the layout
+ * {int32_t fd; int16_t events; int16_t revents} (8 bytes each).  The caller
+ * has already made the buffer readable -- sys_ppoll/sys_poll pass a user
+ * buffer (the kernel reads user memory directly), while sys_select passes a
+ * kernel scratch array it built itself, so no user_ptr_ok check belongs here.
+ * `ticks` is the timeout in timer ticks; -1 means wait forever, 0 means probe
+ * and return immediately.
  */
-static int64_t sys_ppoll(uint64_t ufds, uint64_t nfds, uint64_t utmo, uint64_t sigset)
+static int64_t do_ppoll(uint8_t *p, uint64_t nfds, int64_t ticks)
 {
-    (void)sigset;
     if (nfds > 4096)
         nfds = 4096;
     if (nfds == 0)
         return 0;
-    if (!user_ptr_ok(ufds, nfds * 8))
-        return -E_INVAL;
-
-    /* Convert the optional timeout into timer ticks (100 Hz).  -1 == infinite. */
-    int64_t ticks = -1;
-    if (utmo) {
-        struct { int64_t tv_sec; int64_t tv_nsec; } ts;
-        if (!user_ptr_ok(utmo, sizeof(ts)))
-            return -E_INVAL;
-        memcpy(&ts, (const void *)(uintptr_t)utmo, sizeof(ts));
-        if (ts.tv_sec == 0 && ts.tv_nsec == 0)
-            ticks = 0;                 /* poll-now: never block */
-        else
-            ticks = (int64_t)ts.tv_sec * 100 + (int64_t)ts.tv_nsec / 10000000;
-    }
 
     int64_t ready = 0;
     for (;;) {
         int wait_tty = 0;
+        int wait_net = 0;
         ready = 0;
-        uint8_t *p = (uint8_t *)(uintptr_t)ufds;
+        net_poll();                   /* fold any received packet into socket buffers */
         for (uint64_t i = 0; i < nfds; i++) {
             int32_t  fd = *(int32_t  *)(p + i*8 + 0);
             int16_t  ev = *(int16_t  *)(p + i*8 + 4);
@@ -675,6 +1094,13 @@ static int64_t sys_ppoll(uint64_t ufds, uint64_t nfds, uint64_t utmo, uint64_t s
                     } else if (kind == VFS_PIPE) {
                         if (vfs_pipe_readable(h))
                             r = POLLIN;
+                    } else if (kind == VFS_SOCKET) {
+                        int s = vfs_file_sock(h);
+                        if (s >= 0) {
+                            if ((ev & POLLIN)  && sock_readable(s))  r |= POLLIN;
+                            if ((ev & POLLOUT) && sock_writable(s))  r |= POLLOUT;
+                        }
+                        wait_net = 1;
                     } else {
                         /* regular files are always readable/writable */
                         r = (int16_t)(ev & (POLLIN | POLLOUT));
@@ -700,6 +1126,8 @@ static int64_t sys_ppoll(uint64_t ufds, uint64_t nfds, uint64_t utmo, uint64_t s
 
         if (wait_tty)
             sched_block_timeout(WAIT_TTY, ticks < 0 ? 0 : (uint64_t)ticks);
+        else if (wait_net)
+            sched_block_timeout(WAIT_NET, ticks < 0 ? 0 : (uint64_t)ticks);
         else
             sched_block_timeout(WAIT_PIPE, ticks < 0 ? 0 : (uint64_t)ticks);
 
@@ -710,17 +1138,138 @@ static int64_t sys_ppoll(uint64_t ufds, uint64_t nfds, uint64_t utmo, uint64_t s
     return ready;
 }
 
+/* Convert a ppoll timespec (user pointer, possibly NULL) into timer ticks.
+ * -1 == wait forever, 0 == probe only.  Returns a negative errno on a bad
+ * user pointer. */
+static int ppoll_timeout(uint64_t utmo, int64_t *ticks)
+{
+    *ticks = -1;
+    if (!utmo)
+        return 0;
+    if (!user_ptr_ok(utmo, 16))
+        return -E_INVAL;
+    struct { int64_t tv_sec; int64_t tv_nsec; } ts;
+    memcpy(&ts, (const void *)(uintptr_t)utmo, sizeof(ts));
+    if (ts.tv_sec == 0 && ts.tv_nsec == 0)
+        *ticks = 0;
+    else
+        *ticks = (int64_t)ts.tv_sec * 100 + (int64_t)ts.tv_nsec / 10000000;
+    return 0;
+}
+
+static int64_t sys_ppoll(uint64_t ufds, uint64_t nfds, uint64_t utmo, uint64_t sigset)
+{
+    (void)sigset;
+    if (nfds > 4096)
+        nfds = 4096;
+    if (nfds == 0)
+        return 0;
+    if (!user_ptr_ok(ufds, nfds * 8))
+        return -E_INVAL;
+
+    int64_t ticks;
+    int e = ppoll_timeout(utmo, &ticks);
+    if (e < 0)
+        return e;
+
+    /* The buffer stays user memory; do_ppoll reads it via the direct mapping. */
+    return do_ppoll((uint8_t *)(uintptr_t)ufds, nfds, ticks);
+}
+
 /* poll(7) is ppoll(271) with a millisecond timeout instead of a timespec.
  * -1 means infinite, otherwise it is rounded up to one tick. */
 static int64_t sys_poll(uint64_t ufds, uint64_t nfds, int64_t ms)
 {
+    int64_t ticks;
     if (ms < 0)
-        return sys_ppoll(ufds, nfds, 0, 0);   /* NULL timespec => block forever */
+        ticks = -1;
+    else if (ms == 0)
+        ticks = 0;
+    else
+        ticks = (ms + 9) / 10;        /* rounding up to one tick (100 Hz) */
+    return do_ppoll((uint8_t *)(uintptr_t)ufds, nfds, ticks);
+}
 
-    struct { int64_t tv_sec; int64_t tv_nsec; } ts;
-    ts.tv_sec  = ms / 1000;
-    ts.tv_nsec = (ms % 1000) * 1000000;
-    return sys_ppoll(ufds, nfds, (uint64_t)(uintptr_t)&ts, 0);
+/*
+ * select(23) -- the call BusyBox nc/wget actually make.  musl's select() is a
+ * real syscall on x86-64 (not multiplexed), and it takes three fd_sets (read,
+ * write, except) each 128 bytes of 1024 bits, plus a struct timeval
+ * {long tv_sec; long tv_usec}.
+ *
+ * We translate the fd_sets to a pollfd array (in kernel scratch), run the same
+ * scan/block core as poll, then write the ready bits back in place.  exceptfds
+ * are never generated by anything we report, so they come back empty -- which
+ * is exactly what these tools expect.
+ */
+typedef uint64_t fdset_t[16];          /* 1024 bits, the layout musl uses */
+
+static inline int  fdset_get(const fdset_t *s, int fd)
+{
+    if (fd < 0 || fd >= 1024) return 0;
+    return (int)(((*s)[fd / 64] >> (fd % 64)) & 1u);
+}
+static inline void fdset_set(fdset_t *s, int fd)
+{
+    if (fd < 0 || fd >= 1024) return;
+    (*s)[fd / 64] |= (1ull << (fd % 64));
+}
+
+static int64_t sys_select(int nfds, uint64_t ur, uint64_t uw, uint64_t ue,
+                          uint64_t utv)
+{
+    if (nfds < 0)
+        return -E_INVAL;
+    if (nfds > PROC_MAX_FD)
+        nfds = PROC_MAX_FD;
+
+    /* Read the caller's masks once; select writes the result back in place. */
+    fdset_t in_r = {0}, in_w = {0};
+    if (ur && !user_ptr_ok(ur, sizeof(fdset_t))) return -E_FAULT;
+    if (uw && !user_ptr_ok(uw, sizeof(fdset_t))) return -E_FAULT;
+    if (ue && !user_ptr_ok(ue, sizeof(fdset_t))) return -E_FAULT;
+    if (ur) memcpy(&in_r, (const void *)(uintptr_t)ur, sizeof(in_r));
+    if (uw) memcpy(&in_w, (const void *)(uintptr_t)uw, sizeof(in_w));
+
+    /* Build a pollfd array in kernel scratch. */
+    uint8_t pbuf[PROC_MAX_FD * 8];
+    for (int i = 0; i < nfds; i++) {
+        uint16_t ev = 0;
+        if (fdset_get(&in_r, i)) ev |= POLLIN;
+        if (fdset_get(&in_w, i)) ev |= POLLOUT;
+        *(int32_t *)(pbuf + i*8 + 0) = i;
+        *(int16_t *)(pbuf + i*8 + 4) = (int16_t)ev;
+        *(int16_t *)(pbuf + i*8 + 6) = 0;
+    }
+
+    /* Translate the timeval (NULL => block forever) into timer ticks. */
+    int64_t ticks = -1;
+    if (utv) {
+        struct { int64_t tv_sec; int64_t tv_usec; } tv;
+        if (!user_ptr_ok(utv, sizeof(tv)))
+            return -E_FAULT;
+        memcpy(&tv, (const void *)(uintptr_t)utv, sizeof(tv));
+        if (tv.tv_sec == 0 && tv.tv_usec == 0)
+            ticks = 0;
+        else
+            ticks = (int64_t)tv.tv_sec * 100 + (int64_t)tv.tv_usec / 10000;
+    }
+
+    int64_t r = do_ppoll(pbuf, (uint64_t)nfds, ticks);
+    if (r < 0)
+        return r;
+
+    /* Clear the user masks and set the bits for descriptors that are ready. */
+    fdset_t out_r = {0}, out_w = {0};
+    for (int i = 0; i < nfds; i++) {
+        int16_t rev = *(int16_t *)(pbuf + i*8 + 6);
+        if (rev & POLLIN)  fdset_set(&out_r, i);
+        if (rev & POLLOUT) fdset_set(&out_w, i);
+    }
+    if (ur) memcpy((void *)(uintptr_t)ur, &out_r, sizeof(out_r));
+    if (uw) memcpy((void *)(uintptr_t)uw, &out_w, sizeof(out_w));
+    /* exceptfds (ue) is left cleared: we never report exceptional conditions */
+    (void)ue;
+    return r;
 }
 
 /*
@@ -794,6 +1343,9 @@ static int64_t sys_ioctl(int fd, uint64_t cmd, uint64_t arg)
     int h = fd_handle(fd);
     if (h < 0)
         return -E_BADF;
+    /* A socket fd carries the SIOC* family of ioctls ifconfig/route use. */
+    if (vfs_file_kind(h) == VFS_SOCKET)
+        return net_if_ioctl(cmd, arg);
     if (vfs_file_ops(h) != (const vfs_ops_t *)tty_ops())
         return -E_NOTTY;
 
@@ -1373,6 +1925,26 @@ void syscall_handler(regs_t *r)
         ret = sys_uname(a1);
         break;
 
+    case SYS_gethostname:
+        ret = sys_gethostname(a1, a2);
+        break;
+
+    case SYS_sethostname:
+        ret = sys_sethostname(a1, a2);
+        break;
+
+    case SYS_setitimer:
+        ret = sys_setitimer(a1, a2, a3);
+        break;
+
+    case SYS_getitimer:
+        ret = sys_getitimer(a1, a2);
+        break;
+
+    case SYS_alarm:
+        ret = sys_alarm(a1);
+        break;
+
     case SYS_umask:
         ret = sys_umask((uint32_t)a1);
         break;
@@ -1452,6 +2024,54 @@ void syscall_handler(regs_t *r)
 
     case SYS_poll:
         ret = sys_poll(a1, a2, (int64_t)a3);
+        break;
+
+    /* ---- BSD socket API (x86-64: one syscall per call, no socketcall) ---- */
+    case SYS_socket:
+        ret = sys_socket((int)a1, (int)a2, (int)a3);
+        break;
+    case SYS_bind:
+        ret = sys_bind((int)a1, a2, a3);
+        break;
+    case SYS_connect:
+        ret = sys_connect((int)a1, a2, a3);
+        break;
+    case SYS_listen:
+        ret = sys_listen((int)a1, (int)a2);
+        break;
+    case SYS_accept:
+        ret = sys_accept((int)a1, a2, a3, 0);
+        break;
+    case SYS_accept4:
+        ret = sys_accept((int)a1, a2, a3, (int)r->r10);
+        break;
+    case SYS_sendto:
+        /* arg order: fd, buf, len, flags, addr, addrlen */
+        ret = sys_sendto((int)a1, a2, a3, (int)r->r10, r->r8, r->r9);
+        break;
+    case SYS_recvfrom:
+        /* arg order: fd, buf, len, flags, addr, addrlen */
+        ret = sys_recvfrom((int)a1, a2, a3, (int)r->r10, r->r8, r->r9);
+        break;
+    case SYS_shutdown:
+        ret = sys_shutdown((int)a1, (int)a2);
+        break;
+    case SYS_getsockname:
+        ret = sys_getsockname((int)a1, a2, a3, 0);
+        break;
+    case SYS_getpeername:
+        ret = sys_getsockname((int)a1, a2, a3, 1);
+        break;
+    case SYS_setsockopt:
+        ret = sys_setsockopt((int)a1, (int)a2, (int)a3, r->r10, r->r8);
+        break;
+    case SYS_getsockopt:
+        ret = sys_getsockopt((int)a1, (int)a2, (int)a3, r->r10, r->r8);
+        break;
+    case SYS_select:
+        /* int select(int nfds, fd_set *rfds, fd_set *wfds, fd_set *xfds,
+         *            struct timeval *tv);  args in RDI/RSI/RDX/R10/R8. */
+        ret = sys_select((int)a1, a2, a3, r->r10, r->r8);
         break;
 
     case SYS_execve: {

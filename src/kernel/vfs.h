@@ -32,6 +32,7 @@
 #define VFS_DIR       2
 #define VFS_CHARDEV   3
 #define VFS_PIPE      4
+#define VFS_SOCKET    5
 
 /* errno values the syscall layer hands back to user space */
 #define E_PERM        1
@@ -51,12 +52,40 @@
 #define E_INVAL      22
 #define E_MFILE      24
 #define E_NOTTY      25
+#define E_NODEV      19
 #define E_NOSPC      28
 #define E_PIPE       32
 #define E_RANGE      34
 #define E_NAMETOOLONG 36
 #define E_NOSYS      38
 #define E_NOTEMPTY   39
+
+/* Sockets bring their own half of the errno table with them.  These are the
+ * Linux numbers, not invented ones: musl maps a negative return straight into
+ * errno, so getting ECONNREFUSED wrong here makes connect() report something
+ * unrelated -- and BusyBox branches on the difference. */
+#define E_NOTSOCK        88
+#define E_DESTADDRREQ    89
+#define E_MSGSIZE        90
+#define E_PROTOTYPE      91
+#define E_NOPROTOOPT     92
+#define E_PROTONOSUPPORT 93
+#define E_SOCKTNOSUPPORT 94
+#define E_OPNOTSUPP      95
+#define E_AFNOSUPPORT    97
+#define E_ADDRINUSE      98
+#define E_ADDRNOTAVAIL   99
+#define E_NETUNREACH    101
+#define E_CONNABORTED   103
+#define E_CONNRESET     104
+#define E_NOBUFS        105
+#define E_ISCONN        106
+#define E_NOTCONN       107
+#define E_TIMEDOUT      110
+#define E_CONNREFUSED   111
+#define E_HOSTUNREACH   113
+#define E_ALREADY       114
+#define E_INPROGRESS    115
 
 struct vfs_node;
 
@@ -132,6 +161,30 @@ int     vfs_pipe_readable(int h);
  * "the writer closed" into an end-of-file for the reader.
  */
 int vfs_pipe(int *read_handle, int *write_handle);
+
+/*
+ * Wrap a socket -- an index into sock.c's table -- in an open-file handle.
+ *
+ * Sockets are not names and never appear in a directory, but everything a
+ * descriptor can do to them (read, write, dup, close, poll) is already
+ * implemented once in the open-file table, and a socket that lived outside it
+ * would need every one of those written a second time.  The handle *owns* the
+ * socket from here on: the last unref closes it, which is what makes close(2)
+ * on the last dup tear down a TCP connection.
+ */
+int vfs_socket(int sock_index);
+
+/* The socket index behind a handle, or -1 if the handle is not a socket.
+ * This is how the syscall layer tells socket calls from file calls without
+ * keeping a second table of which fd is which. */
+int vfs_file_sock(int h);
+
+/* The access-mode / status flags (O_* bits) of a handle.  fcntl(F_GETFL)
+ * needs this; for sockets it carries O_NONBLOCK in step with sock_set_nonblock
+ * so that F_GETFL/F_SETFL round-trip the non-blocking bit exactly. */
+int vfs_file_flags(int h);
+/* Set the O_NONBLOCK bit of a handle's flags, preserving the access mode. */
+void vfs_file_setfl(int h, int nonblock);
 
 /* Convenience wrapper used by the boot path: slurp a whole file. */
 int vfs_read_all(const char *path, void *buf, uint32_t cap, uint32_t *out_size);

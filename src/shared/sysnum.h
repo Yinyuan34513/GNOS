@@ -80,6 +80,14 @@
 #define SYS_openat       257
 #define SYS_uname        63
 #define SYS_umask        95
+#define SYS_gethostname  100
+#define SYS_sethostname  170
+/* Interval timers.  musl has no alarm(2) of its own on x86-64: alarm() is
+ * written in terms of setitimer(ITIMER_REAL), so a program as ordinary as
+ * `ping` fails on a kernel that only implements 37. */
+#define SYS_getitimer    36
+#define SYS_alarm        37
+#define SYS_setitimer    38
 #define SYS_chmod        90
 #define SYS_readlink     89
 #define SYS_utimensat    280
@@ -90,6 +98,49 @@
 #define SYS_lchown       94
 #define SYS_signal       400          /* signal(sig, SIG_DFL|SIG_IGN) */
 #define SYS_gstat        403          /* private: the old 24-byte gstat_t */
+
+/* ---- sockets -----------------------------------------------------------
+ * x86-64 has no socketcall(2) multiplexer -- that is a 32-bit i386 thing --
+ * so musl issues every one of these as its own syscall number.  They all
+ * have to be dispatched individually; a missing one surfaces in user space
+ * as a bare ENOSYS with nothing to say which call went unanswered.
+ */
+#define SYS_socket        41
+#define SYS_connect       42
+#define SYS_accept        43
+#define SYS_sendto        44
+#define SYS_recvfrom      45
+#define SYS_sendmsg       46
+#define SYS_recvmsg       47
+#define SYS_shutdown      48
+#define SYS_bind          49
+#define SYS_listen        50
+#define SYS_getsockname   51
+#define SYS_getpeername   52
+#define SYS_socketpair    53
+#define SYS_setsockopt    54
+#define SYS_getsockopt    55
+#define SYS_accept4      288
+
+/* select(2) comes along with them: BusyBox's nc and wget multiplex with
+ * select, not poll, and musl's select() is this call verbatim (pselect6 is
+ * a separate number and is *not* what select() compiles to on x86-64). */
+#define SYS_select        23
+#define SYS_pselect6     270
+
+/*
+ * struct sockaddr_in as it crosses the syscall boundary: 16 bytes, and the
+ * only place in this kernel where network byte order appears in a
+ * user-visible structure.  sin_port and sin_addr are big-endian; everything
+ * inside the kernel past the syscall layer is host order, so the conversion
+ * happens exactly once, here at the edge.
+ */
+typedef struct {
+    uint16_t sin_family;        /* AF_INET */
+    uint16_t sin_port;          /* network order */
+    uint32_t sin_addr;          /* network order */
+    uint8_t  sin_zero[8];
+} sockaddr_in_t;
 
 /* arch_prctl() codes (x86-64). */
 #define ARCH_SET_FS  0x1002
@@ -145,6 +196,7 @@
 #define SIGKILL  9
 #define SIGSEGV 11
 #define SIGPIPE 13
+#define SIGALRM 14
 #define SIGTERM 15
 #define SIGCHLD 17
 #define SIGCONT 18
@@ -172,6 +224,7 @@
 #define O_CREAT    0100
 #define O_TRUNC    01000
 #define O_APPEND   02000
+#define O_NONBLOCK 04000
 
 /* fcntl() commands musl actually issues for stdio/opendir. */
 #define F_DUPFD          0

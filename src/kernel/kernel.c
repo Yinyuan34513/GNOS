@@ -38,6 +38,11 @@
 #include "proc.h"
 #include "timer.h"
 #include "syscall.h"
+#include "pci.h"
+#include "e1000.h"
+#include "net.h"
+#include "ac97.h"
+#include "hda.h"
 
 extern volatile struct limine_framebuffer_request framebuffer_request;
 extern volatile struct limine_module_request      module_request;
@@ -114,6 +119,26 @@ void kernel_entry(void)
     pmm_init();
     vmm_init();
     vmm_map_kernel_bss();              /* bootloader may leave BSS unmapped */
+
+    /* ---- PCI devices --------------------------------------------------
+     * After the allocators, because every driver here needs DMA buffers and
+     * an uncacheable MMIO mapping, and before the filesystem, so that a card
+     * that wedges the machine does so with the boot log still short enough
+     * to read.  Each driver announces itself and then proves itself: the
+     * NIC loops a frame through its own PHY, the codec streams a tone past
+     * the DMA engine.  Neither test needs a human, a network or a speaker. */
+    pci_init();
+    if (e1000_init())
+        e1000_selftest();
+    if (ac97_init())
+        ac97_selftest();
+    if (hda_init())
+        hda_selftest();
+
+    /* The IP stack sits on top of whatever the NIC probe found, so it is
+     * configured here and not in e1000_init(): with no card it still comes up
+     * with a working loopback, which is all `ping 127.0.0.1` needs. */
+    net_init();
 
     /* ---- filesystem and drivers --------------------------------------- */
     fbcon_puts("initrd: mounting FAT filesystem...\n");

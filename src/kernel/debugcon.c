@@ -38,11 +38,20 @@ void dbg_puts_dec(uint32_t v)
 
 void dbg_puts_hex(uint64_t v)
 {
-    char buf[19];
+    dbg_puts("0x");
+    dbg_puts_hexn(v, 16);
+}
+
+/* Same, but only as wide as the value deserves and with no "0x": a MAC byte
+ * printed as 0x000000000000005A tells you nothing you did not know. */
+void dbg_puts_hexn(uint64_t v, int digits)
+{
+    char buf[17];
     const char *hx = "0123456789ABCDEF";
-    buf[0] = '0'; buf[1] = 'x';
-    for (int i = 0; i < 16; i++)
-        buf[2 + i] = hx[(v >> ((15 - i) * 4)) & 0xF];
-    buf[18] = 0;
+    if (digits < 1) digits = 1;
+    if (digits > 16) digits = 16;
+    for (int i = 0; i < digits; i++)
+        buf[i] = hx[(v >> ((digits - 1 - i) * 4)) & 0xF];
+    buf[digits] = 0;
     dbg_puts(buf);
 }

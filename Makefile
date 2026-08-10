@@ -49,6 +49,9 @@ KOBJS := $(BUILD)/kernel.o $(BUILD)/loader.o $(BUILD)/fbcon.o \
          $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/proc.o \
          $(BUILD)/signal.o $(BUILD)/switch.o $(BUILD)/timer.o \
          $(BUILD)/syscall.o \
+         $(BUILD)/net.o $(BUILD)/tcp.o $(BUILD)/sock.o \
+         $(BUILD)/pci.o $(BUILD)/e1000.o $(BUILD)/audio.o \
+         $(BUILD)/hda.o \
          $(BUILD)/limine_requests.o
 
 # User programs: name -> build/<name>.elf, all linked from crt0 + ulib.
@@ -78,7 +81,13 @@ MUSL_ELFS := $(addprefix $(BUILD)/,$(addsuffix .elf,$(MUSLPROGS)))
 # Statically linked against musl, so the kernel only has to load ET_EXEC.
 BB_SRC     := $(BUILD)/bbsrc/busybox-1.38.0
 BB_BIN     := $(BB_SRC)/busybox
-BB_APPLETS := cat cp echo false head ls mkdir mv pwd rm true uname wc sh ash
+# Network applets (ifconfig/ping/wget/nc/route/udhcpc/hostname/getent) are
+# turned on in $(BB_SRC)/.config and copied into /usr/bin below, so they show
+# up under their own names and /bin/busybox.elf still works as the multicall
+# dispatcher.  ping needs a raw socket and runs as root here, so it works
+# without any setuid shimming.
+BB_APPLETS := cat cp echo false head ls mkdir mv pwd rm true uname wc sh ash \
+              ifconfig ping wget nc route hostname
 
 # musl programs see musl's headers and nothing else.  Two things matter here:
 #   -nostdinc stays (BASEFLAGS already has it) so glibc's /usr/include cannot
@@ -96,7 +105,34 @@ MUSLCFLAGS := $(filter-out -Isrc/include -Isrc/kernel -mgeneral-regs-only \
                            -mno-sse -mno-sse2 -mno-mmx -mno-80387,$(BASEFLAGS)) \
               -isystem $(MUSL_INC) -Isrc/user -fno-pie -fno-pic
 
-.PHONY: all run run-uefi test clean distclean
+# Hardware handed to the guest beyond the PC platform minimum.  The e1000 is
+# the NIC src/kernel/e1000.c drives; the AC97 is the codec src/kernel/audio.c
+# drives.  `audiodev none` gives the codec a backend that consumes samples in
+# real time without needing a sound card on the host -- which is exactly what
+# the headless self-test wants: the DMA engine really runs, nobody hears it.
+# `-nic none` is not redundant: without it QEMU also creates its *default*
+# NIC, the guest sees two e1000s, and the driver binds to whichever it met
+# first -- which is not the one attached to our netdev.
+#
+# Both sound cards are plugged in at once on purpose: they are two completely
+# different programming models (see hda.h) and the kernel drives both, so
+# leaving one out would mean half the audio code never runs in `make test`.
+QEMU_NET   := -nic none -netdev user,id=net0 -device e1000,netdev=net0
+QEMU_AUDIO := -audiodev none,id=snd0 \
+              -device AC97,audiodev=snd0 \
+              -device intel-hda -device hda-duplex,audiodev=snd0
+QEMU_DEVICES := $(QEMU_NET) $(QEMU_AUDIO)
+
+# The same hardware, but with a backend you can actually hear.  Override on
+# the command line if PulseAudio is not what your desktop runs, e.g.
+#   make guistart AUDIO_BACKEND=pipewire
+#   make guistart AUDIO_BACKEND=alsa
+AUDIO_BACKEND ?= pa
+GUI_AUDIO := -audiodev $(AUDIO_BACKEND),id=snd0 \
+             -device AC97,audiodev=snd0 \
+             -device intel-hda -device hda-duplex,audiodev=snd0
+
+.PHONY: all run run-uefi guistart test clean distclean
 all: $(ISO)
 
 # musl's headers only become usable after `make install` assembles them into a
@@ -112,7 +148,7 @@ $(MUSL_LIB)/libc.a $(MUSL_GCC):
 # AR=gcc-ar is not cosmetic: binutils 2.41's plain `ar` segfaults while
 # auto-loading the LTO plugin on this host, and BusyBox archives every
 # subdirectory into a .a before the final link.
-$(BB_BIN): | $(MUSL_GCC)
+$(BB_BIN): $(BB_SRC)/.config | $(MUSL_GCC)
 	$(MAKE) -C $(BB_SRC) CC=$(abspath $(MUSL_GCC)) HOSTCC=gcc AR=gcc-ar \
 	  SKIP_STRIP=y
 
@@ -122,9 +158,23 @@ $(BB_BIN): | $(MUSL_GCC)
 $(BUILD) $(BUILD)/user:
 	mkdir -p $@
 
+# ---------- header dependencies ----------
+# Without this every .o depends only on its .c, so editing a header rebuilds
+# nothing that includes it.  That is not merely a stale-build annoyance here:
+# proc.h defines proc_t, and half the kernel indexes into it, so a field added
+# to that struct and recompiled into only one object gives two translation
+# units two different memory layouts.  The result is a kernel that links
+# cleanly and then corrupts user processes -- which is exactly how the last
+# `-MMD`-less afternoon was spent.  -MP adds a phony target per header so a
+# deleted or renamed header does not wedge make with "no rule to make target".
+DEPFLAGS = -MMD -MP
+DEPS := $(KOBJS:.o=.d) $(UOBJS:.o=.d) $(MUSL_OBJS:.o=.d) $(UCRT:.o=.d) \
+        $(addprefix $(BUILD)/user/,$(addsuffix .d,$(UPROGS)))
+-include $(DEPS)
+
 # ---------- kernel (Limine entry point) ----------
 $(BUILD)/%.o: src/kernel/%.c | $(BUILD)
-	$(CC) $(KCFLAGS) -c -o $@ $<
+	$(CC) $(KCFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD)/%.o: src/kernel/%.asm | $(BUILD)
 	$(AS) -f elf64 -o $@ $<
@@ -135,13 +185,13 @@ $(KRNL): $(KOBJS) linker.ld
 
 # ---------- user programs ----------
 $(BUILD)/user/%.o: src/user/%.c | $(BUILD)/user
-	$(CC) $(UCFLAGS) -c -o $@ $<
+	$(CC) $(UCFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 # musl programs compile against musl's headers (see MUSLCFLAGS).  These are
 # static pattern rules, which beat the generic ulib ones above for exactly the
 # targets named in MUSL_OBJS / MUSL_ELFS and leave every other program alone.
 $(MUSL_OBJS): $(BUILD)/user/%.o: src/user/%.c $(MUSL_LIB)/libc.a | $(BUILD)/user
-	$(CC) $(MUSLCFLAGS) -c -o $@ $<
+	$(CC) $(MUSLCFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD)/user/%.o: src/user/%.asm | $(BUILD)/user
 	$(AS) -f elf64 -o $@ $<
@@ -215,6 +265,11 @@ $(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) src/user/rc | $(BUILD)
 	cp $(BB_BIN) $(BUILD)/initrd-root/bin/sh
 	cp $(BB_BIN) $(BUILD)/initrd-root/bin/ash
 	cp src/user/rc $(BUILD)/initrd-root/etc/rc            # run once at boot by init
+	# Static system config (hosts, resolv.conf, nsswitch, services, protocols,
+	# passwd/group, hostname).  These make the BusyBox network tools and the
+	# C resolver actually work: ping/wget do DNS via /etc/resolv.conf, getent
+	# reads /etc/passwd, and `hostname` uses /etc/hostname.
+	cp -a src/rootfs/etc/. $(BUILD)/initrd-root/etc/
 	dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
 	mke2fs -q -t ext2 -b 1024 -I 256 \
 	       -O ^resize_inode,^dir_index,^ext_attr \
@@ -236,13 +291,32 @@ $(ISO): $(KRNL) $(INITRD) limine.conf $(LIMINE_BIOS) $(LIMINE_UEFI) | $(BUILD)
 
 # ---------- run / test ----------
 run: $(ISO)
-	qemu-system-x86_64 -cdrom $(ISO) -m 256M -display gtk
+	qemu-system-x86_64 -cdrom $(ISO) -m 256M -display gtk $(QEMU_DEVICES)
 
 run-uefi: $(ISO)
-	qemu-system-x86_64 -cdrom $(ISO) -m 256M -bios $(OVMF) -display gtk
+	qemu-system-x86_64 -cdrom $(ISO) -m 256M -bios $(OVMF) -display gtk \
+	  $(QEMU_DEVICES)
+
+# guistart — the "just show me the OS" target.
+#
+# Differences from `run`, all of them about being in front of a human:
+#   - the audio backend is a real one, so both self-test tones (AC97 first,
+#     then HDA) are audible;
+#   - the debug console is teed to build/dbg.log as well, so the boot messages
+#     that scroll past the framebuffer are still there afterwards;
+#   - -no-reboot turns a triple fault into a stopped VM you can look at
+#     instead of an endless reboot loop.
+# The ISO is a prerequisite, so this rebuilds anything stale first.
+guistart: $(ISO)
+	@echo "GNOS: booting in a window (audio backend: $(AUDIO_BACKEND));"
+	@echo "      boot log is also being written to $(BUILD)/dbg.log"
+	qemu-system-x86_64 -cdrom $(ISO) -m 256M \
+	  $(QEMU_NET) $(GUI_AUDIO) \
+	  -device isa-debugcon,chardev=dbg -chardev file,id=dbg,path=$(BUILD)/dbg.log \
+	  -display gtk -no-reboot
 
 test: $(ISO)
-	timeout 20 qemu-system-x86_64 -cdrom $(ISO) -m 256M \
+	timeout 20 qemu-system-x86_64 -cdrom $(ISO) -m 256M $(QEMU_DEVICES) \
 	  -device isa-debugcon,chardev=dbg -chardev file,id=dbg,path=$(BUILD)/dbg.log \
 	  -serial none -display none -no-reboot || true
 	@echo "----- debugcon log -----"
