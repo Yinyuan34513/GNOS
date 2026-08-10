@@ -1,0 +1,44 @@
+# /etc/rc -- GNOS system startup script.
+#
+# Run once by init(8) through the shell, before the interactive prompt.
+# The toy shell has no comment syntax, so every line is a real command;
+# blank lines are ignored.  This is the GNOS analogue of a BSD rc or a
+# single OpenRC runlevel, kept deliberately tiny until the rest of the
+# userland (a real /bin/sh, /proc, libc) is in place.
+echo GNOS rc: starting up
+mkdir /tmp/run
+echo GNOS rc: ready
+/bin/hello.elf
+echo GNOS rc: hello exited with status $?
+# BusyBox smoke test.  Both dispatch paths are exercised on purpose:
+# /bin/busybox.elf reaches the multi-call dispatcher by name prefix, while
+# /usr/bin/echo picks its applet out of argv[0].  The rest walks the write
+# side of the filesystem -- mkdir, cp, mv, rm -- because that is where the
+# ext2 driver is thinnest.
+echo GNOS rc: busybox
+/bin/busybox.elf echo multicall dispatch ok
+/usr/bin/echo applet name dispatch ok
+/usr/bin/uname -a
+/usr/bin/pwd
+/usr/bin/head -2 /etc/rc
+/usr/bin/wc /etc/rc
+/usr/bin/mkdir /tmp/bb
+/usr/bin/cp /etc/rc /tmp/bb/copy
+/usr/bin/wc -c /tmp/bb/copy
+/usr/bin/mv /tmp/bb/copy /tmp/bb/moved
+/usr/bin/ls -l /tmp/bb
+/usr/bin/rm /tmp/bb/moved
+/usr/bin/ls /tmp/bb
+echo GNOS rc: busybox done
+# termios: assert the terminal answers the ioctls a real libc issues, that
+# the defaults match Linux's, and that a background process gets SIGTTOU for
+# reconfiguring it.  All of it is non-interactive, so it runs on every boot.
+/bin/ttytest.elf
+echo GNOS rc: ttytest exited with status $?
+# signals: assert user-installed handlers really run -- that the rt_sigframe
+# byte-for-byte matches Linux (so musl's __restore_rt trampoline works), that
+# sa_mask / SA_NODEFER / SA_RESETHAND behave, that a blocked signal stays
+# pending, that the register and FPU context survives, and that SA_RESTART
+# lets a cut-off read() finish.  All of it is non-interactive.
+/bin/sigtest.elf
+echo GNOS rc: sigtest exited with status $?
