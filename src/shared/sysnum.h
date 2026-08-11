@@ -80,8 +80,17 @@
 #define SYS_openat       257
 #define SYS_uname        63
 #define SYS_umask        95
-#define SYS_gethostname  100
+/*
+ * gethostname is NOT a Linux system call -- glibc and musl both synthesise it
+ * from uname(2).  It used to sit at 100, which on Linux/x86-64 is times(2):
+ * bash's `time` builtin and every libc clock() call issue 100 and hand the
+ * kernel a `struct tms` to fill, so the old number meant a hostname string
+ * got memcpy'd over the caller's timing buffer.  Moved into the private 400
+ * block where nothing from Linux can ever collide with it again.
+ */
+#define SYS_gethostname  401
 #define SYS_sethostname  170
+#define SYS_times        100
 /* Interval timers.  musl has no alarm(2) of its own on x86-64: alarm() is
  * written in terms of setitimer(ITIMER_REAL), so a program as ordinary as
  * `ping` fails on a kernel that only implements 37. */
@@ -96,8 +105,76 @@
 #define SYS_chown        92
 #define SYS_fchown       93
 #define SYS_lchown       94
+#define SYS_fchmod       91
+
+/* ---- what bash needs on top of the above -------------------------------
+ * Every one of these was reached by an interactive bash at some point during
+ * bring-up and answered with ENOSYS.  nanosleep and times are the two that
+ * cannot be faked: `sleep` is a bash builtin loop around the former and the
+ * `time` keyword reports the latter.
+ */
+#define SYS_nanosleep     35
+#define SYS_pread64       17
+#define SYS_pwrite64      18
+#define SYS_getrusage     98
+#define SYS_sysinfo       99
+#define SYS_getrlimit     97
+#define SYS_setrlimit    160
+#define SYS_prlimit64    302
+#define SYS_getgroups    115
+#define SYS_setgroups    116
+#define SYS_getresuid    118
+#define SYS_getresgid    120
+#define SYS_sigaltstack  131
+#define SYS_sigsuspend   130
+#define SYS_statfs       137
+#define SYS_fstatfs      138
+#define SYS_fsync         74
+#define SYS_fdatasync     75
+#define SYS_ftruncate     77
+#define SYS_truncate      76
+#define SYS_time         201
+#define SYS_getrandom    318
+#define SYS_setuid       105
+#define SYS_setgid       106
+#define SYS_setreuid     113
+#define SYS_setregid     114
+#define SYS_setsid       112
+#define SYS_getsid       124
+#define SYS_getpgrp      111
+#define SYS_pipe2        293
+#define SYS_dup3         292
+#define SYS_rmdir         84
+#define SYS_symlink       88
+#define SYS_symlinkat    266
+#define SYS_link          86
+#define SYS_linkat       265
+#define SYS_readlinkat   267
+#define SYS_unlinkat     263
+#define SYS_mkdirat      258
+#define SYS_renameat     264
+#define SYS_renameat2    316
+#define SYS_fchmodat     268
+#define SYS_fchownat     260
+#define SYS_clone         56
+#define SYS_mount        165
+#define SYS_umount2      166
+#define SYS_chroot       161
+#define SYS_reboot       169
+#define SYS_personality  135
+#define SYS_sched_getaffinity 204
+#define SYS_clock_getres 229
+#define SYS_clock_nanosleep 230
+
 #define SYS_signal       400          /* signal(sig, SIG_DFL|SIG_IGN) */
 #define SYS_gstat        403          /* private: the old 24-byte gstat_t */
+/*
+ * ttyinject(404) is a debugging back door, not POSIX.  It pushes bytes
+ * straight into the line discipline as though the keyboard IRQ had produced
+ * them, which is the only way to exercise readline's raw-mode cursor
+ * handling on a headless `make test` run -- see src/user/readlinetest.c.
+ */
+#define SYS_ttyinject    404
 
 /* ---- sockets -----------------------------------------------------------
  * x86-64 has no socketcall(2) multiplexer -- that is a 32-bit i386 thing --
@@ -127,6 +204,11 @@
  * a separate number and is *not* what select() compiles to on x86-64). */
 #define SYS_select        23
 #define SYS_pselect6     270
+/* faccessat2(439) is what musl's faccessat() actually issues on a kernel that
+ * advertises it (it is the modern, flags-carrying replacement for faccessat).
+ * bash's trap handling reaches it during startup; it is just access() with an
+ * explicit dirfd and flags, both of which this single-root kernel can ignore. */
+#define SYS_faccessat2    439
 
 /*
  * struct sockaddr_in as it crosses the syscall boundary: 16 bytes, and the
@@ -208,6 +290,7 @@ typedef struct {
 /* waitpid() options and status decoding. */
 #define WNOHANG    1
 #define WUNTRACED  2
+#define WCONTINUED 8
 
 #define WIFSTOPPED(s)   (((s) & 0xFF) == 0x7F)
 #define WIFSIGNALED(s)  (((s) & 0x7F) != 0 && ((s) & 0xFF) != 0x7F)
@@ -222,9 +305,20 @@ typedef struct {
 #define O_WRONLY   1
 #define O_RDWR     2
 #define O_CREAT    0100
+#define O_EXCL     0200
+#define O_NOCTTY   0400
 #define O_TRUNC    01000
 #define O_APPEND   02000
 #define O_NONBLOCK 04000
+#define O_DIRECTORY 0200000
+#define O_NOFOLLOW  0400000
+/*
+ * O_CLOEXEC is 02000000 on Linux -- deliberately far above the flags the VFS
+ * itself understands, because it is a *descriptor* property rather than an
+ * open-file one.  open() strips it before the VFS sees it and records the bit
+ * in proc_t.fd_cloexec instead.
+ */
+#define O_CLOEXEC   02000000
 
 /* fcntl() commands musl actually issues for stdio/opendir. */
 #define F_DUPFD          0
@@ -371,22 +465,36 @@ typedef struct {
 #define ESRCH      3
 #define EINTR      4
 #define EIO        5
+#define E2BIG      7
+/* ENOEXEC matters more than it looks: bash only retries a failed execve as a
+ * shell script when it sees this, so returning EINVAL for "not an ELF" makes
+ * `./script-without-shebang` fail outright instead of being run by sh. */
+#define ENOEXEC    8
 #define EBADF      9
 #define ECHILD    10
 #define EAGAIN    11
 #define ENOMEM    12
+#define EACCES    13
 #define EFAULT    14
+#define EBUSY     16
 #define EEXIST    17
 #define EXDEV     18
+#define ENODEV    19
 #define EISDIR    21
 #define ENOTDIR   20
 #define EINVAL    22
+#define ENFILE    23
 #define EMFILE    24
 #define ENOTTY    25
 #define ENOSPC    28
+#define EROFS     30
 #define EPIPE     32
+#define ERANGE    34
+#define ENAMETOOLONG 36
 #define ENOSYS    38
 #define ENOTEMPTY 39
+#define ELOOP     40
+#define EOVERFLOW 75
 
 /*
  * What a name refers to.  The numbers match the VFS's internal node kinds so
@@ -396,6 +504,7 @@ typedef struct {
 #define GK_DIR     2
 #define GK_CHARDEV 3
 #define GK_PIPE    4
+#define GK_SYMLINK 6
 
 /* stat(): just enough to answer "does this exist, and what is it?" */
 typedef struct {
@@ -488,6 +597,66 @@ typedef struct {
     char domainname[UTS_LEN];
 } utsname_t;
 
+/*
+ * times(100).  clock_t is a signed 64-bit count of clock ticks on x86-64, and
+ * the tick rate libc reports through sysconf(_SC_CLK_TCK) is 100 -- which is
+ * also SCHED_HZ, so the kernel's own tick counter can be handed over as-is
+ * with no scaling.  bash's `time` keyword and the `times` builtin both read
+ * this; so does every libc clock().
+ */
+typedef struct {
+    int64_t tms_utime;
+    int64_t tms_stime;
+    int64_t tms_cutime;
+    int64_t tms_cstime;
+} tms_t;
+
+/* getrlimit(97)/prlimit64(302).  RLIM_INFINITY is ~0 rather than -1 because
+ * the field is unsigned; bash's ulimit builtin prints "unlimited" for it. */
+#define RLIMIT_CPU     0
+#define RLIMIT_FSIZE   1
+#define RLIMIT_DATA    2
+#define RLIMIT_STACK   3
+#define RLIMIT_CORE    4
+#define RLIMIT_NOFILE  7
+#define RLIMIT_AS      9
+#define RLIMIT_NPROC   6
+#define RLIMIT_NLIMITS 16
+#define RLIM_INFINITY  (~0ULL)
+
+typedef struct {
+    uint64_t rlim_cur;
+    uint64_t rlim_max;
+} rlimit_t;
+
+/* getrusage(98).  Only the two time fields are ever non-zero here. */
+typedef struct { int64_t tv_sec; int64_t tv_usec; } ktimeval_t;
+typedef struct { int64_t tv_sec; int64_t tv_nsec; } ktimespec_t;
+
+typedef struct {
+    ktimeval_t ru_utime;
+    ktimeval_t ru_stime;
+    int64_t    ru_maxrss, ru_ixrss, ru_idrss, ru_isrss;
+    int64_t    ru_minflt, ru_majflt, ru_nswap;
+    int64_t    ru_inblock, ru_oublock;
+    int64_t    ru_msgsnd, ru_msgrcv;
+    int64_t    ru_nsignals, ru_nvcsw, ru_nivcsw;
+} rusage_t;
+
+#define RUSAGE_SELF      0
+#define RUSAGE_CHILDREN (-1)
+
+/* clock_gettime(228) ids.  The kernel keeps one monotonic tick counter and
+ * offsets it by the boot wall-clock epoch for the REALTIME family. */
+#define CLOCK_REALTIME           0
+#define CLOCK_MONOTONIC          1
+#define CLOCK_PROCESS_CPUTIME_ID 2
+#define CLOCK_THREAD_CPUTIME_ID  3
+#define CLOCK_MONOTONIC_RAW      4
+#define CLOCK_REALTIME_COARSE    5
+#define CLOCK_MONOTONIC_COARSE   6
+#define CLOCK_BOOTTIME           7
+
 /* ---- auxv (AT_*) -------------------------------------------------------
  * Types passed to a new process on its initial stack, right after envp and
  * before AT_NULL.  libc's _start walks this list, so the values must match
@@ -503,5 +672,8 @@ typedef struct {
 #define AT_EUID     12
 #define AT_GID      13
 #define AT_EGID     14
+#define AT_CLKTCK   17
+#define AT_SECURE   23
+#define AT_RANDOM   25
 
 #endif

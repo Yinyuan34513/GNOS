@@ -33,10 +33,12 @@
 #define EXT2_S_IFMT        0xF000
 #define EXT2_S_IFREG       0x8000
 #define EXT2_S_IFDIR       0x4000
+#define EXT2_S_IFLNK       0xA000
 
 /* directory entry file_type values (the `filetype` feature) */
 #define EXT2_FT_REG        1
 #define EXT2_FT_DIR        2
+#define EXT2_FT_SYMLINK    7
 
 /* i_block[] layout: 12 direct, then one of each indirect level */
 #define EXT2_NDIR_BLOCKS   12
@@ -60,6 +62,7 @@
 #define EXT2_ENOTDIR    (-4)
 #define EXT2_ENOTEMPTY  (-5)
 #define EXT2_EINVAL     (-6)
+#define EXT2_EISDIR     (-7)
 
 typedef struct {
     uint8_t *img;
@@ -110,8 +113,16 @@ void ext2_opendir(ext2_fs_t *fs, uint32_t ino, ext2_dir_t *dir);
 /* Fetch the next entry, skipping "." and "..".  1 on success, 0 at the end. */
 int ext2_readdir(ext2_dir_t *dir, ext2_dirent_t *out);
 
-/* Resolve an absolute path such as "/init.elf".  Case sensitive, as ext2 is. */
-int ext2_lookup(ext2_fs_t *fs, const char *path, ext2_dirent_t *out);
+/* The inode a directory's ".." entry names (root's parent is itself).  Used
+ * to emit ".." from getdents64, which must report it even though ext2_readdir
+ * skips it. */
+uint32_t ext2_parent_ino(ext2_fs_t *fs, uint32_t ino);
+
+/* Resolve an absolute path such as "/init.elf".  Case sensitive, as ext2 is.
+ * When `follow_final` is set, a symlink at the very end of the path is
+ * followed; when clear, the symlink inode itself is returned (lstat/readlink). */
+int ext2_lookup(ext2_fs_t *fs, const char *path, ext2_dirent_t *out,
+                int follow_final);
 
 /* True when the entry names a directory. */
 int ext2_is_dir(const ext2_dirent_t *ent);
@@ -129,6 +140,17 @@ uint32_t ext2_write(ext2_fs_t *fs, ext2_dirent_t *ent,
 
 /* Create an empty regular file, or a directory complete with "." and "..". */
 int ext2_create(ext2_fs_t *fs, const char *path, int isdir, ext2_dirent_t *out);
+
+/* Create a symbolic link `path` pointing at `target`. */
+int ext2_symlink(ext2_fs_t *fs, const char *target, const char *path);
+
+/* Read a symlink's target into `buf` (size `cap`).  Returns the length, or a
+ * negative EXT2_* code on error. */
+int ext2_readlink(ext2_fs_t *fs, const char *path, char *buf, uint32_t cap);
+
+/* Rename `src` to `dst`.  Handles file/file, file/overwrite, dir/dir
+ * (refusing a non-empty destination), and dir/empty-dir. */
+int ext2_rename(ext2_fs_t *fs, const char *src, const char *dst);
 
 /* Remove a file, or an empty directory. */
 int ext2_unlink(ext2_fs_t *fs, const char *path);

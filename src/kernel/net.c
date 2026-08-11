@@ -45,6 +45,8 @@ int net_if_ioctl(uint64_t ucmd, uint64_t uarg)
     uint32_t cmd = (uint32_t)ucmd;
     if (!uarg || !user_ptr_ok(uarg, 1))
         return -E_FAULT;
+    dbg_puts("net_ioctl: cmd="); dbg_puts_hex(cmd);
+    dbg_puts(" uarg="); dbg_puts_hex((uint64_t)uarg); dbg_puts("\r\n");
 
     switch (cmd) {
     /* Enumerate every interface as a struct ifreq.  ifconfig uses this to
@@ -54,6 +56,8 @@ int net_if_ioctl(uint64_t ucmd, uint64_t uarg)
         if (!user_ptr_ok(uarg, sizeof(ic)))
             return -E_FAULT;
         memcpy(&ic, (const void *)(uintptr_t)uarg, sizeof(ic));
+        dbg_puts("  SIOCGIFCONF: maxlen="); dbg_puts_hex((uint64_t)ic.ifc_len);
+        dbg_puts(" buf="); dbg_puts_hex(ic.ifc_buf); dbg_puts("\r\n");
         int max  = ic.ifc_len;
         int used = 0;
         uint8_t *buf = (uint8_t *)(uintptr_t)ic.ifc_buf;
@@ -73,6 +77,9 @@ int net_if_ioctl(uint64_t ucmd, uint64_t uarg)
         }
         ic.ifc_len = used;
         memcpy((void *)(uintptr_t)uarg, &ic, sizeof(ic));
+        dbg_puts("  SIOCGIFCONF: used="); dbg_puts_hex((uint64_t)used);
+        dbg_puts(" name0=["); dbg_puts(((ifreq_t*)buf)->ifr_name);
+        dbg_puts("]\r\n");
         return 0;
     }
 
@@ -91,6 +98,8 @@ int net_if_ioctl(uint64_t ucmd, uint64_t uarg)
             return -E_FAULT;
         memcpy(&r, (const void *)(uintptr_t)uarg, sizeof(r));
         int idx = net_if_idx(r.ifr_name);
+        dbg_puts("  name=["); dbg_puts(r.ifr_name); dbg_puts("] idx=");
+        dbg_puts_hex((uint64_t)idx); dbg_puts("\r\n");
         if (idx < 0)
             return -E_NODEV;
         netif_t *n = &g_ifs[idx];

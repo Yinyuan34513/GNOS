@@ -25,9 +25,12 @@
 #include "vfs.h"
 #include "ext2.h"
 #include "proc.h"
+#include "procfs.h"
+#include "tmpfs.h"
 #include "sock.h"
 #include "kstring.h"
 #include "debugcon.h"
+#include "syscall.h"
 
 typedef struct {
     int      used;
@@ -64,6 +67,7 @@ static int fs_errno(int e)
     case EXT2_ENOSPC:    return -E_NOSPC;
     case EXT2_ENOTDIR:   return -E_NOTDIR;
     case EXT2_ENOTEMPTY: return -E_NOTEMPTY;
+    case EXT2_EISDIR:    return -E_ISDIR;
     default:             return -E_INVAL;
     }
 }
@@ -90,7 +94,7 @@ static int32_t fs_node_write(vfs_node_t *n, uint64_t off, const void *buf,
     return (int32_t)w;
 }
 
-static const vfs_ops_t g_fs_ops = { fs_node_read, fs_node_write };
+static const vfs_ops_t g_fs_ops = { .read = fs_node_read, .write = fs_node_write };
 
 /*
  * Reading a directory yields whole gdirent_t records.  The offset is a byte
@@ -143,7 +147,7 @@ static int32_t dir_node_write(vfs_node_t *n, uint64_t off, const void *buf,
     return -E_ISDIR;
 }
 
-static const vfs_ops_t g_dir_ops = { dir_node_read, dir_node_write };
+static const vfs_ops_t g_dir_ops = { .read = dir_node_read, .write = dir_node_write };
 
 /* ---- pipes ------------------------------------------------------------ */
 static int32_t pipe_node_read(vfs_node_t *n, uint64_t off, void *buf, uint32_t len)
@@ -246,9 +250,14 @@ static int32_t null_node_write(vfs_node_t *n, uint64_t off, const void *buf,
     return (int32_t)len;
 }
 
-static const vfs_ops_t g_null_ops = { null_node_read, null_node_write };
+static const vfs_ops_t g_null_ops = { .read = null_node_read, .write = null_node_write };
 
-static const vfs_ops_t g_pipe_ops = { pipe_node_read, pipe_node_write };
+/* ---- /dev/zero and /dev/full ------------------------------------------- */
+/* NOTE: the endless-zero /dev/zero, /dev/full, /dev/random and /dev/urandom
+ * memory devices are registered by a later change; at this stage only
+ * /dev/null exists.  The g_null_ops above is what the VFS hands out. */
+
+static const vfs_ops_t g_pipe_ops = { .read = pipe_node_read, .write = pipe_node_write };
 
 int vfs_init(uint8_t *img, uint32_t img_size)
 {
@@ -272,9 +281,9 @@ int vfs_init(uint8_t *img, uint32_t img_size)
     dbg_puts_dec(g_fs.inodes_count);
     dbg_puts(" inodes)\r\n");
 
-    /* The bit bucket: reads hit EOF, writes succeed and discard.  Startup
-     * scripts and daemons wire their stdin to it so they never block on or
-     * steal the keyboard. */
+    /* /dev/null is the one character device the VFS itself provides at this
+     * stage; the rest of /dev (zero, full, random, urandom, the framebuffer)
+     * arrives with later driver and subsystem work. */
     vfs_register_dev("null", &g_null_ops, NULL);
     return 1;
 }
@@ -307,8 +316,76 @@ static vfs_node_t *dev_lookup(const char *name)
     return NULL;
 }
 
+/* ---- mount table ------------------------------------------------------
+ * A mount is a tmpfs instance attached at an absolute path.  Resolution,
+ * readdir and the modifying VFS calls consult this table (longest prefix
+ * wins) before falling through to the ext2 root or the /proc overlay, exactly
+ * the way the VFS already special-cases /proc.  There is no generic
+ * filesystem registry: tmpfs is the only mountable type, which is all a boot
+ * needs (OpenRC wants tmpfs on /run, /tmp, /dev/shm, ...).
+ */
+#define MAX_MOUNTS 8
+struct mount_entry {
+    char     mnt[GNUOS_PATH_MAX];
+    tmpfs_t *fs;
+} g_mounts[MAX_MOUNTS];
+int g_mount_count = 0;
+
+/* Return the tmpfs instance (if any) that owns `abs`, choosing the longest
+ * matching mount prefix, and write the path relative to that instance's root
+ * into `rel` (always begins with '/').  Returns NULL when `abs` is on no
+ * mount. */
+static tmpfs_t *vfs_route_tmpfs(const char *abs, char *rel)
+{
+    tmpfs_t *best = NULL;
+    int      bestlen = -1;
+    for (int i = 0; i < g_mount_count; i++) {
+        const char *m = g_mounts[i].mnt;
+        int ml = (int)strlen(m);
+        if (strcmp(abs, m) == 0) {
+            if (ml > bestlen) { best = g_mounts[i].fs; bestlen = ml;
+                                 rel[0] = '/'; rel[1] = 0; }
+        } else if (strncmp(abs, m, ml) == 0 && abs[ml] == '/') {
+            if (ml > bestlen) { best = g_mounts[i].fs; bestlen = ml;
+                                 strncpy(rel, abs + ml, GNUOS_PATH_MAX - 1);
+                                 rel[GNUOS_PATH_MAX - 1] = 0; }
+        }
+    }
+    return best;
+}
+
+int vfs_mount_tmpfs(const char *path)
+{
+    if (g_mount_count >= MAX_MOUNTS)
+        return -E_NFILE;
+    for (int i = 0; i < g_mount_count; i++)
+        if (strcmp(g_mounts[i].mnt, path) == 0)
+            return -E_EXIST;
+    tmpfs_t *fs = tmpfs_create();
+    if (!fs)
+        return -E_NOSPC;
+    strncpy(g_mounts[g_mount_count].mnt, path, GNUOS_PATH_MAX - 1);
+    g_mounts[g_mount_count].mnt[GNUOS_PATH_MAX - 1] = 0;
+    g_mounts[g_mount_count].fs = fs;
+    g_mount_count++;
+    return 0;
+}
+
+int vfs_umount(const char *path)
+{
+    for (int i = 0; i < g_mount_count; i++) {
+        if (strcmp(g_mounts[i].mnt, path) == 0) {
+            for (int j = i; j < g_mount_count - 1; j++)
+                g_mounts[j] = g_mounts[j + 1];
+            g_mount_count--;
+            return 0;
+        }
+    }
+    return -E_INVAL;
+}
+
 /* ---- path resolution -------------------------------------------------- */
-static int resolve(const char *path, vfs_node_t *out)
+static int resolve(const char *path, vfs_node_t *out, int follow)
 {
     if (!path || path[0] != '/')
         return -E_INVAL;
@@ -321,16 +398,32 @@ static int resolve(const char *path, vfs_node_t *out)
         return 0;
     }
 
+    /* /proc shadows whatever the ext2 image has at that path -- the image
+     * carries an empty /proc directory purely so the mount point exists, and
+     * the generated tree is what anyone asking for it actually wants. */
+    int pr = procfs_resolve(path, out);
+    if (pr != -E_INVAL)
+        return pr;
+
+    /* A mounted tmpfs shadows the ext2 image at its mount point, exactly as
+     * /proc shadows the empty /proc directory the image carries. */
+    char mrel[GNUOS_PATH_MAX];
+    tmpfs_t *mfs = vfs_route_tmpfs(path, mrel);
+    if (mfs)
+        return tmpfs_resolve(mfs, mrel, out);
+
     if (!g_fs_ok)
         return -E_NOENT;
 
     ext2_dirent_t ent;
-    if (!ext2_lookup(&g_fs, path, &ent))
+    if (!ext2_lookup(&g_fs, path, &ent, follow))
         return -E_NOENT;
 
     memset(out, 0, sizeof(*out));
     strncpy(out->name, ent.name, VFS_NAME_MAX - 1);
-    out->kind = ext2_is_dir(&ent) ? VFS_DIR : VFS_FILE;
+    uint16_t m = (uint16_t)(ent.mode & 0xF000);
+    out->kind = (m == EXT2_S_IFDIR) ? VFS_DIR
+              : (m == EXT2_S_IFLNK) ? VFS_SYMLINK : VFS_FILE;
     out->size = ent.size;
     out->ops  = (out->kind == VFS_DIR) ? &g_dir_ops : &g_fs_ops;
     out->e2   = ent;
@@ -351,6 +444,7 @@ static void fill_stat(const vfs_node_t *n, lstat_t *st)
     uint32_t type, perms;
     switch (n->kind) {
     case VFS_DIR:      type = 0x4000; perms = 0755; break; /* S_IFDIR */
+    case VFS_SYMLINK:  type = 0xA000; perms = 0777; break; /* S_IFLNK */
     case VFS_CHARDEV:  type = 0x2000; perms = 0600; break; /* S_IFCHR */
     case VFS_PIPE:     type = 0x1000; perms = 0600; break; /* S_IFIFO */
     case VFS_SOCKET:   type = 0xC000; perms = 0777; break; /* S_IFSOCK */
@@ -371,10 +465,10 @@ static void fill_stat(const vfs_node_t *n, lstat_t *st)
     st->st_blocks  = (n->size + 511) / 512;
 }
 
-int vfs_stat_linux(const char *path, lstat_t *st)
+int vfs_stat_linux(const char *path, lstat_t *st, int follow)
 {
     vfs_node_t n;
-    int r = resolve(path, &n);
+    int r = resolve(path, &n, follow);
     if (r < 0)
         return r;
     fill_stat(&n, st);
@@ -388,6 +482,89 @@ int vfs_fstat(int h, lstat_t *st)
         return -E_BADF;
     fill_stat(&f->node, st);
     return 0;
+}
+
+/*
+ * Pack one musl struct dirent into `p` at `off`, or report that it does not
+ * fit.  Returns the record length, or 0 when the caller should stop.  Linux
+ * pads every record out to eight bytes and d_off is a cookie pointing just
+ * past the entry, which is what a rewinddir-free reader walks by.
+ */
+static uint32_t emit_dirent(uint8_t *p, uint64_t off, uint32_t len,
+                            uint64_t ino, const char *name, uint8_t dt)
+{
+    uint32_t nl = 0;
+    while (nl < 255 && name[nl])
+        nl++;
+    uint32_t reclen = 19 + nl + 1;      /* d_ino+d_off+d_reclen+d_type+name+NUL */
+    reclen = (reclen + 7) & ~7u;
+
+    if (off + reclen > len)
+        return 0;
+
+    uint64_t doff = off + reclen;
+    uint16_t rl   = (uint16_t)reclen;
+
+    memcpy(p + off + 0,  &ino, 8);
+    memcpy(p + off + 8,  &doff, 8);
+    memcpy(p + off + 16, &rl, 2);
+    memcpy(p + off + 18, &dt, 1);
+    for (uint32_t i = 0; i < nl; i++)
+        p[off + 19 + i] = (uint8_t)name[i];
+    p[off + 19 + nl] = 0;
+    return reclen;
+}
+
+/* The /proc half of getdents64: no inode, no blocks, just the generated table
+ * walked by index.  The inode numbers are synthesised from that index because
+ * every reader only needs them to be non-zero and distinct. */
+static int64_t proc_getdents64(vfs_file_t *f, void *buf, uint32_t len)
+{
+    uint8_t *p   = (uint8_t *)buf;
+    uint64_t off = 0;
+
+    for (;;) {
+        char    name[VFS_NAME_MAX];
+        uint8_t dt;
+        if (procfs_readdir(f->path, (uint32_t)f->pos, name, &dt) < 0)
+            break;
+
+        uint32_t rec = emit_dirent(p, off, len, f->pos + 1, name, dt);
+        if (!rec)
+            break;                      /* buffer full: pos stays, caller retries */
+        off += rec;
+        f->pos++;
+    }
+
+    return (int64_t)off;
+}
+
+/* The tmpfs half of getdents64: enumerate the in-memory tree by index, the
+ * same contract proc_getdents64 uses. */
+static int64_t tmpfs_getdents64(vfs_file_t *f, void *buf, uint32_t len)
+{
+    char    rel[GNUOS_PATH_MAX];
+    tmpfs_t *fs = vfs_route_tmpfs(f->path, rel);
+    if (!fs)
+        return -E_NOENT;
+
+    uint8_t *p   = (uint8_t *)buf;
+    uint64_t off = 0;
+
+    for (;;) {
+        char    name[VFS_NAME_MAX];
+        uint8_t dt;
+        if (tmpfs_readdir(fs, rel, (uint32_t)f->pos, name, &dt) < 0)
+            break;
+
+        uint32_t rec = emit_dirent(p, off, len, f->pos + 1, name, dt);
+        if (!rec)
+            break;                      /* buffer full: pos stays, caller retries */
+        off += rec;
+        f->pos++;
+    }
+
+    return (int64_t)off;
 }
 
 /*
@@ -405,42 +582,54 @@ int64_t vfs_dir_getdents64(int h, void *buf, uint32_t len)
     if (f->node.kind != VFS_DIR)
         return -E_NOTDIR;
 
+    /* A /proc directory has no inode to walk, so it is enumerated by index
+     * from the generated table instead of by reading blocks off the disk. */
+    if (strncmp(f->path, "/proc", 5) == 0 &&
+        (f->path[5] == '\0' || f->path[5] == '/'))
+        return proc_getdents64(f, buf, len);
+
+    /* A tmpfs mount is enumerated the same way: by index from its tree. */
+    char mrel[GNUOS_PATH_MAX];
+    tmpfs_t *mfs = vfs_route_tmpfs(f->path, mrel);
+    if (mfs)
+        return tmpfs_getdents64(f, buf, len);
+
     ext2_dir_t     d;
     ext2_dirent_t  e;
     ext2_opendir(&g_fs, f->node.e2.ino, &d);
 
     uint8_t  *p   = (uint8_t *)buf;
     uint64_t  off = 0;
-    uint32_t  idx = 0;
+    uint32_t  total = 0;                /* logical entry index: ".", "..", then real */
     uint32_t  emitted = 0;
 
+    /* getdents64 must report "." and ".." even though ext2_readdir skips
+     * them; every reader expects them.  The skip below honours a non-zero
+     * f->pos so a rewind-free walk still resumes correctly. */
+    const char dot[] = ".", dotdot[] = "..";
+    uint32_t parent = ext2_parent_ino(&g_fs, f->node.e2.ino);
+
+    if (total++ >= f->pos) {
+        uint32_t rec = emit_dirent(p, off, len, f->node.e2.ino, dot, DT_DIR);
+        if (!rec) return (int64_t)off;
+        off += rec; emitted++;
+    }
+    if (total++ >= f->pos) {
+        uint32_t rec = emit_dirent(p, off, len, parent, dotdot, DT_DIR);
+        if (!rec) return (int64_t)off;
+        off += rec; emitted++;
+    }
+
     while (ext2_readdir(&d, &e)) {
-        if (idx++ < f->pos)
+        if (total++ < f->pos)
             continue;                   /* reported in a previous call */
 
-        uint32_t nl = 0;
-        while (nl < 255 && e.name[nl])
-            nl++;
-        uint32_t reclen = 19 + nl + 1;  /* d_ino+d_off+d_reclen+d_type+name+NUL */
-        reclen = (reclen + 7) & ~7u;    /* Linux pads each record to 8 bytes */
-
-        if (off + reclen > len)
+        uint32_t rec = emit_dirent(p, off, len, e.ino, e.name,
+                                   ext2_is_dir(&e) ? DT_DIR : DT_REG);
+        if (!rec)
             break;                      /* buffer full: keep pos, return what we have */
 
-        uint64_t ino  = e.ino;
-        uint64_t doff = off + reclen;   /* cookie pointing just past this entry */
-        uint16_t rl   = (uint16_t)reclen;
-        uint8_t  dt   = ext2_is_dir(&e) ? DT_DIR : DT_REG;
-
-        memcpy(p + off + 0,  &ino, 8);
-        memcpy(p + off + 8,  &doff, 8);
-        memcpy(p + off + 16, &rl, 2);
-        memcpy(p + off + 18, &dt, 1);
-        for (uint32_t i = 0; i < nl; i++)
-            p[off + 19 + i] = (uint8_t)e.name[i];
-        p[off + 19 + nl] = 0;
-
-        off += reclen;
+        off += rec;
         emitted++;
     }
 
@@ -451,7 +640,7 @@ int64_t vfs_dir_getdents64(int h, void *buf, uint32_t len)
 int vfs_stat(const char *path, uint64_t *size, int *kind)
 {
     vfs_node_t n;
-    int r = resolve(path, &n);
+    int r = resolve(path, &n, 1);
     if (r < 0)
         return r;
 
@@ -464,20 +653,83 @@ int vfs_stat(const char *path, uint64_t *size, int *kind)
 
 int vfs_unlink(const char *path)
 {
-    if (!g_fs_ok)
-        return -E_NOENT;
     if (strncmp(path, "/dev/", 5) == 0)
         return -E_PERM;
+    char rel[GNUOS_PATH_MAX];
+    tmpfs_t *fs = vfs_route_tmpfs(path, rel);
+    if (fs)
+        return tmpfs_unlink(fs, rel);
+    if (!g_fs_ok)
+        return -E_NOENT;
+    return fs_errno(ext2_unlink(&g_fs, path));
+}
+
+/*
+ * rmdir(84).  The ext2 layer already knows how to remove a directory (see
+ * ext2_unlink's isdir branch: it refuses a non-empty one with ENOTEMPTY and
+ * drops the parent's ".." link), so this is just the VFS guard that rejects a
+ * regular file the way POSIX requires -- unlink(2) is the call for those.
+ */
+int vfs_rmdir(const char *path)
+{
+    if (strncmp(path, "/dev/", 5) == 0)
+        return -E_PERM;
+    char rel[GNUOS_PATH_MAX];
+    tmpfs_t *fs = vfs_route_tmpfs(path, rel);
+    if (fs)
+        return tmpfs_rmdir(fs, rel);
+
+    vfs_node_t n;
+    int r = resolve(path, &n, 0);
+    if (r < 0)
+        return r;
+    if (n.kind != GK_DIR)
+        return -E_NOTDIR;
     return fs_errno(ext2_unlink(&g_fs, path));
 }
 
 int vfs_mkdir(const char *path)
 {
+    if (strncmp(path, "/dev/", 5) == 0)
+        return -E_PERM;
+    char rel[GNUOS_PATH_MAX];
+    tmpfs_t *fs = vfs_route_tmpfs(path, rel);
+    if (fs)
+        return tmpfs_mkdir(fs, rel, 0755);
+    if (!g_fs_ok)
+        return -E_NOENT;
+    return fs_errno(ext2_create(&g_fs, path, 1, NULL));
+}
+
+int vfs_symlink(const char *target, const char *path)
+{
+    if (strncmp(path, "/dev/", 5) == 0)
+        return -E_PERM;
+    char rel[GNUOS_PATH_MAX];
+    tmpfs_t *fs = vfs_route_tmpfs(path, rel);
+    if (fs)
+        return tmpfs_symlink(fs, target, rel);
+    return fs_errno(ext2_symlink(&g_fs, target, path));
+}
+
+int vfs_readlink(const char *path, char *buf, uint32_t cap)
+{
     if (!g_fs_ok)
         return -E_NOENT;
     if (strncmp(path, "/dev/", 5) == 0)
+        return -E_INVAL;
+    /* ext2_readlink returns the target length (>= 0) on success and a
+     * negative EXT2_ code on failure.  Do NOT run the length through
+     * fs_errno -- it would map a positive length to -E_INVAL. */
+    int r = ext2_readlink(&g_fs, path, buf, cap);
+    return r < 0 ? fs_errno(r) : r;
+}
+
+int vfs_rename(const char *src, const char *dst)
+{
+    if (strncmp(src, "/dev/", 5) == 0 || strncmp(dst, "/dev/", 5) == 0)
         return -E_PERM;
-    return fs_errno(ext2_create(&g_fs, path, 1, NULL));
+    return fs_errno(ext2_rename(&g_fs, src, dst));
 }
 
 /* ---- open-file table -------------------------------------------------- */
@@ -499,19 +751,33 @@ static int slot_alloc(void)
 int vfs_file_open(const char *path, int flags)
 {
     vfs_node_t node;
-    int r = resolve(path, &node);
+    int r = resolve(path, &node, 1);
 
-    if (r == -E_NOENT && (flags & O_CREAT) && g_fs_ok) {
-        int c = ext2_create(&g_fs, path, 0, NULL);
-        if (c != EXT2_OK)
-            return fs_errno(c);
-        r = resolve(path, &node);
+    if (r == -E_NOENT && (flags & O_CREAT)) {
+        char rel[GNUOS_PATH_MAX];
+        tmpfs_t *fs = vfs_route_tmpfs(path, rel);
+        if (fs) {
+            int c = tmpfs_create_file(fs, rel, 0644);
+            if (c < 0)
+                return c;
+            r = resolve(path, &node, 1);
+        } else if (g_fs_ok) {
+            int c = ext2_create(&g_fs, path, 0, NULL);
+            if (c != EXT2_OK)
+                return fs_errno(c);
+            r = resolve(path, &node, 1);
+        }
     }
     if (r < 0)
         return r;
 
     if ((flags & O_TRUNC) && node.kind == VFS_FILE && node.size) {
-        ext2_truncate(&g_fs, &node.e2);
+        char trel[GNUOS_PATH_MAX];
+        tmpfs_t *tfs = vfs_route_tmpfs(path, trel);
+        if (tfs)
+            tmpfs_truncate(tfs, trel);
+        else
+            ext2_truncate(&g_fs, &node.e2);
         node.size = 0;
     }
 
@@ -556,8 +822,13 @@ void vfs_file_setfl(int h, int nonblock)
 
 int vfs_chmod(const char *path, uint32_t mode)
 {
+    char rel[GNUOS_PATH_MAX];
+    tmpfs_t *fs = vfs_route_tmpfs(path, rel);
+    if (fs)
+        return tmpfs_chmod(fs, rel, mode);
+
     vfs_node_t n;
-    int r = resolve(path, &n);
+    int r = resolve(path, &n, 1);
     if (r < 0)
         return r;
 
@@ -618,7 +889,7 @@ int vfs_pipe(int *read_handle, int *write_handle)
 /* read()/write() on a socket are recvfrom()/sendto() with no address; the
  * socket index rides in node.priv, which is why sock.c can implement these
  * two without ever seeing the open-file table. */
-static const vfs_ops_t g_sock_ops = { sock_node_read, sock_node_write };
+static const vfs_ops_t g_sock_ops = { .read = sock_node_read, .write = sock_node_write };
 
 int vfs_socket(int sock_index)
 {

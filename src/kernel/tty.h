@@ -57,4 +57,14 @@ const void *tty_ops(void);
  * i.e. a read from the tty would not block.  Used by poll(7)/ppoll(271). */
 uint32_t tty_input_avail(void);
 
+/*
+ * Push one decoded keystroke (a character after scancode translation) into
+ * the line discipline.  Shared by the keyboard IRQ and the ttyinject(404)
+ * syscall so a headless test can simulate the keyboard.
+ */
+void tty_input_char(uint8_t c);
+
+/* Feed a whole buffer of keystrokes through tty_input_char (syscall side). */
+void tty_inject(const char *buf, uint32_t len);
+
 #endif

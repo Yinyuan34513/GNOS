@@ -677,6 +677,40 @@ int ext2_readdir(ext2_dir_t *dir, ext2_dirent_t *out)
     return 0;
 }
 
+/* The inode a directory's ".." entry points at.  getdents64 has to emit ".."
+ * (with the parent inode number) even though ext2_readdir skips it, so this
+ * walks the raw directory blocks the same way dir_find does but looks for the
+ * ".." name specifically.  The root directory's parent is itself. */
+uint32_t ext2_parent_ino(ext2_fs_t *fs, uint32_t ino)
+{
+    if (ino == EXT2_ROOT_INO || !ino)
+        return EXT2_ROOT_INO;
+
+    uint8_t *ip = inode_ptr(fs, ino);
+    if (!ip || (rd16(ip + I_MODE) & EXT2_S_IFMT) != EXT2_S_IFDIR)
+        return 0;
+
+    uint32_t size = rd32(ip + I_SIZE);
+    uint32_t off  = 0;
+    while (off + DE_MIN <= size) {
+        uint8_t *de = de_at(fs, ip, off);
+        if (!de)
+            return 0;
+
+        uint32_t rec = rd16(de + DE_REC_LEN);
+        if (rec < DE_MIN || (rec & 3) || off + rec > size)
+            return 0;
+
+        uint32_t ino2 = rd32(de + DE_INODE);
+        if (de[DE_NAME_LEN] == 2 && de[DE_NAME] == '.' &&
+            de[DE_NAME + 1] == '.' && ino2)
+            return ino2;
+
+        off += rec;
+    }
+    return 0;
+}
+
 /* ---- name lookup ------------------------------------------------------ */
 static uint32_t comp_len(const char *p)
 {
@@ -716,67 +750,204 @@ static uint32_t dir_find(ext2_fs_t *fs, uint32_t dino,
     return 0;
 }
 
-/* Walk an absolute path down to its final component. */
-static uint32_t path_walk(ext2_fs_t *fs, const char *path, uint32_t *parent_out,
-                          const char **leaf_out, uint32_t *leaf_len_out)
+/* ---- symbolic links --------------------------------------------------- */
+#define SYMLINK_MAX  4096          /* longest target we will store or follow */
+#define PW_MAXCOMP   64            /* longest path, in components */
+#define PW_LOOP      8             /* max symlink expansions per lookup */
+
+/*
+ * Read a symlink's target into buf (cap bytes).  Returns the length, or a
+ * negative EXT2_* code.  The target lives in an ordinary data block written by
+ * ext2_symlink via ext2_write, so ext2_read fetches it.
+ */
+static int read_symlink_target(ext2_fs_t *fs, uint32_t ino, char *buf, uint32_t cap)
+{
+    uint8_t *ip = inode_ptr(fs, ino);
+    if (!ip)
+        return EXT2_EINVAL;
+    if ((rd16(ip + I_MODE) & EXT2_S_IFMT) != EXT2_S_IFLNK)
+        return EXT2_EINVAL;
+
+    uint32_t size = rd32(ip + I_SIZE);
+    uint32_t n    = size < cap ? size : cap - 1;
+
+    ext2_dirent_t ent;
+    ent.ino  = ino;
+    ent.size = size;
+    ent.mode = rd16(ip + I_MODE);
+
+    uint32_t got = ext2_read(fs, &ent, 0, buf, n);
+    buf[got] = '\0';
+    return (int)got;
+}
+
+/*
+ * Walk an absolute path to its final component, following symlinks along the
+ * way.  The caller hands over a *mutable* copy of the path: when a symlink is
+ * expanded we splice its target into the component list and re-walk.  `follow`
+ * controls whether a symlink at the very end is itself returned (0, for
+ * lstat/readlink/unlink) or resolved through to its target (1, for open/stat).
+ *
+ * On success `parent_out`/`leaf_out` describe the *literal* final name (so a
+ * creator/unlinker can place or remove it), and the return value is the
+ * resolved inode (the target's, when the final symlink was followed).
+ */
+static uint32_t path_walk(ext2_fs_t *fs, char *path, int follow,
+                          uint32_t *parent_out, char *leaf_buf,
+                          uint32_t *leaf_len_out)
 {
     if (!path || path[0] != '/')
         return 0;
 
-    uint32_t dir  = EXT2_ROOT_INO;
-    uint32_t cur  = EXT2_ROOT_INO;
-    const char *p = path;
-    const char *leaf     = NULL;
-    uint32_t    leaf_len = 0;
+    char comp[PW_MAXCOMP][EXT2_NAME_MAX];
+    int  ncomp = 0;
 
-    while (*p) {
-        while (*p == '/')
-            p++;
-        if (!*p)
-            break;
-
-        uint32_t len = comp_len(p);
-        dir  = cur;
-        leaf = p;
-        leaf_len = len;
-
-        cur = dir_find(fs, dir, p, len);
-        p += len;
-
-        if (!cur) {
-            /* Only the very last component may be missing; a missing
-             * intermediate directory is a plain failure. */
-            while (*p == '/')
+    {   /* split the path into components, skipping empty runs of slashes */
+        const char *p = path;
+        while (*p) {
+            while (*p == '/') p++;
+            if (!*p) break;
+            if (ncomp >= PW_MAXCOMP) return 0;
+            uint32_t l = 0;
+            while (*p && *p != '/') {
+                if (l < EXT2_NAME_MAX - 1)
+                    comp[ncomp][l++] = *p;
                 p++;
-            if (*p)
-                return 0;
-            break;
+            }
+            comp[ncomp][l] = '\0';
+            ncomp++;
         }
     }
 
-    if (parent_out)
-        *parent_out = dir;
-    if (leaf_out)
-        *leaf_out = leaf;
-    if (leaf_len_out)
-        *leaf_len_out = leaf_len;
+    if (ncomp == 0) {                 /* "/" resolves to the root itself */
+        if (parent_out) *parent_out = EXT2_ROOT_INO;
+        if (leaf_buf)   leaf_buf[0] = '\0';
+        if (leaf_len_out) *leaf_len_out = 0;
+        return EXT2_ROOT_INO;
+    }
+
+    uint32_t cwd    = EXT2_ROOT_INO;
+    uint32_t cur    = EXT2_ROOT_INO;
+    uint32_t parent = cwd;
+
+    for (int i = 0; i < ncomp; i++) {
+        uint32_t ino = dir_find(fs, cwd, comp[i], (uint32_t)strlen(comp[i]));
+        if (!ino) {
+            if (i != ncomp - 1)
+                return 0;             /* a missing intermediate name */
+            parent = cwd;
+            cur    = 0;                /* the final name does not exist */
+            goto found;
+        }
+
+        uint8_t *ip = inode_ptr(fs, ino);
+        if (!ip)
+            return 0;
+        uint16_t mt = rd16(ip + I_MODE) & EXT2_S_IFMT;
+
+        if (mt == EXT2_S_IFLNK) {
+            if (i == ncomp - 1 && !follow) {
+                parent = cwd;         /* the symlink name itself */
+                cur    = ino;
+                goto found;
+            }
+            /* Expand the target into the component list and re-walk. */
+            if (i >= PW_LOOP)
+                return 0;             /* too many nested symlinks */
+            char target[SYMLINK_MAX];
+            int  tlen = read_symlink_target(fs, ino, target, sizeof target);
+            if (tlen < 0)
+                return 0;
+
+            char tcomp[PW_MAXCOMP][EXT2_NAME_MAX];
+            int  nt = 0;
+            {
+                const char *p = target;
+                while (*p) {
+                    while (*p == '/') p++;
+                    if (!*p) break;
+                    if (nt >= PW_MAXCOMP) return 0;
+                    uint32_t l = 0;
+                    while (*p && *p != '/') {
+                        if (l < EXT2_NAME_MAX - 1)
+                            tcomp[nt][l++] = *p;
+                        p++;
+                    }
+                    tcomp[nt][l] = '\0';
+                    nt++;
+                }
+            }
+
+            /* Rebuild the component list with the symlink spliced in.
+             * A relative target keeps the components before the symlink
+             * (save[0..i-1]) and after it (save[i+1..]); an absolute target
+             * is a complete path of its own and must DISCARD everything
+             * before the symlink, or we would end up with e.g.
+             * "/a/b" -> "/c" walking as "/a/c". */
+            int  is_abs = (target[0] == '/');
+            char save[PW_MAXCOMP][EXT2_NAME_MAX];
+            memcpy(save, comp, sizeof save);
+            int sn = ncomp, k = 0;
+            if (!is_abs)
+                for (int j = 0; j < i; j++) { strncpy(comp[k], save[j], EXT2_NAME_MAX - 1); comp[k][EXT2_NAME_MAX - 1] = '\0'; k++; }
+            for (int j = 0; j < nt; j++) { strncpy(comp[k], tcomp[j], EXT2_NAME_MAX - 1); comp[k][EXT2_NAME_MAX - 1] = '\0'; k++; }
+            if (!is_abs)
+                for (int j = i + 1; j < sn; j++) { strncpy(comp[k], save[j], EXT2_NAME_MAX - 1); comp[k][EXT2_NAME_MAX - 1] = '\0'; k++; }
+            ncomp = k;
+
+            if (is_abs) {                  /* absolute: restart from root */
+                cwd = EXT2_ROOT_INO;
+                i   = -1;
+            } else {                       /* relative: continue in cwd */
+                i   = i - 1;
+            }
+            continue;
+        }
+
+        if (mt == EXT2_S_IFDIR) {
+            parent = cwd;
+            cwd    = ino;
+            cur    = ino;
+        } else {
+            if (i != ncomp - 1)
+                return 0;                 /* a non-directory mid-path */
+            parent = cwd;
+            cur    = ino;
+            goto found;
+        }
+    }
+
+found:
+    if (parent_out)   *parent_out = parent;
+    if (leaf_buf) {
+        strncpy(leaf_buf, comp[ncomp - 1], EXT2_NAME_MAX - 1);
+        leaf_buf[EXT2_NAME_MAX - 1] = '\0';
+    }
+    if (leaf_len_out) *leaf_len_out = (uint32_t)strlen(comp[ncomp - 1]);
     return cur;
 }
 
-int ext2_lookup(ext2_fs_t *fs, const char *path, ext2_dirent_t *out)
+int ext2_lookup(ext2_fs_t *fs, const char *path, ext2_dirent_t *out,
+                int follow_final)
 {
     if (!fs || !path || path[0] != '/')
         return 0;
 
-    const char *leaf     = NULL;
+    /* path_walk mutates its argument (it splices symlink targets in), so we
+     * hand it a private copy rather than the caller's string. */
+    char pb[SYMLINK_MAX];
+    strncpy(pb, path, sizeof pb - 1);
+    pb[sizeof pb - 1] = '\0';
+
+    char        leaf[EXT2_NAME_MAX];
     uint32_t    leaf_len = 0;
-    uint32_t    ino      = path_walk(fs, path, NULL, &leaf, &leaf_len);
+    uint32_t    ino      = path_walk(fs, pb, follow_final, NULL, leaf, &leaf_len);
 
     if (!ino)
         return 0;
 
     if (out) {
-        if (leaf && leaf_len)
+        if (leaf_len)
             ent_fill(fs, out, ino, leaf, leaf_len);
         else
             ent_fill(fs, out, ino, "/", 1);      /* the root itself */
@@ -872,13 +1043,22 @@ int ext2_chmod(ext2_fs_t *fs, ext2_dirent_t *ent, uint16_t mode)
 /* Fill in an entry's inode, name and type.  rec_len belongs to the caller,
  * who is the only one who knows how much room the slot really spans. */
 static void put_entry(ext2_fs_t *fs, uint8_t *de, uint32_t ino,
-                      const char *name, uint32_t len, int isdir)
+                      const char *name, uint32_t len, uint8_t ft)
 {
     wr32(de + DE_INODE, ino);
     de[DE_NAME_LEN]  = (uint8_t)len;
-    de[DE_FILE_TYPE] = fs->has_filetype
-                     ? (uint8_t)(isdir ? EXT2_FT_DIR : EXT2_FT_REG) : 0;
+    de[DE_FILE_TYPE] = fs->has_filetype ? ft : 0;
     memcpy(de + DE_NAME, name, len);
+}
+
+/* Map an inode mode to a directory-entry file_type byte. */
+static uint8_t mode_to_ft(uint16_t mode)
+{
+    switch (mode & EXT2_S_IFMT) {
+    case EXT2_S_IFDIR:  return EXT2_FT_DIR;
+    case EXT2_S_IFLNK:  return EXT2_FT_SYMLINK;
+    default:            return EXT2_FT_REG;
+    }
 }
 
 /* Space an entry with this name actually occupies, rounded as ext2 requires. */
@@ -896,7 +1076,7 @@ static uint32_t ent_need(uint32_t name_len)
  * true size, and building the new entry in the remainder.
  */
 static int dir_add(ext2_fs_t *fs, uint32_t dino, const char *name,
-                   uint32_t len, uint32_t ino, int isdir)
+                   uint32_t len, uint32_t ino, uint16_t child_mode)
 {
     if (!len || len > 255)
         return EXT2_EINVAL;
@@ -906,6 +1086,8 @@ static int dir_add(ext2_fs_t *fs, uint32_t dino, const char *name,
         return EXT2_ENOENT;
     if ((rd16(dp + I_MODE) & EXT2_S_IFMT) != EXT2_S_IFDIR)
         return EXT2_ENOTDIR;
+
+    uint8_t ft = mode_to_ft(child_mode);
 
     uint32_t need = ent_need(len);
     uint32_t size = rd32(dp + I_SIZE);
@@ -930,7 +1112,7 @@ static int dir_add(ext2_fs_t *fs, uint32_t dino, const char *name,
                 slot = de + used;
                 wr16(slot + DE_REC_LEN, (uint16_t)(rec - used));
             }
-            put_entry(fs, slot, ino, name, len, isdir);
+            put_entry(fs, slot, ino, name, len, ft);
             return EXT2_OK;
         }
         off += rec;
@@ -946,7 +1128,7 @@ static int dir_add(ext2_fs_t *fs, uint32_t dino, const char *name,
     inode_add_blocks(fs, dp, added);
     memset(b, 0, fs->block_size);
     wr16(b + DE_REC_LEN, (uint16_t)fs->block_size);
-    put_entry(fs, b, ino, name, len, isdir);
+    put_entry(fs, b, ino, name, len, ft);
     wr32(dp + I_SIZE, size + fs->block_size);
     return EXT2_OK;
 }
@@ -1019,14 +1201,18 @@ int ext2_create(ext2_fs_t *fs, const char *path, int isdir, ext2_dirent_t *out)
         return EXT2_EINVAL;
 
     uint32_t    parent   = 0;
-    const char *leaf     = NULL;
+    char        leaf[EXT2_NAME_MAX];
     uint32_t    leaf_len = 0;
 
-    if (path_walk(fs, path, &parent, &leaf, &leaf_len))
+    char pb[SYMLINK_MAX];
+    strncpy(pb, path, sizeof pb - 1);
+    pb[sizeof pb - 1] = '\0';
+
+    if (path_walk(fs, pb, 0, &parent, leaf, &leaf_len))
         return EXT2_EEXIST;
     if (!parent)
         return EXT2_ENOENT;              /* a directory along the way is missing */
-    if (!leaf || !leaf_len || leaf_len > 255)
+    if (!leaf_len || leaf_len > 255)
         return EXT2_EINVAL;
 
     uint8_t *pp = inode_ptr(fs, parent);
@@ -1079,7 +1265,8 @@ int ext2_create(ext2_fs_t *fs, const char *path, int isdir, ext2_dirent_t *out)
         wr32(ip + I_SIZE, fs->block_size);
     }
 
-    int r = dir_add(fs, parent, leaf, leaf_len, ino, isdir);
+    int r = dir_add(fs, parent, leaf, leaf_len, ino,
+                    isdir ? (EXT2_S_IFDIR | 0755) : (EXT2_S_IFREG | 0644));
     if (r != EXT2_OK) {
         inode_free_blocks(fs, ip);
         ifree(fs, ino, isdir);
@@ -1101,13 +1288,18 @@ int ext2_unlink(ext2_fs_t *fs, const char *path)
         return EXT2_EINVAL;
 
     uint32_t    parent   = 0;
-    const char *leaf     = NULL;
+    char        leaf[EXT2_NAME_MAX];
     uint32_t    leaf_len = 0;
-    uint32_t    ino      = path_walk(fs, path, &parent, &leaf, &leaf_len);
+
+    char pb[SYMLINK_MAX];
+    strncpy(pb, path, sizeof pb - 1);
+    pb[sizeof pb - 1] = '\0';
+
+    uint32_t    ino      = path_walk(fs, pb, 0, &parent, leaf, &leaf_len);
 
     if (!ino)
         return EXT2_ENOENT;
-    if (!leaf || !leaf_len || ino == EXT2_ROOT_INO)
+    if (!leaf_len || ino == EXT2_ROOT_INO)
         return EXT2_EINVAL;              /* "/" is not something we may remove */
 
     uint8_t *ip = inode_ptr(fs, ino);
@@ -1140,5 +1332,202 @@ int ext2_unlink(ext2_fs_t *fs, const char *path)
     wr32(ip + I_SIZE, 0);
     wr32(ip + I_DTIME, fs_now(fs));      /* a non-zero dtime means "deleted" */
     ifree(fs, ino, isdir);
+    return EXT2_OK;
+}
+
+/* ---- symlinks ---------------------------------------------------------- */
+int ext2_symlink(ext2_fs_t *fs, const char *target, const char *path)
+{
+    if (!fs || !target || !path || path[0] != '/')
+        return EXT2_EINVAL;
+    if (strlen(target) == 0 || strlen(target) >= SYMLINK_MAX)
+        return EXT2_EINVAL;
+
+    char pb[SYMLINK_MAX];
+    strncpy(pb, path, sizeof pb - 1);
+    pb[sizeof pb - 1] = '\0';
+
+    uint32_t    parent   = 0;
+    char        leaf[EXT2_NAME_MAX];
+    uint32_t    leaf_len = 0;
+    if (path_walk(fs, pb, 0, &parent, leaf, &leaf_len))
+        return EXT2_EEXIST;              /* the name already exists */
+    if (!parent)
+        return EXT2_ENOENT;
+    if (!leaf_len || leaf_len > 255)
+        return EXT2_EINVAL;
+
+    uint8_t *pp = inode_ptr(fs, parent);
+    if (!pp)
+        return EXT2_ENOENT;
+    if ((rd16(pp + I_MODE) & EXT2_S_IFMT) != EXT2_S_IFDIR)
+        return EXT2_ENOTDIR;
+
+    uint32_t ino = ialloc(fs, 0);
+    if (!ino)
+        return EXT2_ENOSPC;
+
+    uint8_t *ip = inode_ptr(fs, ino);
+    if (!ip) {
+        ifree(fs, ino, 0);
+        return EXT2_EINVAL;
+    }
+
+    memset(ip, 0, fs->inode_size);
+    wr16(ip + I_MODE, (uint16_t)(EXT2_S_IFLNK | 0777));
+    wr16(ip + I_LINKS, 1);
+    uint32_t now = fs_now(fs);
+    wr32(ip + I_ATIME, now);
+    wr32(ip + I_CTIME, now);
+    wr32(ip + I_MTIME, now);
+
+    /* The target is stored in an ordinary data block via ext2_write, which
+     * keeps i_size and i_blocks honest. */
+    ext2_dirent_t ent;
+    ent.ino  = ino;
+    ent.size = 0;
+    ent.mode = (uint16_t)(EXT2_S_IFLNK | 0777);
+    strncpy(ent.name, leaf, EXT2_NAME_MAX - 1);
+    ent.name[EXT2_NAME_MAX - 1] = '\0';
+
+    uint32_t tlen = (uint32_t)strlen(target);
+    uint32_t done = ext2_write(fs, &ent, 0, target, tlen);
+    if (done != tlen) {
+        inode_free_blocks(fs, ip);
+        ifree(fs, ino, 0);
+        return EXT2_ENOSPC;
+    }
+    wr32(ip + I_SIZE, tlen);
+
+    int r = dir_add(fs, parent, leaf, leaf_len, ino,
+                    (uint16_t)(EXT2_S_IFLNK | 0777));
+    if (r != EXT2_OK) {
+        inode_free_blocks(fs, ip);
+        ifree(fs, ino, 0);
+        return r;
+    }
+    return EXT2_OK;
+}
+
+int ext2_readlink(ext2_fs_t *fs, const char *path, char *buf, uint32_t cap)
+{
+    if (!fs || !buf || cap == 0)
+        return EXT2_EINVAL;
+
+    char pb[SYMLINK_MAX];
+    strncpy(pb, path, sizeof pb - 1);
+    pb[sizeof pb - 1] = '\0';
+
+    uint32_t    parent   = 0;
+    char        leaf[EXT2_NAME_MAX];
+    uint32_t    leaf_len = 0;
+    uint32_t    ino      = path_walk(fs, pb, 0, &parent, leaf, &leaf_len);
+    if (!ino)
+        return EXT2_ENOENT;
+
+    return read_symlink_target(fs, ino, buf, cap);
+}
+
+/* ---- rename ------------------------------------------------------------ */
+int ext2_rename(ext2_fs_t *fs, const char *src, const char *dst)
+{
+    if (!fs || !src || !dst || src[0] != '/' || dst[0] != '/')
+        return EXT2_EINVAL;
+    if (strcmp(src, dst) == 0)
+        return EXT2_OK;
+
+    /* Resolve both names literally (no trailing-symlink following): rename
+     * operates on the source and destination names themselves. */
+    char spb[SYMLINK_MAX];
+    strncpy(spb, src, sizeof spb - 1); spb[sizeof spb - 1] = '\0';
+    uint32_t sparent = 0; char sleaf[EXT2_NAME_MAX]; uint32_t sleaf_len = 0;
+    uint32_t sino = path_walk(fs, spb, 0, &sparent, sleaf, &sleaf_len);
+    if (!sino)
+        return EXT2_ENOENT;
+    if (sino == EXT2_ROOT_INO)
+        return EXT2_EINVAL;
+
+    uint8_t *sip = inode_ptr(fs, sino);
+    if (!sip)
+        return EXT2_ENOENT;
+    uint16_t smode  = rd16(sip + I_MODE);
+    int      sisdir = (smode & EXT2_S_IFMT) == EXT2_S_IFDIR;
+
+    char dpb[SYMLINK_MAX];
+    strncpy(dpb, dst, sizeof dpb - 1); dpb[sizeof dpb - 1] = '\0';
+    uint32_t dparent = 0; char dleaf[EXT2_NAME_MAX]; uint32_t dleaf_len = 0;
+    uint32_t dino = path_walk(fs, dpb, 0, &dparent, dleaf, &dleaf_len);
+    if (dino == EXT2_ROOT_INO)
+        return EXT2_EINVAL;
+    if (!dparent || !dleaf_len)
+        return EXT2_EINVAL;
+
+    /* A directory cannot be renamed into itself or one of its children. */
+    if (sisdir && dparent) {
+        size_t sl = strlen(src);
+        if (strncmp(dst, src, sl) == 0 && (dst[sl] == '/' || dst[sl] == '\0'))
+            return EXT2_EINVAL;
+    }
+
+    uint8_t *dip = dino ? inode_ptr(fs, dino) : NULL;
+    int      disdir = dip && (rd16(dip + I_MODE) & EXT2_S_IFMT) == EXT2_S_IFDIR;
+
+    /* Type mismatches POSIX rejects: dir over file, file over dir. */
+    if (sisdir && dip && !disdir)
+        return EXT2_ENOTDIR;
+    if (!sisdir && dip && disdir)
+        return EXT2_EISDIR;
+
+    if (sisdir && dip && disdir && !dir_is_empty(fs, dino))
+        return EXT2_ENOTEMPTY;
+
+    /* If the destination already existed, drop its old name and (because it
+     * had exactly one link) free its inode. */
+    if (dino) {
+        int r = dir_remove(fs, dparent, dleaf, dleaf_len);
+        if (r != EXT2_OK)
+            return r;
+        if (disdir) {
+            uint8_t *pp = inode_ptr(fs, dparent);
+            if (pp && rd16(pp + I_LINKS) > 1)
+                wr16(pp + I_LINKS, (uint16_t)(rd16(pp + I_LINKS) - 1));
+            wr16(dip + I_LINKS, 0);
+            inode_free_blocks(fs, dip);
+            wr32(dip + I_SIZE, 0);
+            wr32(dip + I_DTIME, fs_now(fs));
+            ifree(fs, dino, 1);
+        } else {
+            uint16_t links = rd16(dip + I_LINKS);
+            if (links > 0)
+                wr16(dip + I_LINKS, (uint16_t)(--links));
+            if (links == 0) {
+                inode_free_blocks(fs, dip);
+                wr32(dip + I_SIZE, 0);
+                wr32(dip + I_DTIME, fs_now(fs));
+                ifree(fs, dino, 0);
+            }
+        }
+    }
+
+    /* Link the source inode under the destination name, then unlink the
+     * source name.  The source inode's link count is left untouched: a file
+     * keeps its single link, a directory keeps the two it always has. */
+    int r = dir_add(fs, dparent, dleaf, dleaf_len, sino, smode);
+    if (r != EXT2_OK)
+        return r;
+
+    r = dir_remove(fs, sparent, sleaf, sleaf_len);
+    if (r != EXT2_OK)
+        return r;
+
+    /* A moved directory's ".." now points at the destination parent. */
+    if (sisdir) {
+        uint8_t *sp = inode_ptr(fs, sparent);
+        if (sp && rd16(sp + I_LINKS) > 1)
+            wr16(sp + I_LINKS, (uint16_t)(rd16(sp + I_LINKS) - 1));
+        uint8_t *dp = inode_ptr(fs, dparent);
+        if (dp)
+            wr16(dp + I_LINKS, (uint16_t)(rd16(dp + I_LINKS) + 1));
+    }
     return EXT2_OK;
 }

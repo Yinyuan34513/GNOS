@@ -27,6 +27,11 @@ uint64_t pmm_alloc_zeroed(void);
 /* Release a frame previously returned by pmm_alloc(). */
 void pmm_free(uint64_t phys);
 
+/* Allocate `n` consecutive frames as one run.  Returns the physical base, or
+ * 0 when no contiguous span of that length exists.  Used by the kernel heap,
+ * which wants a single linear region. */
+uint64_t pmm_alloc_contiguous(uint64_t n);
+
 /* Map a physical address into the kernel's direct map. */
 void *pmm_virt(uint64_t phys);
 

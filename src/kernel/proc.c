@@ -31,17 +31,38 @@
 extern void switch_context(uint64_t *save_rsp, uint64_t load_rsp);
 extern void ret_to_user(void);
 
-/* Argument-vector limits.  These are the real ceiling on what a shell can
+/*
+ * Argument-vector limits.  These are the real ceiling on what a shell can
  * pass to a program, and BusyBox routinely receives more than sixteen words
- * (a glob expanding to a directory's worth of names is the usual way).  The
- * 4 KiB string arena lives on the 16 KiB kernel stack during execve, which is
- * comfortable but not somewhere to keep growing. */
-#define MAX_ARGS      64
-#define ARG_BYTES     4096
-#define IMAGE_MAX     (4 * 1024 * 1024)
+ * (a glob expanding to a directory's worth of names is the usual way).
+ *
+ * The arena has to hold argv *and* envp now, and an interactive bash exports
+ * a few kilobytes of environment before it has run a single command, so 4 KiB
+ * no longer covers a plain `ls`.  16 KiB does -- but it can no longer live on
+ * the 16 KiB kernel stack, so the arena and the two pointer vectors moved to
+ * BSS below.  Sharing one static arena between callers is safe because the
+ * kernel is never preempted: timer.c only calls sched_tick() when the trap
+ * came from ring 3, so an execve runs to completion once it starts.
+ */
+#define MAX_ARGS      128
+#define MAX_ENVS      128
+#define ARG_BYTES     16384
+#define IMAGE_MAX     (8 * 1024 * 1024)
+
+/* How many `#!` lines deep execve will chase an interpreter before giving up
+ * with ELOOP.  Linux uses 4; a script whose interpreter is a script whose
+ * interpreter is a script is already pathological. */
+#define EXEC_INTERP_MAX 4
 
 static proc_t  g_procs[MAX_PROCS];
 static uint8_t g_kstacks[MAX_PROCS][KSTACK_SIZE] __attribute__((aligned(16)));
+
+/* execve's string arena and pointer vectors.  See the comment above for why
+ * these are static rather than automatic. */
+static char  g_argbuf[ARG_BYTES];
+static uint32_t g_argused;
+static char *g_args[MAX_ARGS + 1];
+static char *g_envs[MAX_ENVS + 1];
 
 static proc_t *g_current;
 static int     g_next_pid = 1;
@@ -78,6 +99,7 @@ static proc_t *proc_alloc(void)
         proc_t *p = &g_procs[i];
         memset(p, 0, sizeof(*p));
         p->pid        = g_next_pid++;
+        p->start_tick = timer_ticks();
         p->kstack_top = (uint64_t)(uintptr_t)g_kstacks[i] + KSTACK_SIZE;
         for (int f = 0; f < PROC_MAX_FD; f++)
             p->fds[f] = -1;
@@ -190,11 +212,19 @@ static void make_user_frame(regs_t *f, uint64_t entry, uint64_t stack)
     f->ss     = SEL_UDATA;
 }
 
-/* ---- argv ------------------------------------------------------------- */
+/* ---- argv / envp ------------------------------------------------------ */
 /*
- * Lay out argc/argv at the top of the user stack the way a SysV _start
- * expects to find them:  [argc][argv0..argvN][NULL][envp NULL][auxv][AT_NULL].
+ * Lay out the initial process stack the way a SysV _start expects to find it:
+ *
+ *   [argc][argv0..argvN][NULL][envp0..envpM][NULL][auxv pairs][AT_NULL]
+ *   ... then the string bodies themselves, higher up ...
+ *
  * Returns the new stack pointer, or 0 on failure.
+ *
+ * The environment used to be hardcoded to an empty vector here, which is a
+ * subtle way to break every program that is not a toy: bash with no PATH
+ * cannot find a single external command, and with no TERM readline falls back
+ * to a dumb terminal.  envp is now carried end to end from the execve caller.
  */
 /* Push one auxv (type, value) pair.  The vector is built downwards, so the
  * value word lands above its type word and a bottom-up reader sees the pair
@@ -210,21 +240,56 @@ static int push_aux(addrspace_t *as, uint64_t *sp, uint64_t type, uint64_t val)
     return 1;
 }
 
+/* Pointer slots for the strings we push, filled top-down.  Static for the
+ * same reason the arena is: MAX_ARGS + MAX_ENVS words is 2 KiB and the kernel
+ * stack is only 16 KiB. */
+static uint64_t g_strptr[MAX_ARGS + MAX_ENVS];
+
 static uint64_t push_args(addrspace_t *as, uint64_t stack_top,
-                          char *const argv[], int argc, uint64_t phdr,
-                          uint16_t phnum, uint64_t entry)
+                          char *const argv[], int argc,
+                          char *const envp[], int envc,
+                          uint64_t phdr, uint16_t phnum, uint64_t entry)
 {
-    uint64_t str_ptr[MAX_ARGS];
+    uint64_t *arg_ptr = g_strptr;
+    uint64_t *env_ptr = g_strptr + MAX_ARGS;
     uint64_t sp = stack_top;
 
-    /* Strings first, from the very top downwards. */
+    /* Strings first, from the very top downwards: environment, then argv. */
+    for (int i = envc - 1; i >= 0; i--) {
+        uint32_t len = (uint32_t)strlen(envp[i]) + 1;
+        sp -= len;
+        sp &= ~7ULL;
+        if (!vmm_copy_to_user(as, sp, envp[i], len))
+            return 0;
+        env_ptr[i] = sp;
+    }
     for (int i = argc - 1; i >= 0; i--) {
         uint32_t len = (uint32_t)strlen(argv[i]) + 1;
         sp -= len;
         sp &= ~7ULL;
         if (!vmm_copy_to_user(as, sp, argv[i], len))
             return 0;
-        str_ptr[i] = sp;
+        arg_ptr[i] = sp;
+    }
+
+    /*
+     * AT_RANDOM points at sixteen bytes the libc uses to seed its stack
+     * guard.  musl copes with the entry being absent, but it then leaves the
+     * canary zero; supplying real bytes costs one push and makes the
+     * -fstack-protector builds of third-party userland meaningful.
+     */
+    uint64_t at_random = 0;
+    {
+        uint64_t seed[2];
+        uint64_t t = timer_ticks() * 6364136223846793005ULL + 1442695040888963407ULL;
+        seed[0] = t ^ (uint64_t)(uintptr_t)as;
+        t = t * 6364136223846793005ULL + 1442695040888963407ULL;
+        seed[1] = t ^ entry;
+        sp -= 16;
+        sp &= ~15ULL;
+        if (!vmm_copy_to_user(as, sp, seed, 16))
+            return 0;
+        at_random = sp;
     }
 
     /* auxv, written high-to-low like everything else, so a bottom-up reader
@@ -236,32 +301,42 @@ static uint64_t push_args(addrspace_t *as, uint64_t stack_top,
      * __init_tls walks that many entries unconditionally and faults on the
      * first one.  With the triple absent it falls back to its builtin TLS. */
     sp &= ~15ULL;
-    if (!push_aux(as, &sp, AT_NULL, 0))          return 0;
-    if (!push_aux(as, &sp, AT_ENTRY, entry))     return 0;
-    if (!push_aux(as, &sp, AT_PAGESZ, 4096))     return 0;
+    if (!push_aux(as, &sp, AT_NULL, 0))            return 0;
+    if (!push_aux(as, &sp, AT_ENTRY, entry))       return 0;
+    if (!push_aux(as, &sp, AT_PAGESZ, 4096))       return 0;
+    if (!push_aux(as, &sp, AT_CLKTCK, SCHED_HZ))   return 0;
+    if (!push_aux(as, &sp, AT_SECURE, 0))          return 0;
+    if (!push_aux(as, &sp, AT_RANDOM, at_random))  return 0;
     if (phnum) {
         if (!push_aux(as, &sp, AT_PHNUM, phnum))                return 0;
         if (!push_aux(as, &sp, AT_PHENT, ELF64_PHDR_SIZE))      return 0;
         if (!push_aux(as, &sp, AT_PHDR, phdr))                  return 0;
     }
 
-    /* envp terminator, then the argv array, then argc.
+    /* The envp array, then the argv array, then argc.
      *
-     * argc, argv[0..argc-1], argv[argc]==NULL and envp[0]==NULL are one
-     * contiguous block of argc+3 words, so any alignment padding has to go
-     * *above* it -- a pad inserted anywhere inside would punch a hole in the
-     * argv array.  The SysV ABI wants %rsp 16-byte aligned at process entry
-     * (pointing at argc); that is Linux's STACK_ROUND in create_elf_tables,
-     * and it is not the same as the call-site convention where %rsp%16==8
-     * because a return address has been pushed. */
+     * argc, argv[0..argc-1], argv[argc]==NULL, envp[0..envc-1] and
+     * envp[envc]==NULL are one contiguous block of argc+envc+3 words, so any
+     * alignment padding has to go *above* it -- a pad inserted anywhere
+     * inside would punch a hole in one of the two arrays.  The SysV ABI wants
+     * %rsp 16-byte aligned at process entry (pointing at argc); that is
+     * Linux's STACK_ROUND in create_elf_tables, and it is not the same as the
+     * call-site convention where %rsp%16==8 because a return address has been
+     * pushed. */
     sp &= ~15ULL;
-    if (((sp - 8 * (uint64_t)(argc + 3)) & 15) != 0)
+    if (((sp - 8 * (uint64_t)(argc + envc + 3)) & 15) != 0)
         sp -= 8;
 
     sp -= 8;
     uint64_t nul = 0;
     if (!vmm_copy_to_user(as, sp, &nul, 8))
-        return 0;                                  /* envp[0] == NULL */
+        return 0;                                  /* envp[envc] == NULL */
+
+    for (int i = envc - 1; i >= 0; i--) {
+        sp -= 8;
+        if (!vmm_copy_to_user(as, sp, &env_ptr[i], 8))
+            return 0;
+    }
 
     sp -= 8;
     if (!vmm_copy_to_user(as, sp, &nul, 8))
@@ -269,7 +344,7 @@ static uint64_t push_args(addrspace_t *as, uint64_t stack_top,
 
     for (int i = argc - 1; i >= 0; i--) {
         sp -= 8;
-        if (!vmm_copy_to_user(as, sp, &str_ptr[i], 8))
+        if (!vmm_copy_to_user(as, sp, &arg_ptr[i], 8))
             return 0;
     }
 
@@ -288,6 +363,7 @@ static uint64_t push_args(addrspace_t *as, uint64_t stack_top,
  * caller is touched, so a failure here is always recoverable.
  */
 static int build_image(const char *path, char *const argv[], int argc,
+                       char *const envp[], int envc,
                        addrspace_t **out_as, uint64_t *out_entry,
                        uint64_t *out_sp)
 {
@@ -302,9 +378,12 @@ static int build_image(const char *path, char *const argv[], int argc,
     uint64_t entry = 0;
     uint64_t phdr = 0;
     uint16_t phnum = 0;
+    /* ENOEXEC, not EINVAL: "I read the file and it is not something I can
+     * run" is a distinct answer from "your arguments were wrong", and bash
+     * keys its fallback-to-shell-script behaviour off exactly this errno. */
     if (load_executable(as, g_image, size, &entry, &phdr, &phnum) <= 0) {
         vmm_destroy(as);
-        return -E_INVAL;
+        return -E_NOEXEC;
     }
 
     if (!vmm_alloc_range(as, USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE,
@@ -313,7 +392,7 @@ static int build_image(const char *path, char *const argv[], int argc,
         return -E_NOMEM;
     }
 
-    uint64_t sp = push_args(as, USER_STACK_TOP - 16, argv, argc,
+    uint64_t sp = push_args(as, USER_STACK_TOP - 16, argv, argc, envp, envc,
                             phdr, phnum, entry);
     if (!sp) {
         vmm_destroy(as);
@@ -326,6 +405,45 @@ static int build_image(const char *path, char *const argv[], int argc,
     return 0;
 }
 
+/*
+ * Record argv in the NUL-separated form /proc/<pid>/cmdline is defined to
+ * have.  Truncation is silent and safe: the buffer always ends on a complete
+ * NUL-terminated word, so a reader parsing it can never run off the end.
+ */
+static void proc_set_cmdline(proc_t *p, char *const argv[], int argc)
+{
+    uint32_t n = 0;
+    for (int i = 0; i < argc && argv[i]; i++) {
+        uint32_t len = (uint32_t)strlen(argv[i]) + 1;
+        if (n + len > sizeof(p->cmdline))
+            break;
+        memcpy(p->cmdline + n, argv[i], len);
+        n += len;
+    }
+    p->cmdline_len = n;
+}
+
+/*
+ * The environment PID 1 is born with, and therefore -- since every other
+ * process descends from it through fork -- the default environment of the
+ * whole system.  Setting it here rather than in init.c means it is already in
+ * place for /etc/rc, which runs before anything has a chance to export
+ * anything.  PATH is what lets a shell find a command by name at all; TERM is
+ * what stops readline from falling back to its dumb-terminal line editor.
+ */
+static char *const g_init_env[] = {
+    (char *)"PATH=/bin:/usr/bin:/sbin:/usr/sbin",
+    (char *)"HOME=/root",
+    (char *)"TERM=linux",
+    (char *)"SHELL=/bin/bash",
+    (char *)"USER=root",
+    (char *)"LOGNAME=root",
+    (char *)"TMPDIR=/tmp",
+    (char *)"PWD=/",
+    NULL,
+};
+#define INIT_ENVC ((int)(sizeof(g_init_env) / sizeof(g_init_env[0])) - 1)
+
 int proc_spawn_init(const char *path)
 {
     char *argv[1];
@@ -333,7 +451,8 @@ int proc_spawn_init(const char *path)
 
     addrspace_t *as;
     uint64_t entry, sp;
-    int r = build_image(path, argv, 1, &as, &entry, &sp);
+    int r = build_image(path, argv, 1, g_init_env, INIT_ENVC,
+                        &as, &entry, &sp);
     if (r < 0)
         return r;
 
@@ -345,8 +464,12 @@ int proc_spawn_init(const char *path)
 
     p->ppid = 0;
     p->pgid = p->pid;
+    /* PID 1 is the session leader of the one session that exists at boot, and
+     * every process inherits that sid until something calls setsid(). */
+    p->sid  = p->pid;
     p->as   = as;
     strncpy(p->name, "init", sizeof(p->name) - 1);
+    proc_set_cmdline(p, &argv[0], 1);
 
     /* PID 1 is handed the console on fds 0/1/2; everything descended from it
      * inherits them through fork(), which is how a child shell ends up
@@ -388,6 +511,7 @@ int proc_fork(regs_t *r)
 
     child->ppid        = parent->pid;
     child->pgid        = parent->pgid;
+    child->sid         = parent->sid;
     child->sig_ignored = parent->sig_ignored;
     /* The child inherits the parent's whole memory profile: blocked
      * signals, the break, the TLS base and every anonymous mapping, so a
@@ -410,6 +534,8 @@ int proc_fork(regs_t *r)
     strncpy(child->cwd, parent->cwd, GNUOS_PATH_MAX - 1);
     child->umask           = parent->umask;
     strncpy(child->name, parent->name, sizeof(child->name) - 1);
+    memcpy(child->cmdline, parent->cmdline, parent->cmdline_len);
+    child->cmdline_len = parent->cmdline_len;
 
     /* Shared file offsets are the point of the reference count. */
     for (int i = 0; i < PROC_MAX_FD; i++) {
@@ -417,6 +543,8 @@ int proc_fork(regs_t *r)
         if (child->fds[i] >= 0)
             vfs_file_ref(child->fds[i]);
     }
+    /* fork copies the flag; only exec acts on it. */
+    child->fd_cloexec = parent->fd_cloexec;
 
     /* The child resumes exactly where the parent's syscall will return,
      * except that fork() reports 0 to it. */
@@ -428,41 +556,271 @@ int proc_fork(regs_t *r)
     return child->pid;
 }
 
+/* ---- clone ------------------------------------------------------------
+ * musl implements both fork() and pthread_create on top of the clone(2)
+ * syscall, so a musl-linked userland (OpenRC, bash, ...) depends on it even
+ * for a plain fork.  The toy has no copy-on-write and no shared-memory
+ * threads worth the bookkeeping, so every case is handled as a full address
+ * space copy -- exactly what proc_fork does.  That makes CLONE_VM "threads"
+ * independent copies rather than truly shared, which is wrong if something
+ * joins on a shared variable, but it cannot corrupt the parent's memory the
+ * way sharing the page tables would when the child exits first.  The handful
+ * of flags libc actually uses (TLS, the parent/child tid bookkeeping) are
+ * honoured so futex-based synchronisation at least has a real tid to aim at.
+ */
+#define CLONE_VM           0x00000100
+#define CLONE_SETTLS       0x00040000
+#define CLONE_PARENT_SETTID 0x00080000
+#define CLONE_CHILD_CLEARTID 0x00100000
+#define CLONE_CHILD_SETTID 0x00200000
+
+int proc_clone(regs_t *r)
+{
+    uint64_t  flags      = r->rdi;
+    void     *child_stack = (void *)r->rsi;
+    int      *parent_tid  = (int *)r->rdx;
+    int      *child_tid   = (int *)r->r10;
+    uintptr_t tls         = (uintptr_t)r->r8;
+
+    proc_t *parent = g_current;
+
+    proc_t *child = proc_alloc();
+    if (!child)
+        return -E_NOMEM;
+
+    /* No COW: the child gets its own copy of the parent's address space. */
+    child->as = vmm_clone(parent->as);
+    if (!child->as) {
+        child->state = PROC_UNUSED;
+        return -E_NOMEM;
+    }
+
+    child->ppid        = parent->pid;
+    child->pgid        = parent->pgid;
+    child->sid         = parent->sid;
+    child->sig_ignored = parent->sig_ignored;
+    child->sig_mask    = parent->sig_mask;
+    memcpy(child->sigact, parent->sigact, sizeof(child->sigact));
+    child->brk         = parent->brk;
+    child->fs_base     = parent->fs_base;
+    if (flags & CLONE_SETTLS)
+        child->fs_base = tls;
+    /* A plain copy inherits the parent's clear_child_tid; clone lets the
+     * caller set its own so a thread can be joined via FUTEX_WAIT on it. */
+    child->clear_child_tid = (flags & CLONE_CHILD_CLEARTID)
+                                 ? (uintptr_t)child_tid
+                                 : parent->clear_child_tid;
+    child->nmmaps      = parent->nmmaps;
+    for (int m = 0; m < parent->nmmaps; m++)
+        child->mmaps[m] = parent->mmaps[m];
+    strncpy(child->cwd, parent->cwd, GNUOS_PATH_MAX - 1);
+    child->umask       = parent->umask;
+    strncpy(child->name, parent->name, sizeof(child->name) - 1);
+    memcpy(child->cmdline, parent->cmdline, parent->cmdline_len);
+    child->cmdline_len = parent->cmdline_len;
+
+    for (int i = 0; i < PROC_MAX_FD; i++) {
+        child->fds[i] = parent->fds[i];
+        if (child->fds[i] >= 0)
+            vfs_file_ref(child->fds[i]);
+    }
+    child->fd_cloexec = parent->fd_cloexec;
+
+    /* CLONE_PARENT_SETTID is written into the *parent's* address space, and
+     * it happens immediately; CLONE_CHILD_SETTID is written into the child's
+     * once it starts (here, before it is marked runnable). */
+    if (flags & CLONE_PARENT_SETTID) {
+        int pid = child->pid;
+        vmm_copy_to_user(parent->as, (uint64_t)parent_tid, &pid, sizeof pid);
+    }
+    if (flags & CLONE_CHILD_SETTID) {
+        int pid = child->pid;
+        vmm_copy_to_user(child->as, (uint64_t)child_tid, &pid, sizeof pid);
+    }
+
+    regs_t f = *r;
+    f.rax = 0;
+    /* A thread (child_stack != NULL) must run on the stack libc prepared
+     * rather than the parent's copied one. */
+    if (child_stack)
+        f.rsp = (uint64_t)child_stack;
+    child->saved_rsp = build_startup_stack(child, &f);
+    child->state     = PROC_READY;
+
+    return child->pid;
+}
+
 /* ---- execve ----------------------------------------------------------- */
-int proc_execve(const char *path, char *const argv[], regs_t *r)
+/*
+ * Copy one string into the shared arena and hand back a pointer to it.
+ * Returns NULL when the arena is full, which the caller turns into E2BIG.
+ */
+static char *arena_dup(const char *s)
+{
+    uint32_t len = (uint32_t)strlen(s) + 1;
+    if (g_argused + len > sizeof(g_argbuf))
+        return NULL;
+    char *dst = g_argbuf + g_argused;
+    memcpy(dst, s, len);
+    g_argused += len;
+    return dst;
+}
+
+/*
+ * Resolve one level of `#!` interpretation.
+ *
+ * Returns 1 if `path` was a script and the vectors were rewritten, 0 if it
+ * was not a script (leave it alone and let the ELF loader have it), or a
+ * negative errno.
+ *
+ * The parsing rules are Linux's, from fs/binfmt_script.c, and the details
+ * matter for compatibility:
+ *
+ *   - only the first 256 bytes are examined, and a line longer than that with
+ *     no newline in it is not a script at all;
+ *   - everything after the interpreter path is ONE argument, not a word list.
+ *     "#!/bin/sh -eu" passes the single string "-eu"; it does not pass "-e"
+ *     and "-u".  Splitting it would break every script that relies on the
+ *     single-argument rule, which is most of the ones that use it;
+ *   - the original argv[0] is discarded and replaced by the interpreter, and
+ *     the script's own path is spliced in as the interpreter's first file
+ *     argument.
+ *
+ * The path we splice in is the already-normalised absolute one rather than
+ * the string the caller passed, so the interpreter can still find the script
+ * if it happens to chdir() before opening it.
+ */
+static int resolve_interp(char *pathbuf, char **args, int *argc)
+{
+    int h = vfs_file_open(pathbuf, O_RDONLY);
+    if (h < 0)
+        return 0;                       /* let build_image report the real error */
+
+    char hdr[257];
+    int32_t got = vfs_file_read(h, hdr, sizeof(hdr) - 1);
+    vfs_file_unref(h);
+    if (got < 2 || hdr[0] != '#' || hdr[1] != '!')
+        return 0;
+    hdr[got] = 0;
+
+    /* Truncate at the first newline.  No newline in the first 256 bytes means
+     * this is not a script header, whatever it looks like. */
+    char *nl = hdr;
+    while (*nl && *nl != '\n')
+        nl++;
+    if (*nl != '\n')
+        return -E_NOEXEC;
+    *nl = 0;
+
+    char *s = hdr + 2;
+    while (*s == ' ' || *s == '\t')
+        s++;
+    if (!*s)
+        return -E_NOEXEC;               /* "#!" with nothing after it */
+
+    char *interp = s;
+    while (*s && *s != ' ' && *s != '\t')
+        s++;
+    char *optarg = NULL;
+    if (*s) {
+        *s++ = 0;
+        while (*s == ' ' || *s == '\t')
+            s++;
+        if (*s) {
+            optarg = s;
+            /* Strip trailing whitespace so "#!/bin/sh -e   " does not pass an
+             * argument with three spaces glued to the end of it. */
+            char *e = optarg + strlen(optarg);
+            while (e > optarg && (e[-1] == ' ' || e[-1] == '\t'))
+                *--e = 0;
+        }
+    }
+
+    int extra = optarg ? 2 : 1;
+    if (*argc + extra > MAX_ARGS)
+        return -E_2BIG;
+
+    char *interp_c = arena_dup(interp);
+    char *optarg_c = optarg ? arena_dup(optarg) : NULL;
+    char *script_c = arena_dup(pathbuf);
+    if (!interp_c || !script_c || (optarg && !optarg_c))
+        return -E_2BIG;
+
+    /* Shift the caller's arguments up, dropping the old argv[0], and write
+     * the new head of the vector underneath them. */
+    for (int i = *argc - 1; i >= 1; i--)
+        args[i + extra] = args[i];
+    args[0] = interp_c;
+    if (optarg_c) {
+        args[1] = optarg_c;
+        args[2] = script_c;
+    } else {
+        args[1] = script_c;
+    }
+    *argc += extra;
+
+    strncpy(pathbuf, interp_c, GNUOS_PATH_MAX - 1);
+    pathbuf[GNUOS_PATH_MAX - 1] = 0;
+    return 1;
+}
+
+int proc_execve(const char *path, char *const argv[], char *const envp[],
+                regs_t *r)
 {
     proc_t *p = g_current;
 
-    /* Copy the argument vector out of the old address space before we throw
-     * it away; the strings live in the caller's memory. */
-    char  argbuf[ARG_BYTES];
-    char *args[MAX_ARGS];
-    int   argc = 0;
-    uint32_t used = 0;
+    /*
+     * Copy both vectors out of the old address space before we throw it
+     * away; the strings live in the caller's memory and every pointer in
+     * them dies with it.  argv and envp share one arena, so a program with a
+     * huge environment has correspondingly less room for arguments -- which
+     * is exactly how Linux's ARG_MAX behaves too.
+     */
+    g_argused = 0;
 
+    int argc = 0;
     while (argc < MAX_ARGS && argv && argv[argc]) {
-        const char *s = argv[argc];
-        uint32_t len = (uint32_t)strlen(s) + 1;
-        if (used + len > sizeof(argbuf))
-            return -E_INVAL;
-        memcpy(argbuf + used, s, len);
-        args[argc] = argbuf + used;
-        used += len;
-        argc++;
+        char *c = arena_dup(argv[argc]);
+        if (!c)
+            return -E_2BIG;
+        g_args[argc++] = c;
     }
     if (argc == 0) {
-        strncpy(argbuf, path, sizeof(argbuf) - 1);
-        args[0] = argbuf;
-        argc = 1;
+        char *c = arena_dup(path);
+        if (!c)
+            return -E_2BIG;
+        g_args[argc++] = c;
     }
 
-    char pathbuf[64];
+    int envc = 0;
+    while (envc < MAX_ENVS && envp && envp[envc]) {
+        char *c = arena_dup(envp[envc]);
+        if (!c)
+            return -E_2BIG;
+        g_envs[envc++] = c;
+    }
+    g_args[argc] = NULL;
+    g_envs[envc] = NULL;
+
+    char pathbuf[GNUOS_PATH_MAX];
     strncpy(pathbuf, path, sizeof(pathbuf) - 1);
     pathbuf[sizeof(pathbuf) - 1] = 0;
 
+    /* Chase `#!` lines until we reach something the ELF loader can take. */
+    for (int depth = 0; ; depth++) {
+        if (depth >= EXEC_INTERP_MAX)
+            return -E_LOOP;
+        int got = resolve_interp(pathbuf, g_args, &argc);
+        if (got < 0)
+            return got;
+        if (got == 0)
+            break;
+        g_args[argc] = NULL;
+    }
+
     addrspace_t *as;
     uint64_t entry, sp;
-    int rc = build_image(pathbuf, args, argc, &as, &entry, &sp);
+    int rc = build_image(pathbuf, g_args, argc, g_envs, envc, &as, &entry, &sp);
     if (rc < 0)
         return rc;
 
@@ -471,6 +829,24 @@ int proc_execve(const char *path, char *const argv[], regs_t *r)
     p->as = as;
     vmm_switch(as);
     vmm_destroy(old);
+
+    /*
+     * Only now do the close-on-exec descriptors actually close.  Doing it
+     * any earlier would be a bug: an exec that fails (missing file, bad
+     * ELF) must leave the caller exactly as it was, and a shell that has
+     * already closed the pipe it was about to report the error down has no
+     * way to complain.
+     */
+    for (int i = 0; i < PROC_MAX_FD; i++) {
+        if ((p->fd_cloexec & (1ULL << i)) && p->fds[i] >= 0) {
+            vfs_file_unref(p->fds[i]);
+            p->fds[i] = -1;
+        }
+    }
+    p->fd_cloexec = 0;
+
+    /* Record what we are running now, for /proc/[pid]/cmdline and ps. */
+    proc_set_cmdline(p, g_args, argc);
 
     /* A fresh image gets a fresh break and no TLS/mappings of its own. */
     p->brk             = USER_BRK_BASE;
@@ -593,8 +969,16 @@ int proc_waitpid(int pid, int *status, int options)
         p->wait_reason  = WAIT_CHILD;
         sched_block(WAIT_CHILD);
 
-        /* A signal can break the sleep without a child having exited. */
-        if (proc_pending_signals(p))
+        /*
+         * A signal can break the sleep without a child having exited.
+         * SIGCHLD is the exception, and it has to be: it is almost always
+         * the very wakeup we were waiting for, so returning EINTR here
+         * would mean wait() never once succeeded on a process that
+         * installed a SIGCHLD handler.  Loop round and reap instead; the
+         * handler still runs on the way back to user mode, and if nothing
+         * turned out to be collectable we simply block again.
+         */
+        if (proc_pending_signals(p) & ~SIGMASK(SIGCHLD))
             return -E_INTR;
     }
 }
@@ -611,8 +995,31 @@ static int sig_is_ignored_by_default(int s)
     return s == SIGCHLD;
 }
 
-/* Signals that must never abort a blocking system call. */
-#define SIG_NOINTR  (SIGMASK(SIGCHLD) | SIGMASK(SIGCONT))
+/*
+ * Signals that must never abort a blocking system call.  SIGCONT is here
+ * because by the time anyone inspects the pending set the process has
+ * already been resumed -- the wakeup was the whole point of the signal, and
+ * there is nothing further to report.
+ */
+#define SIG_NOINTR  (SIGMASK(SIGCONT))
+
+/*
+ * Does delivering this signal actually do anything?  A signal whose default
+ * action is "ignore" and for which no handler is installed is dropped on the
+ * way back to user mode, so letting it break a blocking call would hand the
+ * caller an EINTR with nothing behind it: the program restarts the call,
+ * finds the world unchanged, and the only trace is a mysterious short read.
+ * Once a handler exists the signal does have an effect and POSIX wants the
+ * call interrupted so that handler can run -- which is exactly what a shell
+ * relies on to reap background jobs while sitting in read().
+ */
+static int sig_has_effect(const proc_t *p, int s)
+{
+    if (!sig_is_ignored_by_default(s))
+        return 1;
+    /* 0 is SIG_DFL and 1 is SIG_IGN; anything else is a real handler. */
+    return p->sigact[s].handler > 1;
+}
 
 uint64_t proc_pending_signals(const proc_t *p)
 {
@@ -621,7 +1028,13 @@ uint64_t proc_pending_signals(const proc_t *p)
     /* A blocked signal must not break a sleeper out of its call: nobody is
      * going to deliver it on the way back, so the caller would just return
      * EINTR, be restarted, and hit the same still-pending bit forever. */
-    return p->sig_pending & ~p->sig_ignored & ~p->sig_mask & ~SIG_NOINTR;
+    uint64_t s = p->sig_pending & ~p->sig_ignored & ~p->sig_mask & ~SIG_NOINTR;
+
+    for (int sig = 1; sig < NSIG; sig++)
+        if ((s & SIGMASK(sig)) && !sig_has_effect(p, sig))
+            s &= ~SIGMASK(sig);
+
+    return s;
 }
 
 int proc_signal_blocked(const proc_t *p, int sig)

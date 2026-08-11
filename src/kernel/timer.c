@@ -21,6 +21,9 @@
 
 static volatile uint64_t g_ticks;
 
+/* Defined below, next to the rest of the real-time-clock code. */
+static void rtc_read_boot_epoch(void);
+
 static inline void outb(uint16_t port, uint8_t v)
 {
     asm volatile("outb %0, %1" :: "a"(v), "Nd"(port));
@@ -81,6 +84,7 @@ void timer_init(unsigned hz)
     outb(PIT_CH0, (uint8_t)(divisor >> 8));
 
     irq_install(0, timer_irq);
+    rtc_read_boot_epoch();
 
     dbg_puts("TIMER: PIT at ");
     dbg_puts_dec(hz);
@@ -92,6 +96,126 @@ void timer_init(unsigned hz)
 uint64_t timer_ticks(void)
 {
     return g_ticks;
+}
+
+/* ---- the CMOS real-time clock -----------------------------------------
+ *
+ * The PIT counts, but it does not know what time it is.  The date comes
+ * from the battery-backed clock behind ports 0x70/0x71, read exactly once
+ * at boot: it is a slow, byte-at-a-time interface, and re-reading it on
+ * every gettimeofday() would make the cheapest system call in the set one
+ * of the most expensive.  Wall-clock time is therefore this epoch plus the
+ * tick counter, which also makes time strictly monotonic -- something the
+ * RTC on its own does not guarantee.
+ */
+#define CMOS_ADDR  0x70
+#define CMOS_DATA  0x71
+
+static uint8_t cmos_read(uint8_t reg)
+{
+    /* Bit 7 of the index port is the NMI disable line; leave it clear. */
+    outb(CMOS_ADDR, reg & 0x7F);
+    return inb(CMOS_DATA);
+}
+
+static int cmos_updating(void)
+{
+    return (cmos_read(0x0A) & 0x80) != 0;
+}
+
+static uint32_t bcd_to_bin(uint8_t v)
+{
+    return (v & 0x0F) + ((v >> 4) * 10);
+}
+
+/* Days from 1970-01-01 to the first of the given month, proleptic Gregorian.
+ * Written as a closed form rather than a loop over years because it has to
+ * be correct for dates well past 2038 and a loop is only correct until
+ * someone stops testing it. */
+static uint64_t days_from_civil(uint32_t y, uint32_t m, uint32_t d)
+{
+    y -= m <= 2;
+    uint32_t era = y / 400;
+    uint32_t yoe = y - era * 400;                           /* [0, 399] */
+    uint32_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;   /* [0, 146096] */
+    /* 719468 is the number of days from 0000-03-01 to 1970-01-01. */
+    return (uint64_t)era * 146097 + doe - 719468;
+}
+
+static uint64_t g_boot_epoch;
+
+static void rtc_read_boot_epoch(void)
+{
+    /*
+     * Read the whole clock twice and only accept a pair of identical
+     * readings taken outside an update cycle.  A single read can catch the
+     * chip mid-carry and return 01:59:60 rolling into 02:00:00 -- the
+     * classic way to be an hour wrong once in a very long while.
+     */
+    uint8_t s = 0, mi = 0, h = 0, d = 0, mo = 0, y = 0, cent = 0, regb = 0;
+
+    for (int tries = 0; tries < 1000; tries++) {
+        while (cmos_updating())
+            ;
+
+        uint8_t s2 = cmos_read(0x00), mi2 = cmos_read(0x02);
+        uint8_t h2 = cmos_read(0x04), d2  = cmos_read(0x07);
+        uint8_t mo2 = cmos_read(0x08), y2 = cmos_read(0x09);
+        uint8_t c2 = cmos_read(0x32);
+
+        if (tries && s == s2 && mi == mi2 && h == h2 && d == d2 &&
+            mo == mo2 && y == y2) {
+            cent = c2;
+            regb = cmos_read(0x0B);
+            break;
+        }
+        s = s2; mi = mi2; h = h2; d = d2; mo = mo2; y = y2;
+        cent = c2;
+        regb = cmos_read(0x0B);
+    }
+
+    if (!mo || mo > 12 || !d || d > 31)
+        return;                         /* no usable clock; stay at the epoch */
+
+    uint32_t hour24 = h;
+    /* Bit 2 of register B: set means the values are already binary. */
+    if (!(regb & 0x04)) {
+        s  = (uint8_t)bcd_to_bin(s);
+        mi = (uint8_t)bcd_to_bin(mi);
+        d  = (uint8_t)bcd_to_bin(d);
+        mo = (uint8_t)bcd_to_bin(mo);
+        y  = (uint8_t)bcd_to_bin(y);
+        cent = (uint8_t)bcd_to_bin(cent);
+        /* In 12-hour BCD mode bit 7 is the PM flag and has to come off
+         * before the digits are converted. */
+        hour24 = bcd_to_bin((uint8_t)(h & 0x7F));
+    }
+    /* Bit 1 of register B clear means 12-hour mode: 12 AM is 0, 12 PM is 12. */
+    if (!(regb & 0x02)) {
+        if (hour24 == 12)
+            hour24 = 0;
+        if (h & 0x80)
+            hour24 += 12;
+    }
+
+    /* The century register is optional and reads as garbage on plenty of
+     * machines; only trust something plausible. */
+    uint32_t year = (cent >= 19 && cent <= 21) ? cent * 100 + y : 2000 + y;
+
+    g_boot_epoch = days_from_civil(year, mo, d) * 86400ULL +
+                   (uint64_t)hour24 * 3600 + (uint64_t)mi * 60 + s;
+
+    /* The RTC is in whatever zone the firmware keeps it in, most often UTC.
+     * We have no timezone database, so it is taken as UTC and left there. */
+    dbg_puts("TIMER: RTC epoch ");
+    dbg_puts_dec((uint32_t)g_boot_epoch);
+    dbg_puts("\r\n");
+}
+
+uint64_t timer_boot_epoch(void)
+{
+    return g_boot_epoch;
 }
 
 /*

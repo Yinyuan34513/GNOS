@@ -40,7 +40,9 @@ static void wrmsr(uint32_t msr, uint64_t val)
     asm volatile("wrmsr" : : "c"(msr), "a"(lo), "d"(hi));
 }
 
-#define MAX_ARGV    16
+/* Room for a shell's environment plus a long command line.  bash alone
+ * exports about 30 variables before it runs anything. */
+#define MAX_ARGV    128
 
 /* user_ptr_ok() now lives in vmm.c (the network ioctl path needs it too);
  * it is declared in vmm.h, which this file includes. */
@@ -174,6 +176,9 @@ static int fd_alloc(proc_t *p, int handle)
     for (int fd = 0; fd < PROC_MAX_FD; fd++) {
         if (p->fds[fd] < 0) {
             p->fds[fd] = handle;
+            /* A recycled descriptor number must not inherit the previous
+             * tenant's close-on-exec flag. */
+            p->fd_cloexec &= ~(1ULL << fd);
             return fd;
         }
     }
@@ -188,6 +193,11 @@ static int64_t open_resolved(const char *abs, int flags)
     if (!p)
         return -E_INVAL;
 
+    /* O_CLOEXEC describes the descriptor, not the open file, so it is
+     * stripped here and never reaches the filesystem layer. */
+    int cloexec = (flags & O_CLOEXEC) != 0;
+    flags &= ~O_CLOEXEC;
+
     int h = vfs_file_open(abs, flags);
     if (h < 0)
         return h;
@@ -197,6 +207,8 @@ static int64_t open_resolved(const char *abs, int flags)
         vfs_file_unref(h);
         return fd;
     }
+    if (cloexec)
+        p->fd_cloexec |= 1ULL << fd;
     return fd;
 }
 
@@ -223,9 +235,14 @@ static int64_t sys_openat(int dfd, uint64_t upath, int flags)
 }
 
 /*
- * fcntl(72).  opendir() and the stdio layer probe/set FD_CLOEXEC here.  We do
- * not track close-on-exec yet, so GET/SET are accepted as no-ops; DUPFD hands
- * back a second descriptor onto the same open file.
+ * fcntl(72).  opendir() and the stdio layer probe/set FD_CLOEXEC here, and a
+ * shell depends on it for real: every fd it keeps for its own bookkeeping
+ * (the saved terminal, the script it is reading, the fd a here-document
+ * lives on) is marked close-on-exec so the command it runs cannot see them.
+ * The flag is per-descriptor, not per-open-file, so it lives in the process
+ * bitmap rather than in the file table -- dup()ing a cloexec fd gives you a
+ * second one that is *not* cloexec, which is exactly how a shell moves a
+ * descriptor out of the way before exec.
  */
 static int64_t sys_fcntl(int fd, int cmd, uint64_t arg)
 {
@@ -248,10 +265,24 @@ static int64_t sys_fcntl(int fd, int cmd, uint64_t arg)
             return -E_MFILE;
         p->fds[newfd] = h;
         vfs_file_ref(h);
+        if (cmd == F_DUPFD_CLOEXEC)
+            p->fd_cloexec |= 1ULL << newfd;
+        else
+            p->fd_cloexec &= ~(1ULL << newfd);
         return newfd;
     }
-    case F_GETFD:  return 0;          /* no FD_CLOEXEC tracking yet */
-    case F_SETFD:  return 0;
+    case F_GETFD:
+        if (!p)
+            return -E_BADF;
+        return (p->fd_cloexec & (1ULL << fd)) ? FD_CLOEXEC : 0;
+    case F_SETFD:
+        if (!p)
+            return -E_BADF;
+        if (arg & FD_CLOEXEC)
+            p->fd_cloexec |= 1ULL << fd;
+        else
+            p->fd_cloexec &= ~(1ULL << fd);
+        return 0;
     case F_GETFL: {
         /* Access mode (the low two bits) plus, for sockets, the O_NONBLOCK
          * bit that lives in the socket itself.  musl and BusyBox read this to
@@ -283,6 +314,7 @@ static int64_t sys_close(int fd)
 
     vfs_file_unref(p->fds[fd]);
     p->fds[fd] = -1;
+    p->fd_cloexec &= ~(1ULL << fd);
     return 0;
 }
 
@@ -300,7 +332,7 @@ static int64_t sys_dup(int oldfd)
     return fd;
 }
 
-static int64_t sys_dup2(int oldfd, int newfd)
+static int64_t do_dup2(int oldfd, int newfd, int cloexec)
 {
     proc_t *p = proc_current();
     if (!p || oldfd < 0 || oldfd >= PROC_MAX_FD || p->fds[oldfd] < 0)
@@ -314,7 +346,33 @@ static int64_t sys_dup2(int oldfd, int newfd)
         vfs_file_unref(p->fds[newfd]);
     p->fds[newfd] = p->fds[oldfd];
     vfs_file_ref(p->fds[newfd]);
+    /* The new descriptor gets its own flag; the old one keeps whatever it
+     * had.  A shell dup2()s a cloexec fd onto 0/1/2 precisely because the
+     * copy is *not* close-on-exec. */
+    if (cloexec)
+        p->fd_cloexec |= 1ULL << newfd;
+    else
+        p->fd_cloexec &= ~(1ULL << newfd);
     return newfd;
+}
+
+static int64_t sys_dup2(int oldfd, int newfd)
+{
+    return do_dup2(oldfd, newfd, 0);
+}
+
+/*
+ * dup3(292): dup2 with a flags word.  musl's dup2 falls back to this on
+ * architectures without a real dup2, and O_CLOEXEC is the only flag
+ * defined.  Unlike dup2, dup3 with oldfd == newfd is an error, not a no-op.
+ */
+static int64_t sys_dup3(int oldfd, int newfd, int flags)
+{
+    if (flags & ~O_CLOEXEC)
+        return -E_INVAL;
+    if (oldfd == newfd)
+        return -E_INVAL;
+    return do_dup2(oldfd, newfd, (flags & O_CLOEXEC) != 0);
 }
 
 /* ---- names ------------------------------------------------------------ */
@@ -346,9 +404,9 @@ static int64_t sys_gstat(uint64_t upath, uint64_t ust)
     return 0;
 }
 
-/* Linux-style stat from a path (SYS_stat=4 / SYS_lstat=6, no symlinks yet, so
- * the two are the same call). */
-static int64_t sys_stat(uint64_t upath, uint64_t ust)
+/* Linux-style stat from a path.  `follow` selects stat() (1, chase the final
+ * symlink) vs lstat() (0, report the symlink itself). */
+static int64_t sys_stat(uint64_t upath, uint64_t ust, int follow)
 {
     if (!user_ptr_ok(ust, sizeof(lstat_t)))
         return -E_INVAL;
@@ -357,7 +415,7 @@ static int64_t sys_stat(uint64_t upath, uint64_t ust)
     int  r = path_abs(upath, abs);
     if (r < 0)
         return r;
-    return vfs_stat_linux(abs, (lstat_t *)(uintptr_t)ust);
+    return vfs_stat_linux(abs, (lstat_t *)(uintptr_t)ust, follow);
 }
 
 /* Linux-style fstat from a descriptor (SYS_fstat=5). */
@@ -366,6 +424,32 @@ static int64_t sys_fstat(int fd, uint64_t ust)
     if (!user_ptr_ok(ust, sizeof(lstat_t)))
         return -E_INVAL;
     return vfs_fstat(fd_handle(fd), (lstat_t *)(uintptr_t)ust);
+}
+
+/* readlink()/readlinkat(): copy the link target into `ubuf` (up to `usize`
+ * bytes, no NUL terminator) and return the target length. */
+static int64_t do_readlink(const char *abs, uint64_t ubuf, uint64_t usize)
+{
+    char kbuf[4096];
+    int  n = vfs_readlink(abs, kbuf, sizeof(kbuf));
+    if (n < 0)
+        return n;
+
+    uint64_t w = (usize < (uint64_t)n) ? usize : (uint64_t)n;
+    if (w && user_ptr_ok(ubuf, w))
+        memcpy((void *)(uintptr_t)ubuf, kbuf, w);
+    else if (w)
+        return -E_INVAL;
+    return (int64_t)n;
+}
+
+static int64_t sys_readlink(const char *upath, uint64_t ubuf, uint64_t usize)
+{
+    char abs[GNUOS_PATH_MAX];
+    int  r = path_abs((uint64_t)(uintptr_t)upath, abs);
+    if (r < 0)
+        return r;
+    return do_readlink(abs, ubuf, usize);
 }
 
 /*
@@ -384,7 +468,8 @@ static int64_t sys_newfstatat(int fd, uint64_t upath, uint64_t ust, uint64_t fla
     int  r = path_at(fd, upath, abs);
     if (r < 0)
         return r;
-    return vfs_stat_linux(abs, (lstat_t *)(uintptr_t)ust);
+    return vfs_stat_linux(abs, (lstat_t *)(uintptr_t)ust,
+                          (flags & AT_SYMLINK_NOFOLLOW) ? 0 : 1);
 }
 
 /* ---- the current directory -------------------------------------------- */
@@ -498,6 +583,134 @@ static int64_t sys_gethostname(uint64_t ubuf, uint64_t sz)
     return 0;
 }
 
+/* ---- getrandom(318) ---------------------------------------------------
+ * Fill `buf` with `usize` pseudo-random bytes.  We have no hardware entropy
+ * source, so this is a fast xorshift64 stream seeded from the TSC plus a
+ * global counter -- "insecure" by construction, but perfectly good for the
+ * things a boot actually uses it for (ASLR-ish, seedrng's seed, temp names).
+ * The GRND_* flags are all honoured trivially: we never block.
+ */
+static uint64_t g_rng_state;
+static inline uint64_t rdtsc(void)
+{
+    uint32_t lo, hi;
+    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+static uint64_t rng_u64(void)
+{
+    uint64_t x = g_rng_state;
+    if (x == 0)
+        x = 0x9E3779B97F4A7C15ULL;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    g_rng_state = x;
+    return x;
+}
+void krandom_bytes(void *buf, uint32_t n)
+{
+    if (g_rng_state == 0)
+        g_rng_state = rdtsc() ^ 0x9E3779B97F4A7C15ULL;
+    uint8_t *p = (uint8_t *)buf;
+    uint32_t done = 0;
+    while (done < n) {
+        uint64_t w = rng_u64();
+        uint32_t chunk = n - done;
+        if (chunk > 8)
+            chunk = 8;
+        memcpy(p + done, &w, chunk);
+        done += chunk;
+    }
+}
+
+static int64_t sys_getrandom(uint64_t ubuf, uint64_t usize, uint64_t uflags)
+{
+    (void)uflags;
+    if (usize == 0)
+        return 0;
+    /* Cap to keep a huge request from faulting on a user buffer we only
+     * range-checked at the start.  64 MB is far above anything reasonable. */
+    if (usize > 64u * 1024 * 1024)
+        usize = 64u * 1024 * 1024;
+    if (!user_ptr_ok(ubuf, 1))
+        return -E_FAULT;
+    if (g_rng_state == 0)
+        g_rng_state = rdtsc() ^ 0x9E3779B97F4A7C15ULL;
+
+    uint8_t *u = (uint8_t *)(uintptr_t)ubuf;
+    size_t n = (size_t)usize;
+    size_t done = 0;
+    while (done < n) {
+        uint64_t w = rng_u64();
+        size_t chunk = n - done;
+        if (chunk > 8)
+            chunk = 8;
+        memcpy(u + done, &w, chunk);
+        done += chunk;
+    }
+    return (int64_t)n;
+}
+
+/* ---- mount(165) / umount2(166) ---------------------------------------
+ * Only tmpfs is mountable; everything else (proc/sysfs/devtmpfs) is either
+ * already special-cased by the VFS (/proc) or intentionally left alone
+ * (/dev must keep its static device nodes).  MS_REMOUNT is accepted as a
+ * no-op so shutdown-style "mount -o remount,ro" does not fail the boot.
+ */
+#define MS_REMOUNT 0x20
+
+static int64_t sys_mount(uint64_t usrc, uint64_t utgt, uint64_t ufs,
+                         uint64_t uflags, uint64_t udata)
+{
+    (void)usrc;
+    (void)udata;
+
+    if (!user_ptr_ok(utgt, 1))
+        return -E_FAULT;
+    char tgt[GNUOS_PATH_MAX];
+    strncpy(tgt, (const char *)(uintptr_t)utgt, GNUOS_PATH_MAX - 1);
+    tgt[GNUOS_PATH_MAX - 1] = 0;
+
+    char fst[32];
+    if (ufs) {
+        if (!user_ptr_ok(ufs, 1))
+            return -E_FAULT;
+        strncpy(fst, (const char *)(uintptr_t)ufs, sizeof(fst) - 1);
+        fst[sizeof(fst) - 1] = 0;
+    } else {
+        fst[0] = 0;
+    }
+
+    char abs[GNUOS_PATH_MAX];
+    int r = path_norm("/", tgt, abs);
+    if (r < 0)
+        return r;
+
+    if (uflags & MS_REMOUNT)
+        return 0;                       /* ro/rw tracking is not implemented */
+
+    if (strcmp(fst, "tmpfs") != 0)
+        return -E_NODEV;
+
+    return vfs_mount_tmpfs(abs);
+}
+
+static int64_t sys_umount2(uint64_t utgt, uint64_t uflags)
+{
+    (void)uflags;
+    if (!user_ptr_ok(utgt, 1))
+        return -E_FAULT;
+    char tgt[GNUOS_PATH_MAX];
+    strncpy(tgt, (const char *)(uintptr_t)utgt, GNUOS_PATH_MAX - 1);
+    tgt[GNUOS_PATH_MAX - 1] = 0;
+    char abs[GNUOS_PATH_MAX];
+    int r = path_norm("/", tgt, abs);
+    if (r < 0)
+        return r;
+    return vfs_umount(abs);
+}
+
 /* ---- interval timers --------------------------------------------------
  * setitimer(38)/getitimer(36)/alarm(37), ITIMER_REAL only.
  *
@@ -510,20 +723,23 @@ static int64_t sys_gethostname(uint64_t ubuf, uint64_t sz)
  */
 #define ITIMER_REAL     0
 
-typedef struct { int64_t tv_sec; int64_t tv_usec; } ktimeval_t;
+/* ktimeval_t is the shared struct timeval from sysnum.h. */
 typedef struct { ktimeval_t it_interval; ktimeval_t it_value; } kitimerval_t;
 
-/* A tick is 10 ms (SCHED_HZ is 100).  Round up: a sub-tick delay truncated to
- * zero would read back as "disarmed" and the signal would never arrive. */
+#define USEC_PER_TICK (1000000ULL / SCHED_HZ)
+
+/* Round up: a sub-tick delay truncated to zero would read back as
+ * "disarmed" and the signal would never arrive. */
 static uint64_t tv_to_ticks(const ktimeval_t *tv)
 {
-    return (uint64_t)tv->tv_sec * 100 + ((uint64_t)tv->tv_usec + 9999) / 10000;
+    return (uint64_t)tv->tv_sec * SCHED_HZ +
+           ((uint64_t)tv->tv_usec + USEC_PER_TICK - 1) / USEC_PER_TICK;
 }
 
 static void ticks_to_tv(uint64_t ticks, ktimeval_t *tv)
 {
-    tv->tv_sec  = (int64_t)(ticks / 100);
-    tv->tv_usec = (int64_t)(ticks % 100) * 10000;
+    tv->tv_sec  = (int64_t)(ticks / SCHED_HZ);
+    tv->tv_usec = (int64_t)(ticks % SCHED_HZ) * (int64_t)USEC_PER_TICK;
 }
 
 /* How long is left on p's timer, in ticks; 0 when it is not armed. */
@@ -648,7 +864,29 @@ static int64_t sys_access(int dfd, uint64_t upath, int at)
         return r;
 
     lstat_t st;
-    return vfs_stat_linux(abs, &st);
+    return vfs_stat_linux(abs, &st, 1);
+}
+
+/*
+ * getresuid(118)/getresgid(120): every r/e/s uid/gid is 0 (single root user).
+ * Each pointer may be NULL; write 0 only through the non-NULL ones.
+ */
+static int64_t sys_getresuid(uint64_t ruid, uint64_t euid, uint64_t suid)
+{
+    uint32_t z = 0;
+    if (ruid && user_ptr_ok(ruid, 4)) *(uint32_t *)(uintptr_t)ruid = z;
+    if (euid && user_ptr_ok(euid, 4)) *(uint32_t *)(uintptr_t)euid = z;
+    if (suid && user_ptr_ok(suid, 4)) *(uint32_t *)(uintptr_t)suid = z;
+    return 0;
+}
+
+static int64_t sys_getresgid(uint64_t rgid, uint64_t egid, uint64_t sgid)
+{
+    uint32_t z = 0;
+    if (rgid && user_ptr_ok(rgid, 4)) *(uint32_t *)(uintptr_t)rgid = z;
+    if (egid && user_ptr_ok(egid, 4)) *(uint32_t *)(uintptr_t)egid = z;
+    if (sgid && user_ptr_ok(sgid, 4)) *(uint32_t *)(uintptr_t)sgid = z;
+    return 0;
 }
 
 /* getdents64(217): fill a musl struct dirent buffer from a directory fd. */
@@ -667,10 +905,16 @@ static int64_t sys_getdents64(int fd, uint64_t ubuf, uint64_t len)
  * first must go back, or a shell that hits the limit leaks a pipe end and
  * its reader never sees end-of-file.
  */
-static int64_t sys_pipe(uint64_t ufds)
+static int64_t sys_pipe2(uint64_t ufds, int flags)
 {
     proc_t *p = proc_current();
     if (!p || !user_ptr_ok(ufds, 2 * sizeof(int)))
+        return -E_INVAL;
+    /* O_NONBLOCK is accepted but does nothing: the pipe's read and write
+     * paths live below the descriptor layer and always block.  Rejecting it
+     * would be worse -- callers pass it opportunistically and treat the
+     * failure as fatal. */
+    if (flags & ~(O_CLOEXEC | O_NONBLOCK))
         return -E_INVAL;
 
     int rh, wh;
@@ -693,10 +937,18 @@ static int64_t sys_pipe(uint64_t ufds)
         return wfd;
     }
 
+    if (flags & O_CLOEXEC)
+        p->fd_cloexec |= (1ULL << rfd) | (1ULL << wfd);
+
     int *out = (int *)(uintptr_t)ufds;
     out[0] = rfd;
     out[1] = wfd;
     return 0;
+}
+
+static int64_t sys_pipe(uint64_t ufds)
+{
+    return sys_pipe2(ufds, 0);
 }
 
 /* ---- sockets -----------------------------------------------------------
@@ -976,34 +1228,42 @@ static int64_t sys_getsockopt(int fd, int level, int name, uint64_t uval,
 
 /* ---- execve argument vector ------------------------------------------- */
 /*
- * Validate the user's argv and flatten it into a kernel-side array of
- * pointers.  The strings themselves stay in user memory: proc_execve() copies
- * them out while the old address space is still the current one.
+ * Validate one of the user's NULL-terminated pointer vectors and flatten it
+ * into a kernel-side array.  The strings themselves stay in user memory:
+ * proc_execve() copies them out while the old address space is still the
+ * current one.
+ *
+ * A vector longer than the array is E2BIG rather than a silent truncation.
+ * Quietly dropping the tail of an environment is the kind of bug that shows
+ * up much later as a program mysteriously ignoring $PATH.
  */
 static char *g_argv[MAX_ARGV + 1];
+static char *g_envp[MAX_ARGV + 1];
 
-static int collect_argv(uint64_t uargv)
+static int collect_vec(uint64_t uvec, char **dst)
 {
-    g_argv[0] = NULL;
-    if (!uargv)
+    dst[0] = NULL;
+    if (!uvec)
         return 0;
-    if (!user_ptr_ok(uargv, 8))
+    if (!user_ptr_ok(uvec, 8))
         return -E_INVAL;
 
-    char *const *ua = (char *const *)(uintptr_t)uargv;
+    char *const *ua = (char *const *)(uintptr_t)uvec;
 
     int n = 0;
-    for (; n < MAX_ARGV; n++) {
+    for (; n <= MAX_ARGV; n++) {
         if (!user_ptr_ok((uint64_t)(uintptr_t)&ua[n], 8))
             return -E_INVAL;
         char *s = ua[n];
         if (!s)
             break;
+        if (n == MAX_ARGV)
+            return -E_2BIG;
         if (!user_ptr_ok((uint64_t)(uintptr_t)s, 1))
             return -E_INVAL;
-        g_argv[n] = s;
+        dst[n] = s;
     }
-    g_argv[n] = NULL;
+    dst[n] = NULL;
     return n;
 }
 
@@ -1214,8 +1474,14 @@ static inline void fdset_set(fdset_t *s, int fd)
     (*s)[fd / 64] |= (1ull << (fd % 64));
 }
 
-static int64_t sys_select(int nfds, uint64_t ur, uint64_t uw, uint64_t ue,
-                          uint64_t utv)
+/*
+ * Shared body for select(23) and pselect6(270).  Both take the same classic
+ * fd_set bitmaps (read/write/except) -- 128 bytes of 1024 bits, the layout
+ * musl's fd_set uses -- and differ only in timeout encoding.  exceptfds are
+ * never set: nothing this kernel reports counts as an exceptional condition.
+ */
+static int64_t select_common(int nfds, uint64_t ur, uint64_t uw, uint64_t ue,
+                             int64_t ticks)
 {
     if (nfds < 0)
         return -E_INVAL;
@@ -1241,19 +1507,6 @@ static int64_t sys_select(int nfds, uint64_t ur, uint64_t uw, uint64_t ue,
         *(int16_t *)(pbuf + i*8 + 6) = 0;
     }
 
-    /* Translate the timeval (NULL => block forever) into timer ticks. */
-    int64_t ticks = -1;
-    if (utv) {
-        struct { int64_t tv_sec; int64_t tv_usec; } tv;
-        if (!user_ptr_ok(utv, sizeof(tv)))
-            return -E_FAULT;
-        memcpy(&tv, (const void *)(uintptr_t)utv, sizeof(tv));
-        if (tv.tv_sec == 0 && tv.tv_usec == 0)
-            ticks = 0;
-        else
-            ticks = (int64_t)tv.tv_sec * 100 + (int64_t)tv.tv_usec / 10000;
-    }
-
     int64_t r = do_ppoll(pbuf, (uint64_t)nfds, ticks);
     if (r < 0)
         return r;
@@ -1267,9 +1520,50 @@ static int64_t sys_select(int nfds, uint64_t ur, uint64_t uw, uint64_t ue,
     }
     if (ur) memcpy((void *)(uintptr_t)ur, &out_r, sizeof(out_r));
     if (uw) memcpy((void *)(uintptr_t)uw, &out_w, sizeof(out_w));
-    /* exceptfds (ue) is left cleared: we never report exceptional conditions */
     (void)ue;
     return r;
+}
+
+static int64_t sys_select(int nfds, uint64_t ur, uint64_t uw, uint64_t ue,
+                          uint64_t utv)
+{
+    /* Translate the timeval (NULL => block forever) into timer ticks. */
+    int64_t ticks = -1;
+    if (utv) {
+        struct { int64_t tv_sec; int64_t tv_usec; } tv;
+        if (!user_ptr_ok(utv, sizeof(tv)))
+            return -E_FAULT;
+        memcpy(&tv, (const void *)(uintptr_t)utv, sizeof(tv));
+        if (tv.tv_sec == 0 && tv.tv_usec == 0)
+            ticks = 0;
+        else
+            ticks = (int64_t)tv.tv_sec * 100 + (int64_t)tv.tv_usec / 10000;
+    }
+    return select_common(nfds, ur, uw, ue, ticks);
+}
+
+/*
+ * pselect6(270): select with a timespec timeout and a (here ignored) sigmask.
+ * The sigmask would have to be swapped in atomically around the wait, which
+ * this single-signal-mask-per-process kernel has no machinery for; ignoring
+ * it is harmless because no caller here relies on the race it closes.
+ */
+static int64_t sys_pselect6(int nfds, uint64_t ur, uint64_t uw, uint64_t ue,
+                            uint64_t uts, uint64_t usig)
+{
+    (void)usig;
+    int64_t ticks = -1;
+    if (uts) {
+        struct { int64_t tv_sec; int64_t tv_nsec; } ts;
+        if (!user_ptr_ok(uts, sizeof(ts)))
+            return -E_FAULT;
+        memcpy(&ts, (const void *)(uintptr_t)uts, sizeof(ts));
+        if (ts.tv_sec == 0 && ts.tv_nsec == 0)
+            ticks = 0;
+        else
+            ticks = (int64_t)ts.tv_sec * 100 + (int64_t)ts.tv_nsec / 10000000;
+    }
+    return select_common(nfds, ur, uw, ue, ticks);
 }
 
 /*
@@ -1346,7 +1640,8 @@ static int64_t sys_ioctl(int fd, uint64_t cmd, uint64_t arg)
     /* A socket fd carries the SIOC* family of ioctls ifconfig/route use. */
     if (vfs_file_kind(h) == VFS_SOCKET)
         return net_if_ioctl(cmd, arg);
-    if (vfs_file_ops(h) != (const vfs_ops_t *)tty_ops())
+    const vfs_ops_t *ops = vfs_file_ops(h);
+    if (ops != (const vfs_ops_t *)tty_ops())
         return -E_NOTTY;
 
     switch (cmd) {
@@ -1409,6 +1704,29 @@ static int64_t sys_ioctl(int fd, uint64_t cmd, uint64_t arg)
     return -E_INVAL;
 }
 
+/*
+ * ttyinject(404) -- a headless-test back door, not POSIX.  It pushes len bytes
+ * from a user buffer straight into the line discipline as though the keyboard
+ * IRQ had produced them, so readlinetest.c can drive the terminal with no
+ * human at it.  The length is capped so a wild call cannot pin the kernel
+ * copying unbounded user memory.
+ */
+#define TTYINJECT_MAX 4096
+static int64_t sys_ttyinject(uint64_t ubuf, uint64_t len)
+{
+    if (!ubuf || len == 0)
+        return 0;
+    if (len > TTYINJECT_MAX)
+        len = TTYINJECT_MAX;
+    if (!user_ptr_ok(ubuf, len))
+        return -E_FAULT;
+
+    char scratch[TTYINJECT_MAX];
+    memcpy(scratch, (const void *)(uintptr_t)ubuf, len);
+    tty_inject(scratch, (uint32_t)len);
+    return (int64_t)len;
+}
+
 /* ---- memory management (mmap/brk) --------------------------------------
  * musl's malloc is built almost entirely on these three calls, so they are
  * the backbone of getting any libc program to run.
@@ -1452,6 +1770,24 @@ static void mmap_forget(proc_t *p, int idx)
     p->nmmaps--;
 }
 
+/* Choose a free user-virtual span at or above MMAP_BASE, below MMAP_TOP.
+ * Returns 0 if no room.  MAP_FIXED / hinted addresses are handled by the
+ * caller; this only serves the "let the kernel pick" case. */
+static uint64_t mmap_pick_base(proc_t *p, uint64_t size)
+{
+    uint64_t base = MMAP_BASE;
+    for (int i = 0; i < p->nmmaps; i++) {
+        if (p->mmaps[i].base < MMAP_BASE || p->mmaps[i].base >= MMAP_TOP)
+            continue;
+        uint64_t top = p->mmaps[i].base + p->mmaps[i].size;
+        if (top > base)
+            base = top;
+    }
+    if (base + size > MMAP_TOP)
+        return 0;
+    return base;
+}
+
 static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                         uint64_t flags, int64_t fd)
 {
@@ -1459,17 +1795,17 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     if (!p || len == 0)
         return -E_INVAL;
 
-    /* Only anonymous memory is backed here.  A file mapping would need the
-     * pages populated from the fd, and quietly handing back zeroed anonymous
-     * memory instead reads as an empty file rather than as a failure. */
-    if (!(flags & MAP_ANONYMOUS) || fd >= 0)
-        return -E_NOSYS;
-
-    uint64_t size = (len + PAGE_SIZE - 1) & ~0xFFFULL;
-
     unsigned vflags = VM_USER;
     if (prot & PROT_WRITE) vflags |= VM_WRITE;
     if (prot & PROT_EXEC)  vflags |= VM_EXEC;
+
+    uint64_t size = (len + PAGE_SIZE - 1) & ~0xFFFULL;
+
+    /* Only anonymous memory is otherwise backed here.  A file mapping would
+     * need the pages populated from the fd, and quietly handing back zeroed
+     * anonymous memory instead reads as an empty file rather than a failure. */
+    if (!(flags & MAP_ANONYMOUS) || fd >= 0)
+        return -E_NOSYS;
 
     uint64_t base;
     if (flags & MAP_FIXED) {
@@ -1483,19 +1819,8 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     } else if (addr != 0) {
         base = addr & ~0xFFFULL;        /* honour a hint when given */
     } else {
-        /* Pick the first free span above everything we have handed out.  Only
-         * mappings that actually live in the auto-arena count: a MAP_FIXED page
-         * musl placed at the brk base would otherwise shove the free pointer
-         * past MMAP_TOP and starve every later anonymous mmap. */
-        base = MMAP_BASE;
-        for (int i = 0; i < p->nmmaps; i++) {
-            if (p->mmaps[i].base < MMAP_BASE || p->mmaps[i].base >= MMAP_TOP)
-                continue;
-            uint64_t top = p->mmaps[i].base + p->mmaps[i].size;
-            if (top > base)
-                base = top;
-        }
-        if (base + size > MMAP_TOP)
+        base = mmap_pick_base(p, size);
+        if (!base)
             return -ENOMEM;
     }
 
@@ -1732,15 +2057,41 @@ static int64_t sys_set_tid_address(uint64_t utid)
     return p->pid;
 }
 
+/*
+ * Is this clock id one that counts from the epoch rather than from boot?
+ * The distinction matters to `ls -l` and to make: a monotonic clock that
+ * starts at zero puts every timestamp in 1970 and every file "in the
+ * future".
+ */
+static int clock_is_realtime(uint64_t clkid)
+{
+    return clkid == CLOCK_REALTIME || clkid == CLOCK_REALTIME_COARSE;
+}
+
 static int64_t sys_clock_gettime(uint64_t clkid, uint64_t utp)
 {
-    (void)clkid;                        /* treat every clock as the same tick */
-    if (utp && user_ptr_ok(utp, 16)) {
+    if (clkid > CLOCK_BOOTTIME)
+        return -E_INVAL;
+    if (utp && user_ptr_ok(utp, sizeof(ktimespec_t))) {
         uint64_t ticks = timer_ticks();
-        uint64_t sec  = ticks / 100;
-        uint64_t nsec = (ticks % 100) * 10000000ULL;
-        *(uint64_t *)(uintptr_t)utp       = sec;
-        *(uint64_t *)(uintptr_t)(utp + 8) = nsec;
+        ktimespec_t *ts = (ktimespec_t *)(uintptr_t)utp;
+        ts->tv_sec  = (int64_t)(ticks / SCHED_HZ);
+        ts->tv_nsec = (int64_t)((ticks % SCHED_HZ) * (1000000000ULL / SCHED_HZ));
+        if (clock_is_realtime(clkid))
+            ts->tv_sec += (int64_t)timer_boot_epoch();
+    }
+    return 0;
+}
+
+/* clock_getres(229): the tick is the only resolution we have. */
+static int64_t sys_clock_getres(uint64_t clkid, uint64_t utp)
+{
+    if (clkid > CLOCK_BOOTTIME)
+        return -E_INVAL;
+    if (utp && user_ptr_ok(utp, sizeof(ktimespec_t))) {
+        ktimespec_t *ts = (ktimespec_t *)(uintptr_t)utp;
+        ts->tv_sec  = 0;
+        ts->tv_nsec = 1000000000L / SCHED_HZ;
     }
     return 0;
 }
@@ -1748,14 +2099,210 @@ static int64_t sys_clock_gettime(uint64_t clkid, uint64_t utp)
 static int64_t sys_gettimeofday(uint64_t utv, uint64_t utz)
 {
     (void)utz;                          /* timezones are ignored */
-    if (utv && user_ptr_ok(utv, 16)) {
+    if (utv && user_ptr_ok(utv, sizeof(ktimeval_t))) {
         uint64_t ticks = timer_ticks();
-        uint64_t sec  = ticks / 100;
-        uint64_t usec = (ticks % 100) * 10000ULL;
-        *(uint64_t *)(uintptr_t)utv       = sec;
-        *(uint64_t *)(uintptr_t)(utv + 8) = usec;
+        ktimeval_t *tv = (ktimeval_t *)(uintptr_t)utv;
+        tv->tv_sec  = (int64_t)(ticks / SCHED_HZ + timer_boot_epoch());
+        tv->tv_usec = (int64_t)((ticks % SCHED_HZ) * (1000000ULL / SCHED_HZ));
     }
     return 0;
+}
+
+/* time(201): seconds since the epoch, optionally stored through a pointer. */
+static int64_t sys_time(uint64_t utp)
+{
+    int64_t now = (int64_t)(timer_ticks() / SCHED_HZ + timer_boot_epoch());
+    if (utp) {
+        if (!user_ptr_ok(utp, 8))
+            return -E_FAULT;
+        *(int64_t *)(uintptr_t)utp = now;
+    }
+    return now;
+}
+
+/* ---- process accounting ------------------------------------------------
+ *
+ * Everything below is derived from the one quantity the kernel actually
+ * measures: elapsed ticks.  There is no per-process CPU accounting, so a
+ * process's "user time" is reported as its whole lifetime and its "system
+ * time" as zero.  That is not true, but it is monotonic and non-decreasing,
+ * which is the property every caller actually relies on -- bash's `time`
+ * builtin samples times() twice and prints the difference, and a difference
+ * that could go backwards is what would make it print nonsense.
+ */
+static uint64_t proc_elapsed_ticks(const proc_t *p)
+{
+    uint64_t now = timer_ticks();
+    return (p && now > p->start_tick) ? now - p->start_tick : 0;
+}
+
+static int64_t sys_times(uint64_t ubuf)
+{
+    proc_t *p = proc_current();
+    uint64_t elapsed = proc_elapsed_ticks(p);
+
+    if (ubuf) {
+        if (!user_ptr_ok(ubuf, sizeof(tms_t)))
+            return -E_FAULT;
+        tms_t *t = (tms_t *)(uintptr_t)ubuf;
+        t->tms_utime  = (int64_t)elapsed;
+        t->tms_stime  = 0;
+        t->tms_cutime = 0;
+        t->tms_cstime = 0;
+    }
+    /* The return value is ticks since an arbitrary point in the past; the
+     * boot tick is as good a point as any, and it can never go backwards. */
+    return (int64_t)timer_ticks();
+}
+
+static int64_t sys_getrusage(int who, uint64_t ubuf)
+{
+    if (!ubuf)
+        return 0;
+    if (!user_ptr_ok(ubuf, sizeof(rusage_t)))
+        return -E_FAULT;
+
+    rusage_t *ru = (rusage_t *)(uintptr_t)ubuf;
+    memset(ru, 0, sizeof(*ru));
+
+    /* Children are not accounted for separately, so RUSAGE_CHILDREN is an
+     * honest zero rather than a wrong number. */
+    if (who == RUSAGE_SELF)
+        ticks_to_tv(proc_elapsed_ticks(proc_current()), &ru->ru_utime);
+    return 0;
+}
+
+/*
+ * getrlimit(97)/prlimit64(302).  The limits are fixed by how the kernel is
+ * built, so there is nothing to store: report the real ceilings and accept
+ * (but ignore) attempts to lower them.  bash reads RLIMIT_NOFILE at startup
+ * to size its own descriptor bookkeeping, and its `ulimit` builtin prints
+ * whatever comes back here.
+ */
+static void rlimit_for(int res, rlimit_t *out)
+{
+    switch (res) {
+    case RLIMIT_NOFILE: out->rlim_cur = PROC_MAX_FD;      break;
+    case RLIMIT_STACK:  out->rlim_cur = USER_STACK_SIZE;  break;
+    case RLIMIT_NPROC:  out->rlim_cur = MAX_PROCS;        break;
+    case RLIMIT_CORE:   out->rlim_cur = 0;                break;  /* no dumps */
+    default:            out->rlim_cur = RLIM_INFINITY;    break;
+    }
+    out->rlim_max = out->rlim_cur;
+}
+
+static int64_t sys_getrlimit(int res, uint64_t ulim)
+{
+    if (res < 0 || res >= RLIMIT_NLIMITS)
+        return -E_INVAL;
+    if (!user_ptr_ok(ulim, sizeof(rlimit_t)))
+        return -E_FAULT;
+    rlimit_for(res, (rlimit_t *)(uintptr_t)ulim);
+    return 0;
+}
+
+static int64_t sys_prlimit64(int pid, int res, uint64_t unew, uint64_t uold)
+{
+    proc_t *p = proc_current();
+    if (pid != 0 && (!p || pid != p->pid))
+        return -E_SRCH;                 /* only ourselves */
+    if (res < 0 || res >= RLIMIT_NLIMITS)
+        return -E_INVAL;
+
+    if (uold) {
+        if (!user_ptr_ok(uold, sizeof(rlimit_t)))
+            return -E_FAULT;
+        rlimit_for(res, (rlimit_t *)(uintptr_t)uold);
+    }
+    if (unew) {
+        /* Validate it so a bad pointer is still an error, then drop it: the
+         * limits are structural and cannot actually be changed. */
+        if (!user_ptr_ok(unew, sizeof(rlimit_t)))
+            return -E_FAULT;
+    }
+    return 0;
+}
+
+/* ---- sleeping ----------------------------------------------------------
+ *
+ * The sleep is rounded *up* to a whole tick: a program that asks for one
+ * microsecond and gets zero ticks would spin, and `sleep 0.001` in a shell
+ * loop is a real thing people write.
+ */
+static int64_t do_nanosleep(const ktimespec_t *req, uint64_t urem)
+{
+    if (req->tv_sec < 0 || req->tv_nsec < 0 || req->tv_nsec >= 1000000000L)
+        return -E_INVAL;
+
+    uint64_t ns    = (uint64_t)req->tv_nsec;
+    uint64_t ticks = (uint64_t)req->tv_sec * SCHED_HZ +
+                     (ns + (1000000000ULL / SCHED_HZ) - 1) /
+                     (1000000000ULL / SCHED_HZ);
+    if (!ticks)
+        return 0;
+
+    uint64_t deadline = timer_ticks() + ticks;
+    proc_t  *p        = proc_current();
+
+    while (timer_ticks() < deadline) {
+        if (p && proc_pending_signals(p)) {
+            /* POSIX wants the shortfall reported so a caller can resume the
+             * sleep after handling the signal. */
+            if (urem && user_ptr_ok(urem, sizeof(ktimespec_t))) {
+                uint64_t left = deadline - timer_ticks();
+                ktimespec_t *rem = (ktimespec_t *)(uintptr_t)urem;
+                rem->tv_sec  = (int64_t)(left / SCHED_HZ);
+                rem->tv_nsec = (int64_t)((left % SCHED_HZ) *
+                                         (1000000000ULL / SCHED_HZ));
+            }
+            return -E_INTR;
+        }
+        sched_block_timeout(WAIT_SLEEP, deadline - timer_ticks());
+    }
+
+    if (urem && user_ptr_ok(urem, sizeof(ktimespec_t)))
+        memset((void *)(uintptr_t)urem, 0, sizeof(ktimespec_t));
+    return 0;
+}
+
+static int64_t sys_nanosleep(uint64_t ureq, uint64_t urem)
+{
+    if (!user_ptr_ok(ureq, sizeof(ktimespec_t)))
+        return -E_FAULT;
+    return do_nanosleep((const ktimespec_t *)(uintptr_t)ureq, urem);
+}
+
+/*
+ * clock_nanosleep(230).  TIMER_ABSTIME (flag 1) asks to sleep *until* a
+ * point in time rather than for a duration, which is what a program doing
+ * periodic work uses to avoid drifting.
+ */
+#define TIMER_ABSTIME 1
+
+static int64_t sys_clock_nanosleep(uint64_t clkid, int flags, uint64_t ureq,
+                                   uint64_t urem)
+{
+    if (clkid > CLOCK_BOOTTIME)
+        return -E_INVAL;
+    if (!user_ptr_ok(ureq, sizeof(ktimespec_t)))
+        return -E_FAULT;
+
+    const ktimespec_t *req = (const ktimespec_t *)(uintptr_t)ureq;
+    if (!(flags & TIMER_ABSTIME))
+        return do_nanosleep(req, urem);
+
+    /* Convert the absolute deadline into the relative form we can sleep on,
+     * on the same time base the caller named. */
+    int64_t base = (int64_t)(timer_ticks() / SCHED_HZ);
+    if (clock_is_realtime(clkid))
+        base += (int64_t)timer_boot_epoch();
+
+    ktimespec_t rel = { req->tv_sec - base, req->tv_nsec };
+    while (rel.tv_nsec < 0) { rel.tv_nsec += 1000000000L; rel.tv_sec--; }
+    if (rel.tv_sec < 0)
+        return 0;                       /* the deadline is already past */
+    /* An absolute sleep has no meaningful remainder. */
+    return do_nanosleep(&rel, 0);
 }
 
 /* ---- scatter/gather I/O ------------------------------------------------
@@ -1857,8 +2404,11 @@ void syscall_handler(regs_t *r)
         break;
 
     case SYS_stat:
-    case SYS_lstat:                    /* no symlinks: lstat == stat */
-        ret = sys_stat(a1, a2);
+        ret = sys_stat(a1, a2, 1);
+        break;
+
+    case SYS_lstat:
+        ret = sys_stat(a1, a2, 0);
         break;
 
     case SYS_fstat:
@@ -1897,6 +2447,14 @@ void syscall_handler(regs_t *r)
         break;
     }
 
+    case SYS_rmdir: {
+        char abs[GNUOS_PATH_MAX];
+        ret = path_abs(a1, abs);
+        if (ret < 0) break;
+        ret = vfs_rmdir(abs);
+        break;
+    }
+
     case SYS_chdir:
         ret = sys_chdir(a1);
         break;
@@ -1909,16 +2467,8 @@ void syscall_handler(regs_t *r)
         ret = sys_getcwd(a1, a2);
         break;
 
-    /*
-     * rename(82).  The ext2 driver has no rename, and open-coding one in the
-     * kernel (create, copy, unlink, undo it all on failure) is a lot of
-     * fragile code for something user space already handles.  EXDEV is both
-     * honest -- we genuinely cannot move the name -- and useful: it is the
-     * one error `mv` is written to recover from, by copying and then
-     * deleting, which is exactly the behaviour we want.
-     */
     case SYS_rename:
-        ret = -E_XDEV;
+        ret = vfs_rename((const char *)a1, (const char *)a2);
         break;
 
     case SYS_uname:
@@ -1949,6 +2499,18 @@ void syscall_handler(regs_t *r)
         ret = sys_umask((uint32_t)a1);
         break;
 
+    case SYS_getrandom:
+        ret = sys_getrandom(a1, a2, a3);
+        break;
+
+    case SYS_mount:
+        ret = sys_mount(a1, a2, a3, r->r10, r->r8);
+        break;
+
+    case SYS_umount2:
+        ret = sys_umount2(a1, a2);
+        break;
+
     case SYS_chmod:
         ret = sys_chmod(a1, (uint32_t)a2);
         break;
@@ -1958,6 +2520,11 @@ void syscall_handler(regs_t *r)
         break;
 
     case SYS_faccessat:
+        ret = sys_access((int)a1, a2, 1);
+        break;
+
+    /* faccessat2(439): musl's faccessat() on a kernel that advertises it. */
+    case SYS_faccessat2:
         ret = sys_access((int)a1, a2, 1);
         break;
 
@@ -1972,10 +2539,87 @@ void syscall_handler(regs_t *r)
         ret = 0;
         break;
 
-    /* readlink(89): there are no symlinks on this filesystem, and EINVAL is
-     * precisely what POSIX says to return for a name that is not one. */
+    /* readlink(89): fill the caller's buffer with the link target.  POSIX
+     * says the target is NOT nul-terminated and the result is its length. */
     case SYS_readlink:
-        ret = -E_INVAL;
+        ret = sys_readlink((const char *)a1, a2, a3);
+        break;
+
+    /* ---- *at() namespace ops (the path the musl libc actually uses) ---- */
+    /*
+     * musl routes unlink/rmdir/mkdir/rename/symlink/readlink through their
+     * *at() forms, so these are not optional extras -- without them nothing
+     * can create or delete a file.  dirfd is AT_FDCWD for the cases we hit.
+     */
+    case SYS_unlinkat: {
+        char abs[GNUOS_PATH_MAX];
+        ret = path_at((int)a1, a2, abs);
+        if (ret < 0) break;
+        /* AT_REMOVEDIR (0x200) turns unlinkat into rmdir. */
+        if (a3 & 0x200)
+            ret = vfs_rmdir(abs);
+        else
+            ret = vfs_unlink(abs);
+        break;
+    }
+
+    case SYS_mkdirat: {
+        char abs[GNUOS_PATH_MAX];
+        ret = path_at((int)a1, a2, abs);
+        if (ret < 0) break;
+        ret = vfs_mkdir(abs);
+        break;
+    }
+
+    case SYS_renameat:
+    case SYS_renameat2: {
+        char old[GNUOS_PATH_MAX], newp[GNUOS_PATH_MAX];
+        ret = path_at((int)a1, a2, old);
+        if (ret < 0) break;
+        ret = path_at((int)r->r10, r->r8, newp);
+        if (ret < 0) break;
+        /* renameat2(316) flags are ignored: no NOREPLACE/EXCHANGE support,
+         * and OpenRC only ever asks for a plain rename. */
+        ret = vfs_rename(old, newp);
+        break;
+    }
+
+    case SYS_symlink:
+        ret = vfs_symlink((const char *)a1, (const char *)a2);
+        break;
+
+    case SYS_symlinkat: {
+        char abs[GNUOS_PATH_MAX];
+        ret = path_at((int)a2, a3, abs);
+        if (ret < 0) break;
+        ret = vfs_symlink((const char *)a1, abs);
+        break;
+    }
+
+    case SYS_readlinkat: {
+        char abs[GNUOS_PATH_MAX];
+        ret = path_at((int)a1, a2, abs);
+        if (ret < 0) break;
+        /* readlinkat(dirfd, path, buf, bufsize): buf is a3 (RDX), bufsize
+         * is the 4th argument r10 -- not r8. */
+        ret = do_readlink(abs, a3, r->r10);
+        break;
+    }
+
+    case SYS_fchmodat: {
+        char abs[GNUOS_PATH_MAX];
+        ret = path_at((int)a1, a2, abs);
+        if (ret < 0) break;
+        /* AT_SYMLINK_NOFOLLOW (0x100) would mean chmod the link itself, which
+         * we cannot do; we always operate on the resolved target. */
+        ret = vfs_chmod(abs, (uint32_t)a3);
+        break;
+    }
+
+    case SYS_fchownat:
+        /* Every file is root-owned and there is no second owner to hand it
+         * to, so the only possible result is the one already in effect. */
+        ret = 0;
         break;
 
     /* utimensat(280): we keep no timestamps, so there is nothing to set.
@@ -1992,6 +2636,12 @@ void syscall_handler(regs_t *r)
 
     case SYS_ioctl:
         ret = sys_ioctl((int)a1, a2, a3);
+        break;
+
+    /* ttyinject(404): feed a buffer into the line discipline.  A debugging
+     * back door for headless tests (see readlinetest.c); not POSIX. */
+    case SYS_ttyinject:
+        ret = sys_ttyinject(a1, a2);
         break;
 
     case SYS_sched_yield:
@@ -2016,6 +2666,12 @@ void syscall_handler(regs_t *r)
          * the child gets its own address space and must execve() or _exit().
          * That is what busybox ash needs vfork for (running external commands). */
         ret = proc_fork(r);
+        break;
+
+    case SYS_clone:
+        /* musl routes both fork() and pthread_create through clone, so a
+         * musl-linked userland (OpenRC, bash, ...) needs it even for a fork. */
+        ret = proc_clone(r);
         break;
 
     case SYS_ppoll:
@@ -2074,13 +2730,21 @@ void syscall_handler(regs_t *r)
         ret = sys_select((int)a1, a2, a3, r->r10, r->r8);
         break;
 
+    case SYS_pselect6:
+        /* pselect6 has the same fd_set layout; timeout is timespec and the
+         * 6th arg (sigmask) is ignored -- see sys_pselect6(). */
+        ret = sys_pselect6((int)a1, a2, a3, r->r10, r->r8, r->r9);
+        break;
+
     case SYS_execve: {
         char abs[GNUOS_PATH_MAX];
         ret = path_abs(a1, abs);
         if (ret < 0) break;
-        int n = collect_argv(a2);
+        int n = collect_vec(a2, g_argv);
         if (n < 0) { ret = n; break; }
-        ret = proc_execve(abs, g_argv, r);
+        n = collect_vec(a3, g_envp);
+        if (n < 0) { ret = n; break; }
+        ret = proc_execve(abs, g_argv, g_envp, r);
         if (ret == 0)
             return;                    /* the frame now belongs to the new image */
         break;
@@ -2180,8 +2844,54 @@ void syscall_handler(regs_t *r)
         ret = sys_clock_gettime(a1, a2);
         break;
 
+    case SYS_clock_getres:
+        ret = sys_clock_getres(a1, a2);
+        break;
+
     case SYS_gettimeofday:
         ret = sys_gettimeofday(a1, a2);
+        break;
+
+    case SYS_time:
+        ret = sys_time(a1);
+        break;
+
+    case SYS_times:
+        ret = sys_times(a1);
+        break;
+
+    case SYS_getrusage:
+        ret = sys_getrusage((int)a1, a2);
+        break;
+
+    case SYS_getrlimit:
+        ret = sys_getrlimit((int)a1, a2);
+        break;
+
+    case SYS_setrlimit:
+        /* The limits are structural, so there is nothing to set; a shell
+         * that cannot lower one is better off than one that cannot start. */
+        ret = 0;
+        break;
+
+    case SYS_prlimit64:
+        ret = sys_prlimit64((int)a1, (int)a2, a3, r->r10);
+        break;
+
+    case SYS_nanosleep:
+        ret = sys_nanosleep(a1, a2);
+        break;
+
+    case SYS_clock_nanosleep:
+        ret = sys_clock_nanosleep(a1, (int)a2, a3, r->r10);
+        break;
+
+    case SYS_dup3:
+        ret = sys_dup3((int)a1, (int)a2, (int)a3);
+        break;
+
+    case SYS_pipe2:
+        ret = sys_pipe2(a1, (int)a2);
         break;
 
     case SYS_getuid:
@@ -2189,6 +2899,18 @@ void syscall_handler(regs_t *r)
     case SYS_getgid:
     case SYS_getegid:
         ret = 0;                       /* single root user */
+        break;
+
+    /*
+     * getresuid(118)/getresgid(120): there is exactly one user (root, 0) and
+     * no saved-set-uid dance, so every r/e/s uid/gid is 0.  Each argument may
+     * be NULL, which we must not write through.
+     */
+    case SYS_getresuid:
+        ret = sys_getresuid(a1, a2, a3);
+        break;
+    case SYS_getresgid:
+        ret = sys_getresgid(a1, a2, a3);
         break;
 
     case SYS_exit_group:

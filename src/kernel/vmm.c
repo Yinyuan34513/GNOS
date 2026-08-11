@@ -225,6 +225,38 @@ uint64_t vmm_resolve(addrspace_t *as, uint64_t vaddr)
 }
 
 /*
+ * Extend the stack by the one page that was touched.
+ *
+ * Deliberately not clever: any unmapped address inside the reserved window
+ * grows the stack, with no check that it is anywhere near the current RSP.
+ * Linux needs that check because a user mapping can legitimately sit just
+ * below the stack; here the whole window is reserved for the stack and
+ * nothing else is ever placed in it, so there is nothing to protect
+ * against.  Everything below the window stays unmapped forever and is the
+ * guard: a runaway recursion walks off the end and takes SIGSEGV.
+ */
+int vmm_grow_stack(addrspace_t *as, uint64_t addr)
+{
+    if (!as)
+        return 0;
+
+    if (addr >= USER_STACK_TOP || addr < USER_STACK_TOP - USER_STACK_MAX)
+        return 0;
+
+    uint64_t page = addr & ~0xFFFULL;
+    if (vmm_resolve(as, page))
+        return 0;               /* already mapped: a protection fault, not growth */
+
+    if (!vmm_alloc_range(as, page, PAGE_SIZE, VM_USER | VM_WRITE))
+        return 0;
+
+    /* The fault loaded a not-present entry into the TLB; drop it so the
+     * retried instruction sees the mapping we just made. */
+    asm volatile("invlpg (%0)" :: "r"(page) : "memory");
+    return 1;
+}
+
+/*
  * Map a physical MMIO region into the kernel's own address space with the
  * cache-disable (uncacheable) attribute device registers need, and return
  * its virtual base.  Device registers must not be cached or writes can be

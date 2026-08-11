@@ -66,7 +66,11 @@ static uint32_t g_line_len;
 static uint16_t          g_ring[RING_SIZE];
 static volatile uint32_t g_head, g_tail;
 
-static int g_shift, g_caps, g_ctrl;
+static int g_shift, g_caps, g_ctrl, g_alt;
+
+/* Set after a 0xE0 prefix byte: the next scan code is the second half of an
+ * extended sequence (cursor keys, edit keys, right-hand modifiers). */
+static int g_ext;
 
 /* The foreground process group; 0 means "nobody", i.e. no job control yet. */
 static int g_fg_pgid;
@@ -80,6 +84,36 @@ static inline uint8_t inb(uint16_t port)
     asm volatile("inb %1, %0" : "=a"(v) : "Nd"(port));
     return v;
 }
+
+static inline void outb(uint16_t port, uint8_t v)
+{
+    asm volatile("outb %0, %1" : : "a"(v), "Nd"(port));
+}
+
+/* The 8042 command port, separate from the keyboard data port. */
+#define KBD_CMD     0x64
+#define KBD_ENABLE  0xAE            /* enable the first PS/2 port (keyboard) */
+#define KBD_DISABLE 0xAD
+
+/*
+ * Extended (0xE0-prefixed) make codes that produce text.  Indexed by make
+ * code; NULL means "nothing to type" (a bare modifier, a release, ...).  The
+ * strings are the ANSI escape sequences a real terminal emits for the
+ * cursor and editing keys, which is exactly what readline expects in raw
+ * mode -- so the arrow keys move the cursor instead of printing garbage.
+ */
+static const char * const kbd_ext_map[128] = {
+    [0x47] = "\033[1~",   /* Home     */
+    [0x48] = "\033[A",    /* Up       */
+    [0x49] = "\033[5~",   /* PageUp   */
+    [0x4B] = "\033[D",    /* Left     */
+    [0x4D] = "\033[C",    /* Right    */
+    [0x4F] = "\033[4~",   /* End      */
+    [0x50] = "\033[B",    /* Down     */
+    [0x51] = "\033[6~",   /* PageDown */
+    [0x52] = "\033[2~",   /* Insert   */
+    [0x53] = "\033[3~",   /* Delete   */
+};
 
 /*
  * Scancode set 1, US layout.  Index = make code, 0 = no ASCII meaning.
@@ -188,7 +222,13 @@ static void line_flush(int with_newline)
 }
 
 /* ---- the line discipline ---------------------------------------------- */
-static void ldisc_input(uint8_t c)
+/*
+ * The single entry point for "a key was pressed": used by both the keyboard
+ * IRQ (after scancode decode) and the ttyinject(404) syscall, which lets a
+ * headless test push bytes as though the IRQ had produced them.  Made global
+ * on purpose -- see tty.h.
+ */
+void tty_input_char(uint8_t c)
 {
     /* ---- c_iflag: input mapping ---------------------------------------- */
     if (g_tio.c_iflag & ISTRIP)
@@ -290,6 +330,15 @@ static void ldisc_input(uint8_t c)
     }
 }
 
+/* Feed a whole buffer through the line discipline, byte by byte.  This is
+ * the kernel side of the ttyinject(404) syscall: a test program hands us a
+ * string of "keystrokes" and we treat each one exactly as the IRQ would have. */
+void tty_inject(const char *buf, uint32_t len)
+{
+    for (uint32_t i = 0; i < len; i++)
+        tty_input_char((uint8_t)buf[i]);
+}
+
 /* ---- keyboard interrupt ----------------------------------------------- */
 static void kbd_irq(regs_t *r)
 {
@@ -297,19 +346,49 @@ static void kbd_irq(regs_t *r)
 
     uint8_t sc = inb(KBD_DATA);
 
-    /* 0xE0 introduces an extended code; we ignore the whole sequence. */
-    if (sc == 0xE0)
+    /* 0xE0 begins an extended sequence: remember it and wait for the real
+     * code on the next IRQ.  0xE1 (Pause/Break) is a multi-byte escape we do
+     * not decode, so just drop the prefix and the following bytes. */
+    if (sc == 0xE0 || sc == 0xE1) {
+        g_ext = (sc == 0xE0);
         return;
+    }
 
     int release = sc & 0x80;
     uint8_t code = (uint8_t)(sc & 0x7F);
+
+    /* Second half of an extended sequence.  Modifier releases do nothing;
+     * key releases are ignored; otherwise the make code yields an escape
+     * sequence (or sets a right-hand modifier). */
+    if (g_ext) {
+        g_ext = 0;
+        if (release)
+            return;
+        if (code == 0x1D) {             /* right control */
+            g_ctrl = 1;
+            return;
+        }
+        if (code == 0x38) {             /* right alt */
+            g_alt = 1;
+            return;
+        }
+        const char *seq = kbd_ext_map[code];
+        if (seq) {
+            while (*seq)
+                tty_input_char((uint8_t)*seq++);
+        }
+        return;
+    }
 
     switch (code) {
     case 0x2A: case 0x36:            /* left / right shift */
         g_shift = !release;
         return;
-    case 0x1D:                       /* control */
+    case 0x1D:                       /* left control */
         g_ctrl = !release;
+        return;
+    case 0x38:                       /* left alt */
+        g_alt = !release;
         return;
     case 0x3A:                       /* caps lock */
         if (!release)
@@ -333,7 +412,7 @@ static void kbd_irq(regs_t *r)
     else if (g_ctrl && c == '\\')
         c = 0x1C;                              /* Ctrl-\ */
 
-    ldisc_input((uint8_t)c);
+    tty_input_char((uint8_t)c);
 }
 
 /* ---- read / write ----------------------------------------------------- */
@@ -547,7 +626,7 @@ static int32_t tty_node_write(vfs_node_t *n, uint64_t off, const void *buf,
     return tty_write((const char *)buf, len);
 }
 
-static const vfs_ops_t g_tty_ops = { tty_node_read, tty_node_write };
+static const vfs_ops_t g_tty_ops = { .read = tty_node_read, .write = tty_node_write };
 
 const void *tty_ops(void)
 {
@@ -586,18 +665,28 @@ void tty_init(void)
 {
     g_line_len = 0;
     g_head = g_tail = 0;
-    g_shift = g_caps = g_ctrl = 0;
+    g_shift = g_caps = g_ctrl = g_alt = 0;
+    g_ext = 0;
     g_fg_pgid = 0;
 
     termios_defaults(&g_tio);
 
-    /* Drain anything the firmware left in the controller's output buffer,
-     * otherwise the first IRQ never fires. */
+    /* ---- 8042 controller bring-up --------------------------------------
+     * QEMU's emulated keyboard already works with no init, but real hardware
+     * (and a legacy-emulated USB keyboard) can leave the port disabled or its
+     * output buffer full of firmware leftovers.  Briefly wait for the
+     * controller to accept a command, enable the keyboard port, then drain
+     * its buffer so the first IRQ is a real keystroke.
+     */
+    while (inb(KBD_STATUS) & 0x02)          /* wait for input buffer empty */
+        ;
+    outb(KBD_CMD, KBD_ENABLE);              /* enable PS/2 port 1 (keyboard) */
     while (inb(KBD_STATUS) & 1)
         (void)inb(KBD_DATA);
 
     irq_install(1, kbd_irq);
     vfs_register_dev("tty", &g_tty_ops, NULL);
+    vfs_register_dev("console", &g_tty_ops, NULL);
 
     dbg_puts("GNOS: tty ready (PS/2 keyboard on IRQ1, termios line discipline)\r\n");
 }

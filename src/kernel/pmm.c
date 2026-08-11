@@ -166,3 +166,34 @@ void pmm_free(uint64_t phys)
 
 uint64_t pmm_total_frames(void) { return g_total; }
 uint64_t pmm_free_frames(void)  { return g_free; }
+
+/*
+ * Allocate `n` *consecutive* free frames and mark them used.  The kernel heap
+ * wants one contiguous run so it can be treated as a single linear region
+ * through the HHDM (phys + offset), which keeps the allocator's bookkeeping
+ * simple.  Returns the physical base, or 0 if no run of that length exists.
+ */
+uint64_t pmm_alloc_contiguous(uint64_t n)
+{
+    if (n == 0)
+        return 0;
+
+    uint64_t f = 0;
+    while (f + n <= g_total) {
+        /* Scan for `n` free frames starting at f. */
+        uint64_t k = 0;
+        while (k < n && !bit_test(f + k))
+            k++;
+        if (k == n) {                       /* all free: take it */
+            for (uint64_t j = 0; j < n; j++) {
+                bit_set(f + j);
+                g_free--;
+            }
+            g_next_hint = f + n;
+            return f * PAGE_SIZE;
+        }
+        /* Skip past the first occupied frame in this failed run. */
+        f += k + 1;
+    }
+    return 0;
+}

@@ -15,7 +15,15 @@
 #include "vmm.h"
 #include "panic.h"
 
-#define MAX_PROCS     16
+/*
+ * 64 rather than 16.  A single OpenRC runlevel forks openrc, openrc-run, a
+ * shell per service and start-stop-daemon for each backgrounded one, and an
+ * interactive bash pipeline adds a process per stage on top -- 16 was being
+ * exhausted before the runlevel finished.  The cost is linear and paid in
+ * BSS: KSTACK_SIZE * MAX_PROCS (1 MiB) plus sizeof(proc_t) * MAX_PROCS
+ * (~340 KiB), which is why the QEMU line went from -m 256M to -m 512M.
+ */
+#define MAX_PROCS     64
 #define KSTACK_SIZE   0x4000        /* 16 KiB */
 
 /* A full libc program opens far more descriptors than the toy utilities did:
@@ -43,6 +51,7 @@ typedef enum {
     WAIT_TTY,
     WAIT_PIPE,
     WAIT_NET,
+    WAIT_SLEEP,                     /* nanosleep: waiting only on the clock */
 } wait_reason_t;
 
 /* Signal numbers, wait() flags and the rest of the user-visible constants
@@ -74,10 +83,24 @@ typedef struct proc {
     int           pid;
     int           ppid;
     int           pgid;             /* process group: the unit of job control */
+    /*
+     * Session id.  A session is a collection of process groups that share a
+     * controlling terminal; setsid() starts a new one.  We track it mainly so
+     * a daemon that has detached (start-stop-daemon --background does exactly
+     * this) can be told apart from the shell's own jobs, and so TIOCSPGRP
+     * from outside the tty's session can be refused the way Linux does.
+     */
+    int           sid;
     proc_state_t  state;
     wait_reason_t wait_reason;
     int           wait_pid;         /* which child waitpid() is after, -1 = any */
     uint64_t      wake_tick;        /* timer tick to wake at, 0 = no deadline */
+
+    /* The tick this process was created on.  There is no per-process CPU
+     * accounting here, so times() and getrusage() report elapsed lifetime
+     * instead; a shell's `time` builtin subtracts two samples, and for that
+     * a monotonic baseline is all it needs. */
+    uint64_t      start_tick;
 
     /* ITIMER_REAL, in scheduler ticks.  It counts wall-clock time, so unlike
      * wake_tick it keeps running while the process is descheduled -- which is
@@ -90,6 +113,16 @@ typedef struct proc {
     uint64_t      saved_rsp;        /* where switch_context parked this task */
 
     int           fds[PROC_MAX_FD]; /* -1, or a handle into the open-file table */
+
+    /*
+     * Close-on-exec, one bit per descriptor.  This is a property of the
+     * descriptor and not of the open file behind it, which is exactly why it
+     * cannot live in the VFS table: two fds dup'd onto the same file may
+     * disagree about it, and dup2() is defined to clear the bit on the new fd
+     * even when the old one has it set.  A bitmap works because PROC_MAX_FD
+     * is 64; the assertion below is what keeps that true.
+     */
+    uint64_t      fd_cloexec;
 
     uint64_t      sig_pending;
     uint64_t      sig_ignored;
@@ -138,7 +171,20 @@ typedef struct proc {
     int           reported;         /* stop already reported to the parent */
 
     char          name[16];
+
+    /*
+     * The full argument vector of the running image, NUL-separated and
+     * NUL-terminated, in the layout /proc/<pid>/cmdline is defined to have.
+     * OpenRC's start-stop-daemon identifies a running daemon by reading this
+     * back and comparing it against the --exec it was asked to supervise, so
+     * a plain basename in `name` is not enough.
+     */
+    char          cmdline[192];
+    uint32_t      cmdline_len;
 } proc_t;
+
+/* fd_cloexec is a uint64_t bitmap indexed by descriptor number. */
+_Static_assert(PROC_MAX_FD <= 64, "fd_cloexec bitmap is only 64 bits wide");
 
 /* Write the current process's TLS base into MSR FSBASE.  Called by the two
  * paths that return to user mode (ret_to_user and the syscall stub) so a
@@ -157,8 +203,23 @@ int  proc_spawn_init(const char *path);
  * 0 to the child, or a negative errno. */
 int  proc_fork(regs_t *r);
 
-/* execve(): replace the caller's image.  Only returns on failure. */
-int  proc_execve(const char *path, char *const argv[], regs_t *r);
+/* clone(2): the syscall musl funnels both fork() and pthread_create through.
+ * Handled here as a full address-space copy (no COW, no shared threads) plus
+ * the libc-used flags (TLS, parent/child tid).  Returns the child pid to the
+ * parent and 0 to the child, or a negative errno. */
+int  proc_clone(regs_t *r);
+
+/*
+ * execve(): replace the caller's image.  Only returns on failure.
+ *
+ * argv and envp both point into the *caller's* address space, which this
+ * function is about to destroy, so the strings are copied into kernel storage
+ * before anything irreversible happens.  A `#!` script is resolved here too:
+ * the interpreter becomes the real image and the script path is spliced into
+ * argv, recursively, up to EXEC_INTERP_MAX levels deep.
+ */
+int  proc_execve(const char *path, char *const argv[], char *const envp[],
+                 regs_t *r);
 
 /* exit(): turn the caller into a zombie and schedule someone else. */
 void proc_exit(int status) __attribute__((noreturn));
@@ -193,9 +254,16 @@ void proc_check_signals(regs_t *r);
 
 /*
  * The pending signals that should break a process out of a blocking call.
- * SIGCHLD and SIGCONT are deliberately excluded: they arrive constantly
- * during normal job control, and a waitpid() that returned EINTR every time
- * one of its own children exited would never reap anything.
+ *
+ * SIGCHLD used to be excluded here, on the theory that a waitpid() returning
+ * EINTR every time one of its own children exited would never reap anything.
+ * That reasoning was right about the symptom and wrong about the cure: bash
+ * deliberately installs its SIGCHLD handler *without* SA_RESTART precisely so
+ * that a read() blocked at the prompt returns EINTR and the job table can be
+ * updated.  Suppressing it kernel-side meant completed background jobs went
+ * unreported until the user happened to press a key.  The exclusion now lives
+ * where it belongs -- inside proc_waitpid(), which ignores its own SIGCHLD
+ * and nothing else.
  */
 uint64_t proc_pending_signals(const proc_t *p);
 

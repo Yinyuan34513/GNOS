@@ -13,6 +13,7 @@
 #include "gdt.h"
 #include "panic.h"
 #include "proc.h"
+#include "vmm.h"
 #include "debugcon.h"
 
 struct idt_entry {
@@ -163,6 +164,19 @@ void isr_dispatch(regs_t *r)
          * process.  Only a fault taken in ring 0 is fatal to the system.
          */
         if ((r->cs & 3) == 3 && proc_current()) {
+            /*
+             * A page fault just below the stack is not an error, it is the
+             * stack growing.  Map the page and retry the instruction; only
+             * if the address is outside the stack window does this fall
+             * through to the SIGSEGV path below.
+             */
+            if (r->vector == 14) {
+                uint64_t cr2;
+                asm volatile("mov %%cr2, %0" : "=r"(cr2));
+                if (vmm_grow_stack(proc_current()->as, cr2))
+                    return;
+            }
+
             dbg_puts("GNOS: fault in user pid ");
             dbg_puts_dec((uint32_t)proc_current()->pid);
             dbg_puts(" vector=");

@@ -28,13 +28,23 @@
  * heap metadata gets corrupted and malloc aborts.  Keep a gap before the stack
  * too, or a growing heap collides with a growing stack. */
 #define USER_STACK_TOP   0x0000700000000000ULL
-/* The stack is committed up front rather than grown on demand -- there is no
- * fault handler that extends it -- so it has to be big enough for the deepest
- * program we intend to run.  BusyBox recurses through directory trees and
- * musl's printf machinery is not shy with locals; 1 MiB is 256 frames, which
- * this machine can spare far more easily than it can debug a silent overflow
- * into unmapped space. */
-#define USER_STACK_SIZE  (256 * 0x1000ULL)         /* 1 MiB */
+/*
+ * The stack is committed up front and then extended on demand: a fault
+ * anywhere in the reserved window below the committed part maps one more
+ * page (see vmm_grow_stack).  Committing all of USER_STACK_MAX instead
+ * would be paid twice over, once in physical frames and again on every
+ * fork(), which copies each mapped page -- and almost none of it is ever
+ * touched.  Anything below the window is left permanently unmapped, so a
+ * runaway recursion still dies of SIGSEGV instead of quietly walking into
+ * the heap.
+ *
+ * bash is the reason the ceiling is generous: its parser recurses once per
+ * level of nesting, and a deeply nested case/if inside a function can go a
+ * long way down before it reaches anything a shell script author would
+ * consider unreasonable.
+ */
+#define USER_STACK_SIZE  (64 * 0x1000ULL)          /* 256 KiB committed */
+#define USER_STACK_MAX   (8 * 1024 * 1024ULL)      /* 8 MiB reserved */
 #define USER_BRK_BASE    0x0000600000000000ULL
 #define USER_BRK_CEIL    0x00006F0000000000ULL     /* leave room above for stack */
 #define USER_MMAP_BASE   0x0000500000000000ULL
@@ -78,6 +88,14 @@ int vmm_alloc_range(addrspace_t *as, uint64_t vaddr, uint64_t size,
 
 /* Physical address backing `vaddr`, or 0 if unmapped. */
 uint64_t vmm_resolve(addrspace_t *as, uint64_t vaddr);
+
+/*
+ * Handle a page fault that may be the stack asking to grow.  Returns 1 if a
+ * page was mapped and the faulting instruction should simply be retried, 0
+ * if the address has nothing to do with the stack -- in which case the
+ * caller must treat the fault as the error it is.
+ */
+int vmm_grow_stack(addrspace_t *as, uint64_t addr);
 
 /* Map a physical MMIO region into the kernel address space with the
  * uncacheable attribute device registers require; returns its virtual base. */

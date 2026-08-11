@@ -33,6 +33,7 @@
 #define VFS_CHARDEV   3
 #define VFS_PIPE      4
 #define VFS_SOCKET    5
+#define VFS_SYMLINK   6
 
 /* errno values the syscall layer hands back to user space */
 #define E_PERM        1
@@ -40,25 +41,37 @@
 #define E_SRCH        3
 #define E_INTR        4
 #define E_IO          5
+#define E_2BIG        7
+/* ENOEXEC is what execve() must return for a file that is not an ELF, and
+ * it is load-bearing rather than cosmetic: it is the signal a shell uses to
+ * decide the file is a script and retry it through itself. */
+#define E_NOEXEC      8
 #define E_BADF        9
 #define E_CHILD      10
 #define E_AGAIN      11
 #define E_NOMEM      12
+#define E_ACCES      13
 #define E_FAULT      14
+#define E_BUSY       16
 #define E_EXIST      17
 #define E_XDEV       18
 #define E_NOTDIR     20
 #define E_ISDIR      21
 #define E_INVAL      22
+#define E_NFILE      23
 #define E_MFILE      24
 #define E_NOTTY      25
 #define E_NODEV      19
 #define E_NOSPC      28
+#define E_SPIPE      29
+#define E_ROFS       30
 #define E_PIPE       32
 #define E_RANGE      34
 #define E_NAMETOOLONG 36
 #define E_NOSYS      38
 #define E_NOTEMPTY   39
+#define E_LOOP       40
+#define E_OVERFLOW   75
 
 /* Sockets bring their own half of the errno table with them.  These are the
  * Linux numbers, not invented ones: musl maps a negative return straight into
@@ -117,11 +130,22 @@ int  vfs_register_dev(const char *name, const vfs_ops_t *ops, void *priv);
 /* ---- names ------------------------------------------------------------ */
 int  vfs_stat(const char *path, uint64_t *size, int *kind);
 int  vfs_unlink(const char *path);
+int  vfs_rmdir(const char *path);
 int  vfs_mkdir(const char *path);
+int  vfs_symlink(const char *target, const char *path);
+int  vfs_readlink(const char *path, char *buf, uint32_t cap);
+int  vfs_rename(const char *src, const char *dst);
 
 /* Linux-style stat (144-byte struct) used by musl/BusyBox. */
-int  vfs_stat_linux(const char *path, lstat_t *st);
+int  vfs_stat_linux(const char *path, lstat_t *st, int follow);
 int  vfs_fstat(int h, lstat_t *st);
+
+/* Mount a fresh tmpfs instance at `path` (absolute, normalised).  Returns 0 or
+ * a negative errno.  This is the VFS side of mount(2); only tmpfs is
+ * supported, so any other fstype fails with -E_NODEV at the syscall layer. */
+int  vfs_mount_tmpfs(const char *path);
+/* Remove the mount at `path`.  Returns 0 or a negative errno. */
+int  vfs_umount(const char *path);
 
 /* The absolute path a descriptor names (for fchdir / relative openat).
  * Returns NULL if the handle is not open.  The pointer is into the open-file

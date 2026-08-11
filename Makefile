@@ -45,7 +45,7 @@ ISO_ROOT := $(BUILD)/iso
 KOBJS := $(BUILD)/kernel.o $(BUILD)/loader.o $(BUILD)/fbcon.o \
          $(BUILD)/debugcon.o $(BUILD)/ext2.o $(BUILD)/panic.o \
          $(BUILD)/gdt.o $(BUILD)/idt.o $(BUILD)/isr.o \
-         $(BUILD)/kstring.o $(BUILD)/vfs.o $(BUILD)/tty.o \
+         $(BUILD)/kstring.o $(BUILD)/vfs.o $(BUILD)/procfs.o $(BUILD)/tmpfs.o $(BUILD)/tty.o \
          $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/proc.o \
          $(BUILD)/signal.o $(BUILD)/switch.o $(BUILD)/timer.o \
          $(BUILD)/syscall.o \
@@ -70,7 +70,7 @@ MUSL_INC  := $(MUSL_PREFIX)/include
 MUSL_GCC  := $(MUSL_PREFIX)/bin/musl-gcc
 
 # Programs built against musl rather than ulib.
-MUSLPROGS := hello ttytest sigtest
+MUSLPROGS := hello ttytest sigtest readlinetest fstest mounttest mount
 MUSL_OBJS := $(addprefix $(BUILD)/user/,$(addsuffix .o,$(MUSLPROGS)))
 MUSL_ELFS := $(addprefix $(BUILD)/,$(addsuffix .elf,$(MUSLPROGS)))
 
@@ -87,7 +87,31 @@ BB_BIN     := $(BB_SRC)/busybox
 # dispatcher.  ping needs a raw socket and runs as root here, so it works
 # without any setuid shimming.
 BB_APPLETS := cat cp echo false head ls mkdir mv pwd rm true uname wc sh ash \
-              ifconfig ping wget nc route hostname
+              ifconfig ping wget nc route hostname \
+              env expr sleep test sort tr sed grep dirname basename \
+              mktemp seq stat chmod ln readlink find date id kill ps printf
+
+# GNU Bash — the shell this whole userland effort is aimed at.
+#
+# Configured by hand in the tree (it takes seconds; the recipe below only
+# relinks) with:
+#
+#   ./configure CC=<musl-gcc> CFLAGS="-O2 -g -static -no-pie -fno-pie" \
+#               LDFLAGS="-static -no-pie" --without-bash-malloc \
+#               --disable-nls --enable-readline bash_cv_termcap_lib=gnutermcap
+#
+# Each of those matters.  -static because there is no dynamic loader and
+# -no-pie because loader.c only accepts ET_EXEC.  --without-bash-malloc
+# drops bash's own sbrk-based allocator in favour of musl's, which is the
+# one this kernel's brk/mmap behaviour has actually been tested against.
+# bash_cv_termcap_lib=gnutermcap picks the termcap bundled in lib/termcap
+# rather than the host's ncurses, which musl-gcc cannot link against.
+#
+# Note there is no --host: musl-gcc produces binaries that run natively on
+# the build machine, so configure's AC_TRY_RUN probes execute for real
+# instead of falling back to cross-compilation guesses.
+BASH_SRC := $(BUILD)/bashsrc/bash-5.3
+BASH_BIN := $(BASH_SRC)/bash
 
 # musl programs see musl's headers and nothing else.  Two things matter here:
 #   -nostdinc stays (BASEFLAGS already has it) so glibc's /usr/include cannot
@@ -151,6 +175,12 @@ $(MUSL_LIB)/libc.a $(MUSL_GCC):
 $(BB_BIN): $(BB_SRC)/.config | $(MUSL_GCC)
 	$(MAKE) -C $(BB_SRC) CC=$(abspath $(MUSL_GCC)) HOSTCC=gcc AR=gcc-ar \
 	  SKIP_STRIP=y
+
+# GNU Bash.  Like BusyBox, the tree is fetched and configured by hand (see
+# the BASH_SRC comment above) and this rule only relinks it when the binary
+# is missing, so a hand-run `make` inside the tree is never undone.
+$(BASH_BIN): $(BASH_SRC)/Makefile | $(MUSL_GCC)
+	$(MAKE) -C $(BASH_SRC)
 
 # Both directories are listed separately: `clean` leaves $(BUILD) standing (the
 # third-party trees live there), so a rule keyed only on $(BUILD) would never
@@ -217,7 +247,7 @@ $(MUSL_ELFS): $(BUILD)/%.elf: $(BUILD)/user/%.o \
 # neither a loopback mount nor root.  The feature set is trimmed on purpose:
 # ^dir_index keeps every directory a plain linear list, which is all the
 # kernel driver knows how to rewrite.
-$(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) src/user/rc | $(BUILD)
+$(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) $(BASH_BIN) src/user/rc | $(BUILD)
 	rm -rf $(BUILD)/initrd-root
 	mkdir -p $(BUILD)/initrd-root
 	# ---- FHS skeleton (empty dirs are harmless placeholders for now) ----
@@ -247,6 +277,10 @@ $(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) src/user/rc | $(BUILD)
 	for p in $(MUSLPROGS); do \
 	  cp $(BUILD)/$$p.elf $(BUILD)/initrd-root/bin/$$p.elf; \
 	done
+	# `mount` is invoked by its bare name from OpenRC's init.sh and service
+	# scripts, so it must sit on PATH as /bin/mount (not /bin/mount.elf).  The
+	# rest of the musl programs are only ever called by absolute path.
+	cp $(BUILD)/mount.elf $(BUILD)/initrd-root/bin/mount
 	# ---- BusyBox: the multi-call binary, plus one file per applet ----
 	# BusyBox picks its applet from basename(argv[0]) -- names that start with
 	# "busybox" fall through to the multi-call dispatcher instead -- so every
@@ -264,12 +298,33 @@ $(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) src/user/rc | $(BUILD)
 	# them.
 	cp $(BB_BIN) $(BUILD)/initrd-root/bin/sh
 	cp $(BB_BIN) $(BUILD)/initrd-root/bin/ash
+	# ---- GNU Bash ----
+	# Stripped on the way in: the unstripped binary is 4.4 MB of mostly
+	# DWARF, and every byte of it would be read off the initrd at exec time.
+	cp $(BASH_BIN) $(BUILD)/initrd-root/bin/bash
+	strip $(BUILD)/initrd-root/bin/bash
 	cp src/user/rc $(BUILD)/initrd-root/etc/rc            # run once at boot by init
 	# Static system config (hosts, resolv.conf, nsswitch, services, protocols,
 	# passwd/group, hostname).  These make the BusyBox network tools and the
 	# C resolver actually work: ping/wget do DNS via /etc/resolv.conf, getent
 	# reads /etc/passwd, and `hostname` uses /etc/hostname.
 	cp -a src/rootfs/etc/. $(BUILD)/initrd-root/etc/
+	# ---- OpenRC 0.56 tree ------------------------------------------------
+	# The full install (built separately with meson + musl, see
+	# build/orcsrc/) drops in here: /sbin/openrc (+ openrc-run, rc-status,
+	# start-stop-daemon, ...), /etc/init.d/*, /etc/runlevels/*, /etc/conf.d/*,
+	# /etc/rc.conf, and /usr/libexec/rc/{bin,sbin,sh}.  It is what the kernel's
+	# mount/getrandom/symlink/rename support exists to serve, so it rides along
+	# in the initrd and /etc/rc brings its runlevels up at boot.
+	mkdir -p $(BUILD)/initrd-root/dev/shm $(BUILD)/initrd-root/run/lock
+	cp -a build/orcsrc/openrc-install/bin/.    $(BUILD)/initrd-root/bin/    2>/dev/null || true
+	cp -a build/orcsrc/openrc-install/sbin/.   $(BUILD)/initrd-root/sbin/
+	cp -a build/orcsrc/openrc-install/etc/.    $(BUILD)/initrd-root/etc/
+	cp -a build/orcsrc/openrc-install/usr/.    $(BUILD)/initrd-root/usr/
+	# devfs would mount a tmpfs over /dev and hide the static character
+	# devices the kernel already provides (null, tty, ...); drop it from the
+	# sysinit runlevel so the rest of OpenRC can run headless.
+	rm -f $(BUILD)/initrd-root/etc/runlevels/sysinit/devfs
 	dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
 	mke2fs -q -t ext2 -b 1024 -I 256 \
 	       -O ^resize_inode,^dir_index,^ext_attr \
