@@ -19,7 +19,7 @@
 /* The open-file table is shared by every process, so it has to cover the
  * worst case across all of them at once, not per process. */
 #define VFS_MAX_FILES 64
-#define VFS_MAX_DEV   8
+#define VFS_MAX_DEV   16
 #define VFS_MAX_PIPES 16
 #define VFS_NAME_MAX  32
 
@@ -105,6 +105,13 @@ struct vfs_node;
 typedef struct {
     int32_t (*read)(struct vfs_node *n, uint64_t off, void *buf, uint32_t len);
     int32_t (*write)(struct vfs_node *n, uint64_t off, const void *buf, uint32_t len);
+    /* Optional device control.  cmd/arg mirror ioctl(2); return 0 on success
+     * or a negative errno.  NULL means "no ioctls" (caller gets ENOTTY). */
+    int32_t (*ioctl)(struct vfs_node *n, uint64_t cmd, uint64_t arg);
+    /* Optional device mapping.  Fills in the physical range a MAP_SHARED /
+     * device mmap should cover; return 0 on success, negative on failure.
+     * NULL means the device is not mappable. */
+    int (*mmap)(struct vfs_node *n, uint64_t *phys, uint64_t *size);
 } vfs_ops_t;
 
 typedef struct vfs_node {
@@ -147,6 +154,13 @@ int  vfs_mount_tmpfs(const char *path);
 /* Remove the mount at `path`.  Returns 0 or a negative errno. */
 int  vfs_umount(const char *path);
 
+/* The tmpfs mounts currently attached, so /proc/mounts can report them.
+ * Without this the file lists only the three static entries, and anything
+ * that consults it to decide what is already mounted -- `mount -a`, OpenRC's
+ * localmount -- would mount /run a second time on every pass. */
+int         vfs_mount_count(void);
+const char *vfs_mount_path(int i);
+
 /* The absolute path a descriptor names (for fchdir / relative openat).
  * Returns NULL if the handle is not open.  The pointer is into the open-file
  * table and only valid until the next VFS call. */
@@ -156,6 +170,12 @@ const char *vfs_file_path(int h);
  * directory, or a closed handle.  ioctl() uses this to tell "is this fd the
  * terminal?" without hard-coding a path. */
 const vfs_ops_t *vfs_file_ops(int h);
+
+/* The vfs_node_t a descriptor names (its kind, ops, priv, ...).  NULL when
+ * the handle is not open.  Callers that implement device ioctls/mmap read
+ * their per-device state out of node->priv.  The pointer is into the
+ * open-file table and only valid until the next VFS call. */
+const vfs_node_t *vfs_file_node(int h);
 
 /* Change the permission bits (low 12) of a path's inode; returns 0 or errno. */
 int  vfs_chmod(const char *path, uint32_t mode);
@@ -174,6 +194,13 @@ int     vfs_file_open(const char *path, int flags);
 int32_t vfs_file_read(int h, void *buf, uint32_t len);
 int32_t vfs_file_write(int h, const void *buf, uint32_t len);
 int64_t vfs_file_seek(int h, int64_t off, int whence);
+/* pread(2)/pwrite(2): transfer at an explicit offset and leave the shared
+ * file position alone.  That last part is the whole point -- two threads, or
+ * a parent and the child that inherited the description, can read different
+ * parts of one file without racing over the offset.  A pipe or a socket has
+ * no offset to name, so those get ESPIPE. */
+int32_t vfs_file_pread(int h, void *buf, uint32_t len, uint64_t off);
+int32_t vfs_file_pwrite(int h, const void *buf, uint32_t len, uint64_t off);
 void    vfs_file_ref(int h);
 void    vfs_file_unref(int h);
 uint8_t vfs_file_kind(int h);

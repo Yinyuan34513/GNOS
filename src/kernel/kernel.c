@@ -35,6 +35,11 @@
 #include "tty.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "heap.h"
+#include "gfx.h"
+#include "fbdev.h"
+#include "subsys.h"
+#include "acpi.h"
 #include "proc.h"
 #include "timer.h"
 #include "syscall.h"
@@ -48,9 +53,10 @@ extern volatile struct limine_framebuffer_request framebuffer_request;
 extern volatile struct limine_module_request      module_request;
 extern volatile struct limine_hhdm_request        hhdm_request;
 extern volatile struct limine_kernel_address_request kernel_address_request;
+extern volatile struct limine_rsdp_request        rsdp_request;
 
-/* How often the scheduler pre-empts a running user process. */
-#define SCHED_HZ  100
+/* How often the scheduler pre-empts a running user process: SCHED_HZ, which
+ * timer.h owns because times(2) and AT_CLKTCK have to report the same rate. */
 
 /* bootinfo describing the framebuffer, shared with the console driver */
 static bootinfo_t g_bi;
@@ -111,6 +117,10 @@ void kernel_entry(void)
     gdt_init();
     idt_init();
 
+    /* The driver registry has to exist before the first driver init runs,
+     * because every one of them announces itself into it. */
+    subsys_init();
+
     /* ---- console ------------------------------------------------------ */
     fbcon_init(&g_bi);
     fbcon_puts("GNOS (x86-64) booted via Limine\n");
@@ -119,6 +129,15 @@ void kernel_entry(void)
     pmm_init();
     vmm_init();
     vmm_map_kernel_bss();              /* bootloader may leave BSS unmapped */
+    kheap_init();                      /* kernel heap on top of the PMM */
+
+    /* ---- firmware description ------------------------------------------
+     * After the direct map is trustworthy (every ACPI pointer is physical and
+     * gets read through it) and before the PCI probe, so that anything the
+     * tables say about interrupt routing is already on hand. */
+    acpi_init(rsdp_request.response
+                  ? (uint64_t)(uintptr_t)rsdp_request.response->address : 0);
+    acpi_dump();
 
     /* ---- PCI devices --------------------------------------------------
      * After the allocators, because every driver here needs DMA buffers and
@@ -128,12 +147,31 @@ void kernel_entry(void)
      * NIC loops a frame through its own PHY, the codec streams a tone past
      * the DMA engine.  Neither test needs a human, a network or a speaker. */
     pci_init();
-    if (e1000_init())
+    /* Each probe reports into the registry so that "was there a NIC?" is a
+     * lookup later on instead of a line of boot text nobody kept. */
+    int slot_nic = subsys_register("e1000", NULL, SUBSYS_CLASS_NET, 0, 0);
+    if (e1000_init()) {
+        subsys_set_state(slot_nic, SUBSYS_STATE_LIVE);
         e1000_selftest();
-    if (ac97_init())
+    } else {
+        subsys_set_state(slot_nic, SUBSYS_STATE_FAILED);
+    }
+
+    int slot_ac97 = subsys_register("ac97", NULL, SUBSYS_CLASS_SOUND, 14, 3);
+    if (ac97_init()) {
+        subsys_set_state(slot_ac97, SUBSYS_STATE_LIVE);
         ac97_selftest();
-    if (hda_init())
+    } else {
+        subsys_set_state(slot_ac97, SUBSYS_STATE_FAILED);
+    }
+
+    int slot_hda = subsys_register("hda", NULL, SUBSYS_CLASS_SOUND, 116, 0);
+    if (hda_init()) {
+        subsys_set_state(slot_hda, SUBSYS_STATE_LIVE);
         hda_selftest();
+    } else {
+        subsys_set_state(slot_hda, SUBSYS_STATE_FAILED);
+    }
 
     /* The IP stack sits on top of whatever the NIC probe found, so it is
      * configured here and not in e1000_init(): with no card it still comes up
@@ -147,11 +185,23 @@ void kernel_entry(void)
         panic("initrd is not a mountable FAT volume");
 
     tty_init();
+
+    /* /dev/fb0 goes in after the VFS (it needs the /dev table) but shares the
+     * framebuffer with fbcon: the boot log stays on screen until a user-space
+     * program opens the device and draws over it. */
+    fbdev_init(&g_bi);
+
     syscall_init();
 
     /* ---- processes ----------------------------------------------------- */
     proc_init();
     timer_init(SCHED_HZ);
+
+    kheap_self_test();
+    gfx_self_test();
+    fbdev_self_test();
+    acpi_self_test();
+    subsys_dump();
 
     fbcon_puts("starting /init.elf as pid 1...\n\n");
     int pid = proc_spawn_init("/init.elf");

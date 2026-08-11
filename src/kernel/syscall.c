@@ -1640,7 +1640,16 @@ static int64_t sys_ioctl(int fd, uint64_t cmd, uint64_t arg)
     /* A socket fd carries the SIOC* family of ioctls ifconfig/route use. */
     if (vfs_file_kind(h) == VFS_SOCKET)
         return net_if_ioctl(cmd, arg);
+    /* A character device with its own ioctl handler (framebuffer, ...) gets
+     * first crack; it returns -E_NOTTY for requests it does not recognise so
+     * the generic "not a terminal" answer still flows through. */
     const vfs_ops_t *ops = vfs_file_ops(h);
+    if (vfs_file_kind(h) == VFS_CHARDEV && ops && ops->ioctl) {
+        const vfs_node_t *n = vfs_file_node(h);
+        int64_t r = ops->ioctl((vfs_node_t *)n, cmd, arg);
+        if (r != -E_NOTTY)
+            return r;
+    }
     if (ops != (const vfs_ops_t *)tty_ops())
         return -E_NOTTY;
 
@@ -1800,6 +1809,43 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     if (prot & PROT_EXEC)  vflags |= VM_EXEC;
 
     uint64_t size = (len + PAGE_SIZE - 1) & ~0xFFFULL;
+
+    /* A file/device mapping: today only character devices with an mmap op
+     * (the framebuffer) are supported -- the device hands back the physical
+     * range to map, so no page population from an fd is needed. */
+    if (!(flags & MAP_ANONYMOUS) && fd >= 0) {
+        int h = fd_handle((int)fd);
+        if (h < 0)
+            return -E_BADF;
+        if (vfs_file_kind(h) != VFS_CHARDEV)
+            return -E_NOSYS;
+        const vfs_ops_t *ops = vfs_file_ops(h);
+        if (!ops || !ops->mmap)
+            return -E_NOSYS;
+        uint64_t phys = 0, dsize = 0;
+        if (ops->mmap((vfs_node_t *)vfs_file_node(h), &phys, &dsize) < 0)
+            return -E_INVAL;
+        uint64_t drounded = (dsize + PAGE_SIZE - 1) & ~0xFFFULL;
+        if (size > drounded)
+            size = drounded;
+
+        uint64_t base = (flags & MAP_FIXED) ? (addr & ~0xFFFULL)
+                      : (addr ? (addr & ~0xFFFULL) : mmap_pick_base(p, size));
+        if (!base || base + size > USER_LIMIT)
+            return -E_INVAL;
+        /* Map the whole span, not just its first page: a 1024x768 framebuffer
+         * is three megabytes and a single vmm_map() would leave user space
+         * faulting one page in. */
+        for (uint64_t o = 0; o < size; o += PAGE_SIZE) {
+            if (!vmm_map(p->as, base + o, phys + o, vflags)) {
+                vmm_unmap(p->as, base, o);
+                return -ENOMEM;
+            }
+        }
+        if (!mmap_record(p, base, size))
+            return -ENOMEM;
+        return (int64_t)base;
+    }
 
     /* Only anonymous memory is otherwise backed here.  A file mapping would
      * need the pages populated from the fd, and quietly handing back zeroed
@@ -2369,6 +2415,23 @@ void syscall_handler(regs_t *r)
         if (!user_ptr_ok(a2, a3)) { ret = -E_INVAL; break; }
         ret = vfs_file_write(fd_handle((int)a1), (const void *)(uintptr_t)a2,
                              (uint32_t)a3);
+        break;
+
+    /* pread64(17)/pwrite64(18): musl's pread/pwrite, and what any program
+     * that does random access without an lseek dance -- an ELF loader, a
+     * framebuffer client, sqlite -- reaches for first. */
+    case SYS_pread64:
+        if (!user_ptr_ok(a2, a3)) { ret = -E_INVAL; break; }
+        if ((int64_t)r->r10 < 0)  { ret = -E_INVAL; break; }
+        ret = vfs_file_pread(fd_handle((int)a1), (void *)(uintptr_t)a2,
+                             (uint32_t)a3, r->r10);
+        break;
+
+    case SYS_pwrite64:
+        if (!user_ptr_ok(a2, a3)) { ret = -E_INVAL; break; }
+        if ((int64_t)r->r10 < 0)  { ret = -E_INVAL; break; }
+        ret = vfs_file_pwrite(fd_handle((int)a1), (const void *)(uintptr_t)a2,
+                              (uint32_t)a3, r->r10);
         break;
 
     case SYS_readv:

@@ -24,6 +24,7 @@
 #include "pmm.h"
 #include "timer.h"
 #include "vfs.h"
+#include "subsys.h"
 
 /* One render never exceeds this; /proc/net/dev with two interfaces is the
  * largest and comes to a few hundred bytes. */
@@ -216,6 +217,18 @@ static void gen_mounts(sbuf_t *s)
     sb_str(s, "/dev/root / ext2 rw,relatime 0 0\n");
     sb_str(s, "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n");
     sb_str(s, "dev /dev devtmpfs rw,relatime 0 0\n");
+    /* The tmpfs instances mount(2) attached at run time.  These have to show
+     * up here and not only in the kernel's own table: `mount -a` skips a
+     * target that already appears in this file, so without them it would
+     * stack a second /run over the one holding OpenRC's pidfiles. */
+    for (int i = 0; i < vfs_mount_count(); i++) {
+        const char *m = vfs_mount_path(i);
+        if (!m)
+            continue;
+        sb_str(s, "tmpfs ");
+        sb_str(s, m);
+        sb_str(s, " tmpfs rw,nosuid,nodev,relatime 0 0\n");
+    }
 }
 
 /* /proc/devices, in Linux's exact layout: a "Character devices:" heading,
@@ -226,9 +239,63 @@ static void gen_mounts(sbuf_t *s)
 static void gen_devices(sbuf_t *s)
 {
     sb_str(s, "Character devices:\n");
-    sb_str(s, "  1 mem\n");
-    sb_str(s, "  5 tty\n");
+    for (int i = 0; i < subsys_count(); i++) {
+        const subsys_t *d = subsys_get(i);
+        if (d->state != SUBSYS_STATE_LIVE || !d->dev[0])
+            continue;
+        /* One line per *major*, as Linux does -- the minors belong to the
+         * individual nodes, not to the driver. */
+        int seen = 0, shared = 0;
+        for (int j = 0; j < subsys_count(); j++) {
+            const subsys_t *e = subsys_get(j);
+            if (j == i || e->state != SUBSYS_STATE_LIVE || !e->dev[0] ||
+                e->major != d->major)
+                continue;
+            shared = 1;
+            if (j < i)
+                seen = 1;
+        }
+        if (seen)
+            continue;
+        sb_dec(s, d->major, 3);
+        sb_char(s, ' ');
+        /* Linux names the line after the chrdev *registration*, which covers
+         * every minor behind one major: "1 mem" for null/zero/full/random,
+         * "5 tty" for tty and console, but "29 fb" for the lone framebuffer.
+         * Falling back to the class name when a major is shared, and using
+         * the driver's own name when it is not, reproduces that exactly --
+         * and it matters, because a coldplug script greps for "fb". */
+        sb_str(s, shared ? subsys_class_name(d->cls) : d->name);
+        sb_char(s, '\n');
+    }
     sb_str(s, "\nBlock devices:\n");
+}
+
+/* /proc/subsystems is ours, not Linux's: one line per registered driver, with
+ * the /dev node it published and the state its probe reached.  /proc/devices
+ * cannot carry this because it is keyed by major and has no place for a node
+ * name, a minor or a failed probe -- and those three things are exactly what
+ * a coldplug pass needs in order to create the right nodes and to notice a
+ * device it should have found and did not. */
+static void gen_subsystems(sbuf_t *s)
+{
+    for (int i = 0; i < subsys_count(); i++) {
+        const subsys_t *d = subsys_get(i);
+        sb_str(s, d->name);
+        sb_char(s, '\t');
+        sb_str(s, subsys_class_name(d->cls));
+        sb_char(s, '\t');
+        sb_str(s, d->state == SUBSYS_STATE_LIVE   ? "live"
+                : d->state == SUBSYS_STATE_FAILED ? "failed"
+                                                  : "registered");
+        sb_char(s, '\t');
+        sb_str(s, d->dev[0] ? d->dev : "-");
+        sb_char(s, '\t');
+        sb_dec(s, d->major, 0);
+        sb_char(s, ':');
+        sb_dec(s, d->minor, 0);
+        sb_char(s, '\n');
+    }
 }
 
 /* ---- the file table ---------------------------------------------------- */
@@ -251,6 +318,7 @@ static const procfile_t g_files[] = {
     { "/proc/mounts",       gen_mounts        },
     { "/proc/self/mounts",  gen_mounts        },
     { "/proc/devices",      gen_devices       },
+    { "/proc/subsystems",   gen_subsystems    },
 };
 #define NFILES ((int)(sizeof(g_files) / sizeof(g_files[0])))
 

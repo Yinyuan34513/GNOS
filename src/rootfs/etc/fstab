@@ -1,0 +1,28 @@
+# /etc/fstab -- filesystems mounted at boot. (GPLv2)
+#
+# `mount -a`, run from /etc/rc before OpenRC starts, replays this file.  The
+# three tmpfs lines are the ones the boot genuinely depends on:
+#
+#   /run       OpenRC keeps its service state, pidfiles and the
+#              rc-status bookkeeping here.  Without a writable /run the
+#              sysinit runlevel fails on its very first checkpath.
+#   /tmp       every program that calls mkstemp(), and bash's here-documents.
+#   /dev/shm   POSIX shared memory and sem_open(); musl expects it to exist.
+#
+# The root line is informational: the kernel mounts the ext2 initrd on / long
+# before user space runs, and `mount -a` skips "/" for that reason.
+#
+# proc and sysfs are listed the way a normal Linux system lists them, but this
+# kernel synthesises /proc internally and has no sysfs, so mount(2) answers
+# ENODEV for both.  `mount -a` treats a non-tmpfs failure as "already provided
+# or not implemented" and moves on quietly, which is why they can stay here:
+# the file describes the system a portable init script expects, and the two
+# lines cost nothing.
+#
+# <fs>       <mountpoint>   <type>   <opts>              <dump/pass>
+/dev/root    /              ext2     rw,noatime           0 1
+proc         /proc          proc     defaults             0 0
+sysfs        /sys           sysfs    defaults             0 0
+tmpfs        /run           tmpfs    rw,nosuid,nodev,mode=755   0 0
+tmpfs        /tmp           tmpfs    rw,nosuid,nodev,mode=1777  0 0
+tmpfs        /dev/shm       tmpfs    rw,nosuid,nodev,mode=1777  0 0

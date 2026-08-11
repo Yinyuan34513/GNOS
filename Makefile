@@ -42,10 +42,11 @@ INITRD  := $(BUILD)/initrd.img
 ISO     := $(BUILD)/gnos.iso
 ISO_ROOT := $(BUILD)/iso
 
-KOBJS := $(BUILD)/kernel.o $(BUILD)/loader.o $(BUILD)/fbcon.o \
+KOBJS := $(BUILD)/kernel.o $(BUILD)/loader.o $(BUILD)/fbcon.o $(BUILD)/gfx.o \
+         $(BUILD)/fbdev.o $(BUILD)/subsys.o $(BUILD)/acpi.o \
          $(BUILD)/debugcon.o $(BUILD)/ext2.o $(BUILD)/panic.o \
          $(BUILD)/gdt.o $(BUILD)/idt.o $(BUILD)/isr.o \
-         $(BUILD)/kstring.o $(BUILD)/vfs.o $(BUILD)/procfs.o $(BUILD)/tmpfs.o $(BUILD)/tty.o \
+         $(BUILD)/kstring.o $(BUILD)/vfs.o $(BUILD)/procfs.o $(BUILD)/tmpfs.o $(BUILD)/tty.o $(BUILD)/heap.o \
          $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/proc.o \
          $(BUILD)/signal.o $(BUILD)/switch.o $(BUILD)/timer.o \
          $(BUILD)/syscall.o \
@@ -70,7 +71,7 @@ MUSL_INC  := $(MUSL_PREFIX)/include
 MUSL_GCC  := $(MUSL_PREFIX)/bin/musl-gcc
 
 # Programs built against musl rather than ulib.
-MUSLPROGS := hello ttytest sigtest readlinetest fstest mounttest mount
+MUSLPROGS := hello ttytest sigtest readlinetest fstest mounttest mount fbtest coldplug
 MUSL_OBJS := $(addprefix $(BUILD)/user/,$(addsuffix .o,$(MUSLPROGS)))
 MUSL_ELFS := $(addprefix $(BUILD)/,$(addsuffix .elf,$(MUSLPROGS)))
 
@@ -346,10 +347,10 @@ $(ISO): $(KRNL) $(INITRD) limine.conf $(LIMINE_BIOS) $(LIMINE_UEFI) | $(BUILD)
 
 # ---------- run / test ----------
 run: $(ISO)
-	qemu-system-x86_64 -cdrom $(ISO) -m 256M -display gtk $(QEMU_DEVICES)
+	qemu-system-x86_64 -cdrom $(ISO) -m 512M -display gtk $(QEMU_DEVICES)
 
 run-uefi: $(ISO)
-	qemu-system-x86_64 -cdrom $(ISO) -m 256M -bios $(OVMF) -display gtk \
+	qemu-system-x86_64 -cdrom $(ISO) -m 512M -bios $(OVMF) -display gtk \
 	  $(QEMU_DEVICES)
 
 # guistart — the "just show me the OS" target.
@@ -365,13 +366,13 @@ run-uefi: $(ISO)
 guistart: $(ISO)
 	@echo "GNOS: booting in a window (audio backend: $(AUDIO_BACKEND));"
 	@echo "      boot log is also being written to $(BUILD)/dbg.log"
-	qemu-system-x86_64 -cdrom $(ISO) -m 256M \
+	qemu-system-x86_64 -cdrom $(ISO) -m 512M \
 	  $(QEMU_NET) $(GUI_AUDIO) \
 	  -device isa-debugcon,chardev=dbg -chardev file,id=dbg,path=$(BUILD)/dbg.log \
 	  -display gtk -no-reboot
 
 test: $(ISO)
-	timeout 20 qemu-system-x86_64 -cdrom $(ISO) -m 256M $(QEMU_DEVICES) \
+	timeout 20 qemu-system-x86_64 -cdrom $(ISO) -m 512M $(QEMU_DEVICES) \
 	  -device isa-debugcon,chardev=dbg -chardev file,id=dbg,path=$(BUILD)/dbg.log \
 	  -serial none -display none -no-reboot || true
 	@echo "----- debugcon log -----"

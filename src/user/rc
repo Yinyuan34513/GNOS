@@ -63,6 +63,33 @@ echo GNOS rc: fstest exited with status $?
 /bin/mounttest.elf
 echo GNOS rc: mounttest exited with status $?
 
+# ---- /etc/fstab ----------------------------------------------------------
+# Replay the fstab before OpenRC runs, not after: the very first thing the
+# sysinit runlevel does is checkpath its way around /run, and on a read-only
+# root that fails outright.  `mount -a` brings up /run, /tmp and /dev/shm and
+# skips the proc/sysfs lines this kernel answers ENODEV for.
+echo GNOS rc: mount -a
+/bin/mount -a
+echo GNOS rc: mount -a exited with status $?
+echo "--- mounted filesystems ---"
+/bin/mount
+
+# ---- coldplug ------------------------------------------------------------
+# The udev-trigger equivalent: walk the kernel's subsystem registry through
+# /proc/subsystems and prove that every driver that claims to be live really
+# published the /dev node it advertises, and that the node behaves.  A driver
+# that registers itself but forgets vfs_register_dev() fails here by name.
+/bin/coldplug.elf
+echo GNOS rc: coldplug exited with status $?
+echo "--- /proc/devices ---"
+/usr/bin/cat /proc/devices
+
+# fbtest: the framebuffer seen the way a real Linux client sees it -- the
+# <linux/fb.h> struct sizes, FBIOGET_[VF]SCREENINFO geometry, and an mmap of
+# the whole scanout that must agree with read()/write() at both ends.
+/bin/fbtest.elf
+echo GNOS rc: fbtest exited with status $?
+
 # ---- OpenRC --------------------------------------------------------------
 # Bring the boot runlevels up through OpenRC's own machinery.  The initrd
 # carries the full tree (/sbin/openrc, /etc/init.d/*, /etc/runlevels/*); this
@@ -93,6 +120,8 @@ echo GNOS rc: openrc default exited with status $?
 # misbehaves, so a regression fails `make test` instead of waiting for
 # somebody to notice it at a prompt.
 echo GNOS rc: bash
+/bin/bash /etc/bashtest.sh
+echo GNOS rc: bashtest exited with status $?
 
 # ---- network bring-up (BusyBox tools) -----------------------------------
 # Every ping here is bounded by -c: BusyBox's fancy ping otherwise runs until

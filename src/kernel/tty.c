@@ -35,6 +35,7 @@
 #include <stdint.h>
 
 #include "tty.h"
+#include "subsys.h"
 #include "fbcon.h"
 #include "idt.h"
 #include "vfs.h"
@@ -687,6 +688,14 @@ void tty_init(void)
     irq_install(1, kbd_irq);
     vfs_register_dev("tty", &g_tty_ops, NULL);
     vfs_register_dev("console", &g_tty_ops, NULL);
+    /* Two names, one terminal: /dev/tty is "my controlling terminal" and
+     * /dev/console is "where the kernel talks", and with a single console
+     * they are the same device.  An init system opens one or the other with
+     * no way to ask which exists, so both have to. */
+    subsys_set_state(subsys_register("tty", "tty", SUBSYS_CLASS_TTY, 5, 0),
+                     SUBSYS_STATE_LIVE);
+    subsys_set_state(subsys_register("console", "console", SUBSYS_CLASS_TTY, 5, 1),
+                     SUBSYS_STATE_LIVE);
 
     dbg_puts("GNOS: tty ready (PS/2 keyboard on IRQ1, termios line discipline)\r\n");
 }

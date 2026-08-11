@@ -30,6 +30,7 @@
 #include "sock.h"
 #include "kstring.h"
 #include "debugcon.h"
+#include "subsys.h"
 #include "syscall.h"
 
 typedef struct {
@@ -253,9 +254,39 @@ static int32_t null_node_write(vfs_node_t *n, uint64_t off, const void *buf,
 static const vfs_ops_t g_null_ops = { .read = null_node_read, .write = null_node_write };
 
 /* ---- /dev/zero and /dev/full ------------------------------------------- */
-/* NOTE: the endless-zero /dev/zero, /dev/full, /dev/random and /dev/urandom
- * memory devices are registered by a later change; at this stage only
- * /dev/null exists.  The g_null_ops above is what the VFS hands out. */
+/* Both read as an endless run of zero bytes.  They differ only in what a
+ * write does, and that difference is the entire point of /dev/full: it is the
+ * only portable way to make a program take its ENOSPC path on demand. */
+static int32_t zero_node_read(vfs_node_t *n, uint64_t off, void *buf, uint32_t len)
+{
+    (void)n; (void)off;
+    memset(buf, 0, len);
+    return (int32_t)len;
+}
+
+static int32_t full_node_write(vfs_node_t *n, uint64_t off, const void *buf,
+                               uint32_t len)
+{
+    (void)n; (void)off; (void)buf; (void)len;
+    return -E_NOSPC;
+}
+
+static const vfs_ops_t g_zero_ops = { .read = zero_node_read, .write = null_node_write };
+static const vfs_ops_t g_full_ops = { .read = zero_node_read, .write = full_node_write };
+
+/* ---- /dev/random and /dev/urandom -------------------------------------- */
+/* One generator behind both names.  Linux stopped distinguishing them years
+ * ago -- random(4) no longer blocks once seeded -- and a kernel with no
+ * entropy source has nothing to gain by pretending otherwise: a blocking
+ * /dev/random here would simply hang the boot. */
+static int32_t random_node_read(vfs_node_t *n, uint64_t off, void *buf, uint32_t len)
+{
+    (void)n; (void)off;
+    krandom_bytes(buf, len);
+    return (int32_t)len;
+}
+
+static const vfs_ops_t g_random_ops = { .read = random_node_read, .write = null_node_write };
 
 static const vfs_ops_t g_pipe_ops = { .read = pipe_node_read, .write = pipe_node_write };
 
@@ -281,10 +312,31 @@ int vfs_init(uint8_t *img, uint32_t img_size)
     dbg_puts_dec(g_fs.inodes_count);
     dbg_puts(" inodes)\r\n");
 
-    /* /dev/null is the one character device the VFS itself provides at this
-     * stage; the rest of /dev (zero, full, random, urandom, the framebuffer)
-     * arrives with later driver and subsystem work. */
-    vfs_register_dev("null", &g_null_ops, NULL);
+    /* The memory devices.  These are the nodes a POSIX userland assumes are
+     * simply there -- shells redirect to /dev/null, mke2fs and dd read
+     * /dev/zero, and musl's ASLR and BusyBox's mktemp fall back to
+     * /dev/urandom when getrandom(2) is unavailable.  They are registered
+     * here rather than by a driver because they have no hardware behind
+     * them: they are the VFS itself.  The major/minor numbers are Linux's,
+     * so a coldplug run produces the same /dev a Linux box would. */
+    static const struct {
+        const char      *name;
+        const vfs_ops_t *ops;
+        uint16_t         minor;
+    } memdevs[] = {
+        { "null",    &g_null_ops,   3 },
+        { "zero",    &g_zero_ops,   5 },
+        { "full",    &g_full_ops,   7 },
+        { "random",  &g_random_ops, 8 },
+        { "urandom", &g_random_ops, 9 },
+    };
+    for (unsigned i = 0; i < sizeof(memdevs) / sizeof(memdevs[0]); i++) {
+        if (vfs_register_dev(memdevs[i].name, memdevs[i].ops, NULL) < 0)
+            continue;
+        int slot = subsys_register(memdevs[i].name, memdevs[i].name,
+                                   SUBSYS_CLASS_MEM, 1, memdevs[i].minor);
+        subsys_set_state(slot, SUBSYS_STATE_LIVE);
+    }
     return 1;
 }
 
@@ -369,6 +421,18 @@ int vfs_mount_tmpfs(const char *path)
     g_mounts[g_mount_count].fs = fs;
     g_mount_count++;
     return 0;
+}
+
+int vfs_mount_count(void)
+{
+    return g_mount_count;
+}
+
+const char *vfs_mount_path(int i)
+{
+    if (i < 0 || i >= g_mount_count)
+        return 0;
+    return g_mounts[i].mnt;
 }
 
 int vfs_umount(const char *path)
@@ -806,6 +870,12 @@ const vfs_ops_t *vfs_file_ops(int h)
     return f ? f->node.ops : NULL;
 }
 
+const vfs_node_t *vfs_file_node(int h)
+{
+    vfs_file_t *f = get(h);
+    return f ? &f->node : NULL;
+}
+
 int vfs_file_flags(int h)
 {
     vfs_file_t *f = get(h);
@@ -1007,6 +1077,55 @@ int32_t vfs_file_write(int h, const void *buf, uint32_t len)
         if (f->pos > f->node.size)
             f->node.size = f->pos;
     }
+    return n;
+}
+
+/* pread/pwrite differ from read/write in exactly one way -- the position is
+ * an argument instead of state -- so they share the permission and ops checks
+ * and then decline to touch f->pos.  A pipe or socket is refused rather than
+ * silently served from offset 0: a caller that passes an offset is asking for
+ * random access, and answering a stream read instead would be a wrong answer
+ * dressed up as a right one.  A character device is *not* refused: /dev/fb0
+ * and /dev/mem are addressable, and pread is the natural way to reach into
+ * them. */
+static int32_t pio_check(vfs_file_t *f)
+{
+    if (!f)
+        return -E_BADF;
+    if (f->node.kind == VFS_PIPE || f->node.kind == VFS_SOCKET)
+        return -E_SPIPE;
+    return 0;
+}
+
+int32_t vfs_file_pread(int h, void *buf, uint32_t len, uint64_t off)
+{
+    vfs_file_t *f = get(h);
+    int32_t     e = pio_check(f);
+    if (e != 0)
+        return e;
+    if ((f->flags & 3) == O_WRONLY)
+        return -E_BADF;
+    if (!f->node.ops || !f->node.ops->read)
+        return -E_INVAL;
+    return f->node.ops->read(&f->node, off, buf, len);
+}
+
+int32_t vfs_file_pwrite(int h, const void *buf, uint32_t len, uint64_t off)
+{
+    vfs_file_t *f = get(h);
+    int32_t     e = pio_check(f);
+    if (e != 0)
+        return e;
+    if ((f->flags & 3) == O_RDONLY)
+        return -E_BADF;
+    if (!f->node.ops || !f->node.ops->write)
+        return -E_INVAL;
+
+    int32_t n = f->node.ops->write(&f->node, off, buf, len);
+    /* The offset does not move, but the file can still have grown, and a
+     * later fstat() has to see that. */
+    if (n > 0 && f->node.kind == VFS_FILE && off + (uint32_t)n > f->node.size)
+        f->node.size = off + (uint32_t)n;
     return n;
 }
 
