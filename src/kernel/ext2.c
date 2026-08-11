@@ -1015,6 +1015,74 @@ int ext2_truncate(ext2_fs_t *fs, ext2_dirent_t *ent)
     return EXT2_OK;
 }
 
+/* statfs(2) fodder: the four superblock counters df(1) actually prints.  Read
+ * live rather than cached in ext2_fs_t because the free counts move on every
+ * allocation. */
+void ext2_usage(ext2_fs_t *fs, uint64_t *blocks, uint64_t *bfree,
+                uint64_t *files, uint64_t *ffree)
+{
+    uint8_t *sb = sb_ptr(fs);
+    *blocks = sb ? rd32(sb + SB_BLOCKS_COUNT) : 0;
+    *bfree  = sb ? rd32(sb + SB_FREE_BLOCKS)  : 0;
+    *files  = sb ? rd32(sb + SB_INODES_COUNT) : 0;
+    *ffree  = sb ? rd32(sb + SB_FREE_INODES)  : 0;
+}
+
+/*
+ * truncate(2)/ftruncate(2) to an arbitrary length.
+ *
+ * Growing is free: ext2_read() already reads an unmapped block as zeroes, so
+ * the new tail is simply a hole and not one block has to be allocated.  That
+ * is not a shortcut, it is what a sparse file *is*.
+ *
+ * Shrinking to something other than zero keeps the blocks past the new end of
+ * file allocated to the inode and only zeroes them.  Walking the indirect
+ * tree backwards to hand them back is the honest thing to do and this driver
+ * cannot yet do it -- but zeroing is what makes the result *correct* rather
+ * than merely cheap: without it, growing the file again would resurrect the
+ * bytes that were just truncated away.  The space comes back when the file is
+ * unlinked or truncated to zero, which is the path everything but truncate(1)
+ * actually takes.
+ */
+int ext2_setsize(ext2_fs_t *fs, ext2_dirent_t *ent, uint64_t len)
+{
+    if (!fs || !ent || !ent->ino)
+        return EXT2_EINVAL;
+    /* i_size_high is the directory-ACL field in rev-0 ext2 and this driver
+     * never writes it, so 4 GiB is a hard ceiling rather than a policy. */
+    if (len > 0xFFFFFFFFULL)
+        return EXT2_EINVAL;
+
+    uint8_t *ip = inode_ptr(fs, ent->ino);
+    if (!ip)
+        return EXT2_ENOENT;
+    if ((rd16(ip + I_MODE) & EXT2_S_IFMT) == EXT2_S_IFDIR)
+        return EXT2_EINVAL;
+
+    uint32_t nlen = (uint32_t)len;
+    uint32_t cur  = rd32(ip + I_SIZE);
+
+    if (nlen == 0)
+        return ext2_truncate(fs, ent);      /* the one path that frees blocks */
+
+    for (uint32_t off = nlen; off < cur; ) {
+        uint32_t skip = off % fs->block_size;
+        uint32_t take = fs->block_size - skip;
+        if (take > cur - off)
+            take = cur - off;
+
+        uint32_t blk = bmap(fs, ip, off / fs->block_size, 0, NULL);
+        uint8_t *p   = blk ? blk_ptr(fs, blk) : NULL;
+        if (p)
+            memset(p + skip, 0, take);
+        off += take;
+    }
+
+    wr32(ip + I_SIZE, nlen);
+    ent->size = nlen;
+    return EXT2_OK;
+}
+
 /*
  * Replace the permission bits of an inode, leaving the file-type bits alone.
  * Only the low 12 bits (rwx, setuid/setgid/sticky) are the caller's to set;

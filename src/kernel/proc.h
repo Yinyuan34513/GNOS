@@ -129,6 +129,18 @@ typedef struct proc {
     uint64_t      sig_mask;         /* signals blocked from delivery */
     sigact_t      sigact[NSIG];     /* installed dispositions */
 
+    /*
+     * sigsuspend(2) swaps in a temporary mask, waits for a signal, and must
+     * put the caller's original mask back *after* the handler has run -- not
+     * before, or the handler would be delivered under a mask that very likely
+     * blocks the signal it is waiting for.  Linux solves this with
+     * TIF_RESTORE_SIGMASK; this is the same trick: sigsuspend parks the old
+     * mask here, and signal_deliver() writes it into the frame's uc_sigmask
+     * so rt_sigreturn restores it instead of the suspend mask.
+     */
+    uint64_t      sig_saved_mask;
+    int           sig_restore_mask;
+
     /* The syscall number the current trap came in with, or -1 when the trap
      * is not a restartable syscall.  syscall_handler() overwrites RAX with
      * the result before anyone gets to look at signals, so SA_RESTART needs

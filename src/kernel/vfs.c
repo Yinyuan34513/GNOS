@@ -778,10 +778,19 @@ int vfs_symlink(const char *target, const char *path)
 
 int vfs_readlink(const char *path, char *buf, uint32_t cap)
 {
-    if (!g_fs_ok)
-        return -E_NOENT;
     if (strncmp(path, "/dev/", 5) == 0)
         return -E_INVAL;
+
+    /* tmpfs first: vfs_symlink() has always been willing to create a link on
+     * a tmpfs, so reading one back has to work too -- otherwise `ln -s`
+     * succeeds and `readlink` comes back empty. */
+    char rel[GNUOS_PATH_MAX];
+    tmpfs_t *tfs = vfs_route_tmpfs(path, rel);
+    if (tfs)
+        return tmpfs_readlink(tfs, rel, buf, cap);
+
+    if (!g_fs_ok)
+        return -E_NOENT;
     /* ext2_readlink returns the target length (>= 0) on success and a
      * negative EXT2_ code on failure.  Do NOT run the length through
      * fs_errno -- it would map a positive length to -E_INVAL. */
@@ -793,7 +802,51 @@ int vfs_rename(const char *src, const char *dst)
 {
     if (strncmp(src, "/dev/", 5) == 0 || strncmp(dst, "/dev/", 5) == 0)
         return -E_PERM;
+
+    /* rename(2) is defined to fail across filesystems, and coreutils leans on
+     * that: mv catches EXDEV and falls back to copy-then-unlink.  Routing both
+     * paths first and comparing the instances is what makes the distinction --
+     * before this, every rename went to ext2, so `mv` on a tmpfs failed with a
+     * bare ENOENT that mv had no fallback for. */
+    char srel[GNUOS_PATH_MAX], drel[GNUOS_PATH_MAX];
+    tmpfs_t *sfs = vfs_route_tmpfs(src, srel);
+    tmpfs_t *dfs = vfs_route_tmpfs(dst, drel);
+    if (sfs != dfs)
+        return -E_XDEV;
+    if (sfs)
+        return tmpfs_rename(sfs, srel, drel);
+
     return fs_errno(ext2_rename(&g_fs, src, dst));
+}
+
+/*
+ * truncate(2)/ftruncate(2).  Both filesystems grow into a hole and zero on
+ * the way down; see ext2_setsize() and tmpfs_setsize() for why the zeroing is
+ * not optional.
+ */
+int vfs_truncate(const char *path, uint64_t len)
+{
+    if (strncmp(path, "/dev/", 5) == 0)
+        return -E_INVAL;
+
+    char rel[GNUOS_PATH_MAX];
+    tmpfs_t *fs = vfs_route_tmpfs(path, rel);
+    if (fs)
+        return tmpfs_setsize(fs, rel, len);
+
+    if (!g_fs_ok)
+        return -E_NOENT;
+
+    vfs_node_t node;
+    int r = resolve(path, &node, 1);
+    if (r < 0)
+        return r;
+    if (node.kind == VFS_DIR)
+        return -E_ISDIR;
+    if (node.kind != VFS_FILE)
+        return -E_INVAL;
+
+    return fs_errno(ext2_setsize(&g_fs, &node.e2, len));
 }
 
 /* ---- open-file table -------------------------------------------------- */

@@ -43,7 +43,14 @@ int tmpfs_unlink(tmpfs_t *fs, const char *rel);
 int tmpfs_rmdir(tmpfs_t *fs, const char *rel);
 int tmpfs_symlink(tmpfs_t *fs, const char *target, const char *rel);
 int tmpfs_chmod(tmpfs_t *fs, const char *rel, uint32_t mode);
+/* Rename within one tmpfs instance; the caller has already established that
+ * both paths live on the same mount. */
+int tmpfs_rename(tmpfs_t *fs, const char *srel, const char *drel);
 /* Truncate the file at `rel` to zero length (payload bytes are leaked). */
 int tmpfs_truncate(tmpfs_t *fs, const char *rel);
+/* truncate(2) to an arbitrary length, zero-filling in both directions. */
+int tmpfs_setsize(tmpfs_t *fs, const char *rel, uint64_t len);
+/* readlink(2): returns the target length, or a negative errno. */
+int tmpfs_readlink(tmpfs_t *fs, const char *rel, char *buf, uint32_t cap);
 
 #endif

@@ -136,6 +136,7 @@ int  vfs_register_dev(const char *name, const vfs_ops_t *ops, void *priv);
 
 /* ---- names ------------------------------------------------------------ */
 int  vfs_stat(const char *path, uint64_t *size, int *kind);
+int  vfs_truncate(const char *path, uint64_t len);
 int  vfs_unlink(const char *path);
 int  vfs_rmdir(const char *path);
 int  vfs_mkdir(const char *path);

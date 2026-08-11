@@ -16,12 +16,18 @@ echo GNOS rc: ready
 echo GNOS rc: hello exited with status $?
 # BusyBox smoke test.  Both dispatch paths are exercised on purpose:
 # /bin/busybox.elf reaches the multi-call dispatcher by name prefix, while
-# /usr/bin/echo picks its applet out of argv[0].  The rest walks the write
-# side of the filesystem -- mkdir, cp, mv, rm -- because that is where the
-# ext2 driver is thinnest.
+# /usr/bin/sed picks its applet out of argv[0].  sed is used for that second
+# check rather than something obvious like echo because GNU coreutils now owns
+# /usr/bin for every name it provides -- sed is one of the applets BusyBox
+# still has to itself, so it is genuinely testing argv[0] dispatch.
+#
+# The rest of the block walks the write side of the filesystem -- mkdir, cp,
+# mv, rm -- because that is where the ext2 driver is thinnest.  Those are the
+# coreutils binaries now; /etc/coreutilstest.sh asserts on them properly, this
+# is just the early, shell-visible pass.
 echo GNOS rc: busybox
 /bin/busybox.elf echo multicall dispatch ok
-/usr/bin/echo applet name dispatch ok
+/usr/bin/sed -n 1p /etc/hostname
 /usr/bin/uname -a
 /usr/bin/pwd
 /usr/bin/head -2 /etc/rc
@@ -122,6 +128,16 @@ echo GNOS rc: openrc default exited with status $?
 echo GNOS rc: bash
 /bin/bash /etc/bashtest.sh
 echo GNOS rc: bashtest exited with status $?
+
+# ---- GNU coreutils ------------------------------------------------------
+# 104 statically linked GNU programs live in /usr/bin.  They lean on far more
+# of the kernel than BusyBox ever did -- and gnulib wraps nearly every syscall
+# in a probe-and-fall-back, so a missing feature does not crash, it quietly
+# returns the wrong answer.  /etc/coreutilstest.sh is the assertion script
+# that catches that; it runs under bash and exits with the failure count.
+echo GNOS rc: coreutils
+/bin/bash /etc/coreutilstest.sh
+echo GNOS rc: coreutilstest exited with status $?
 
 # ---- network bring-up (BusyBox tools) -----------------------------------
 # Every ping here is bounded by -c: BusyBox's fancy ping otherwise runs until

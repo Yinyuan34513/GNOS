@@ -172,11 +172,20 @@ int signal_deliver(proc_t *p, int sig, regs_t *r)
     sc->ss      = (uint16_t)r->ss;
     sc->err     = r->errcode;
     sc->trapno  = r->vector;
-    sc->oldmask = p->sig_mask;
+    /* Normally the mask to come back to is the one in force right now.  After
+     * sigsuspend(2) it is the one the caller had *before* it suspended: see
+     * proc_t::sig_saved_mask.  The flag is consumed here, so a second signal
+     * arriving later restores the ordinary way. */
+    uint64_t retmask = p->sig_mask;
+    if (p->sig_restore_mask) {
+        retmask = p->sig_saved_mask;
+        p->sig_restore_mask = 0;
+    }
+    sc->oldmask = retmask;
     sc->fpstate = fp;
 
     f->uc.uc_stack.ss_flags = SS_DISABLE;   /* no sigaltstack support */
-    f->uc.uc_sigmask        = p->sig_mask;
+    f->uc.uc_sigmask        = retmask;
 
     /* We do not track who sent a signal, so every one of them looks like it
      * came from kill() by an unknown pid, which is what SI_USER means. */

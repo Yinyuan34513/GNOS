@@ -478,3 +478,116 @@ int tmpfs_truncate(tmpfs_t *fs, const char *rel)
     n->size = 0;                 /* payload bytes are leaked; writes restart at 0 */
     return 0;
 }
+
+/*
+ * truncate(2)/ftruncate(2) to an arbitrary length.
+ *
+ * Both directions have to zero, and for the same reason: the arena is never
+ * given back, so the bytes past the new end of file are still sitting there.
+ * Shrinking without clearing them would let a later grow resurrect the old
+ * contents -- one process's deleted data reappearing inside another's file.
+ */
+int tmpfs_setsize(tmpfs_t *fs, const char *rel, uint64_t len)
+{
+    struct tmpfs_node *n = walk(fs->root, rel);
+    if (!n)
+        return -E_NOENT;
+    if (n->kind == VFS_DIR)
+        return -E_ISDIR;
+    if (n->kind != VFS_FILE)
+        return -E_INVAL;
+
+    if (len > n->datacap) {
+        uint32_t newcap = ((uint32_t)len + 4095u) & ~(uint32_t)4095u;
+        uint8_t *nd = arena_alloc(newcap);
+        if (!nd)
+            return -E_NOSPC;
+        if (n->data && n->size)
+            memcpy(nd, n->data, (uint32_t)n->size);
+        n->data    = nd;
+        n->datacap = newcap;
+    }
+
+    if (n->data) {
+        if (len > n->size)
+            memset(n->data + n->size, 0, (uint32_t)(len - n->size));
+        else if (len < n->size)
+            memset(n->data + len, 0, (uint32_t)(n->size - len));
+    }
+    n->size = len;
+    return 0;
+}
+
+/* readlink(2).  Returns the target length, like the ext2 one, so a caller can
+ * tell "empty target" from "not a symlink". */
+int tmpfs_readlink(tmpfs_t *fs, const char *rel, char *buf, uint32_t cap)
+{
+    struct tmpfs_node *n = walk(fs->root, rel);
+    if (!n)
+        return -E_NOENT;
+    if (n->kind != VFS_SYMLINK || !n->target)
+        return -E_INVAL;
+
+    uint32_t len = (uint32_t)strlen(n->target);
+    uint32_t w   = len < cap ? len : cap;
+    memcpy(buf, n->target, w);
+    return (int)len;
+}
+
+/*
+ * rename(2) within one tmpfs.  Cross-filesystem moves are the caller's
+ * problem (vfs_rename refuses them with EXDEV so coreutils falls back to
+ * copy-then-unlink), which is what makes this a pointer shuffle: the node
+ * keeps its identity, its payload and its children, and only its name and
+ * its place in the parent's child list change.
+ */
+int tmpfs_rename(tmpfs_t *fs, const char *srel, const char *drel)
+{
+    char sleaf[VFS_NAME_MAX], dleaf[VFS_NAME_MAX];
+
+    if (is_fs_root(srel) || is_fs_root(drel))
+        return -E_BUSY;
+
+    struct tmpfs_node *sp = split_parent(fs->root, srel, sleaf, sizeof sleaf);
+    if (!sp)
+        return -E_NOENT;
+    struct tmpfs_node *src = find_child(sp, sleaf, strlen(sleaf));
+    if (!src)
+        return -E_NOENT;
+
+    struct tmpfs_node *dp = split_parent(fs->root, drel, dleaf, sizeof dleaf);
+    if (!dp || dp->kind != VFS_DIR)
+        return -E_NOENT;
+
+    /* Moving a directory into its own subtree would splice the tree into a
+     * ring and hang the next walk() that goes through it. */
+    for (struct tmpfs_node *a = dp; a; a = a->parent)
+        if (a == src)
+            return -E_INVAL;
+
+    struct tmpfs_node *dst = find_child(dp, dleaf, strlen(dleaf));
+    if (dst == src) {
+        /* rename("a", "a"): POSIX says do nothing and succeed. */
+        return 0;
+    }
+    if (dst) {
+        /* POSIX: an existing destination is replaced, but only by something
+         * of a compatible kind, and a directory must be empty first. */
+        if (dst->kind == VFS_DIR && src->kind != VFS_DIR)
+            return -E_ISDIR;
+        if (dst->kind != VFS_DIR && src->kind == VFS_DIR)
+            return -E_NOTDIR;
+        if (dst->kind == VFS_DIR && dst->children)
+            return -E_NOTEMPTY;
+        detach(dp, dst);
+        node_free(dst);
+    }
+
+    detach(sp, src);
+    strncpy(src->name, dleaf, VFS_NAME_MAX - 1);
+    src->name[VFS_NAME_MAX - 1] = 0;
+    src->parent   = dp;
+    src->next     = dp->children;
+    dp->children  = src;
+    return 0;
+}

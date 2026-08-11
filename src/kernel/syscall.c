@@ -2052,6 +2052,53 @@ static int64_t sys_rt_sigpending(uint64_t uset, uint64_t sigsetsize)
     return 0;
 }
 
+/*
+ * rt_sigsuspend(130): install a mask, sleep until a signal that mask lets
+ * through arrives, then return EINTR with the caller's original mask back in
+ * place -- but only *after* the handler has run.
+ *
+ * That last clause is the whole reason this cannot be written as
+ * "sigprocmask; pause; sigprocmask": the window between the second-to-last
+ * two is exactly where the awaited signal likes to arrive, and restoring the
+ * mask before delivery would leave the handler blocked out of its own signal.
+ * proc_t::sig_restore_mask carries the original mask forward to
+ * signal_deliver(), which is where the swap actually becomes visible.
+ *
+ * Getting this wrong is not subtle: timeout(1) blocks SIGALRM and then waits
+ * here for it, so an ENOSYS (or a mask restored one step early) turns
+ * `timeout 1 sleep 5` into an unkillable spin.
+ */
+static int64_t sys_rt_sigsuspend(uint64_t uset, uint64_t sigsetsize)
+{
+    proc_t *p = proc_current();
+    if (!p)
+        return -E_INVAL;
+    if (sigsetsize != sizeof(uint64_t))
+        return -E_INVAL;
+    if (!user_ptr_ok(uset, sizeof(uint64_t)))
+        return -E_FAULT;
+
+    uint64_t newmask = *(const uint64_t *)(uintptr_t)uset & ~SIG_UNCATCHABLE;
+
+    p->sig_saved_mask   = p->sig_mask;
+    p->sig_restore_mask = 1;
+    p->sig_mask         = newmask;
+
+    /* One tick of granularity is plenty: the wake-up itself is not what the
+     * caller is timing, and polling keeps this out of the business of every
+     * wait queue in the kernel.  ITIMER_REAL is driven from the timer tick,
+     * so a pending alarm shows up here within 10 ms of firing. */
+    while (!proc_pending_signals(p))
+        sched_block_timeout(WAIT_SLEEP, 1);
+
+    /* Deliberately *not* restoring sig_mask here.  signal_deliver() consumes
+     * sig_restore_mask on the way out to user mode and rt_sigreturn puts the
+     * saved mask back once the handler returns.  The one case that leaves the
+     * flag set is a pending signal whose default action terminates the
+     * process, and a dying process does not care what its mask says. */
+    return -E_INTR;
+}
+
 /* ---- futex ------------------------------------------------------------- */
 /*
  * Real futex semantics (park-on-wait, wake-on-release) need a queue we do not
@@ -2389,6 +2436,10 @@ static int64_t sys_rw_vec(int fd, uint64_t uiov, uint64_t cnt, int writing)
 }
 
 /* ---- dispatch --------------------------------------------------------- */
+/* One bit per syscall number, set the first time that number is refused.  See
+ * the default case at the bottom of syscall_handler(). */
+static uint64_t g_nosys_logged[8];
+
 void syscall_handler(regs_t *r)
 {
     uint64_t nr = r->rax;
@@ -2534,6 +2585,25 @@ void syscall_handler(regs_t *r)
         ret = vfs_rename((const char *)a1, (const char *)a2);
         break;
 
+    case SYS_truncate: {
+        char abs[GNUOS_PATH_MAX];
+        ret = path_abs(a1, abs);
+        if (ret < 0) break;
+        ret = (int64_t)a2 < 0 ? -E_INVAL : vfs_truncate(abs, a2);
+        break;
+    }
+
+    case SYS_ftruncate: {
+        /* Resolved through the descriptor's remembered path rather than its
+         * node: the open file caches a size that the truncate is about to
+         * invalidate, and going back through the VFS is what keeps the two
+         * from disagreeing. */
+        const char *p = vfs_file_path(fd_handle((int)a1));
+        if (!p) { ret = -E_BADF; break; }
+        ret = (int64_t)a2 < 0 ? -E_INVAL : vfs_truncate(p, a2);
+        break;
+    }
+
     case SYS_uname:
         ret = sys_uname(a1);
         break;
@@ -2636,13 +2706,36 @@ void syscall_handler(regs_t *r)
 
     case SYS_renameat:
     case SYS_renameat2: {
+        /* renameat(olddirfd, oldpath, newdirfd, newpath[, flags]):
+         * newdirfd is the *third* argument (rdx = a3) and newpath the
+         * fourth (r10) -- the same shape as readlinkat below.  Reading the
+         * pair one slot along instead used newpath as a descriptor and the
+         * flags word as a pointer, which page-faulted the kernel the first
+         * time anything called renameat with a non-zero flags register.
+         * musl's renameat() is a 4-argument syscall, so r8 is whatever the
+         * caller happened to leave there: `mv` was enough to trip it. */
         char old[GNUOS_PATH_MAX], newp[GNUOS_PATH_MAX];
         ret = path_at((int)a1, a2, old);
         if (ret < 0) break;
-        ret = path_at((int)r->r10, r->r8, newp);
+        ret = path_at((int)a3, r->r10, newp);
         if (ret < 0) break;
-        /* renameat2(316) flags are ignored: no NOREPLACE/EXCHANGE support,
-         * and OpenRC only ever asks for a plain rename. */
+        if (nr == SYS_renameat2) {
+            uint32_t flags = (uint32_t)r->r8;
+            /* RENAME_NOREPLACE is the one flag worth honouring: gnulib asks
+             * for it whenever it must not clobber the destination, and
+             * quietly ignoring it turns `mv -n` into `mv -f`.  EXCHANGE and
+             * WHITEOUT need atomicity the ext2 driver cannot offer, so they
+             * are refused rather than approximated. */
+            if (flags & ~RENAME_NOREPLACE) {
+                ret = -E_INVAL;
+                break;
+            }
+            uint64_t sz; int kind;
+            if ((flags & RENAME_NOREPLACE) && vfs_stat(newp, &sz, &kind) == 0) {
+                ret = -E_EXIST;
+                break;
+            }
+        }
         ret = vfs_rename(old, newp);
         break;
     }
@@ -2880,6 +2973,10 @@ void syscall_handler(regs_t *r)
         ret = sys_rt_sigpending(a1, r->r10);
         break;
 
+    case SYS_sigsuspend:
+        ret = sys_rt_sigsuspend(a1, a2);
+        break;
+
     case SYS_rt_sigreturn:
         /* Returns nothing: every register, RAX included, comes back from the
          * signal frame, so this must not fall through to the assignment at
@@ -2987,9 +3084,17 @@ void syscall_handler(regs_t *r)
         break;
 
     default:
-        dbg_puts("GNOS: unimplemented syscall ");
-        dbg_puts_dec((uint32_t)nr);
-        dbg_puts("\r\n");
+        /* Once per syscall number, not once per call.  A libc that retries in
+         * a loop on ENOSYS -- which is exactly what happens when a wait
+         * primitive is missing -- otherwise turns the debug console into the
+         * slowest part of the system: one boot with rt_sigsuspend missing
+         * wrote six megabytes of this single line. */
+        if (nr < 512 && !(g_nosys_logged[nr >> 6] & (1ULL << (nr & 63)))) {
+            g_nosys_logged[nr >> 6] |= 1ULL << (nr & 63);
+            dbg_puts("GNOS: unimplemented syscall ");
+            dbg_puts_dec((uint32_t)nr);
+            dbg_puts("\r\n");
+        }
         ret = -E_NOSYS;
         break;
     }

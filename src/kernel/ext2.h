@@ -158,6 +158,13 @@ int ext2_unlink(ext2_fs_t *fs, const char *path);
 /* Release every block of a file and reset its size to zero. */
 int ext2_truncate(ext2_fs_t *fs, ext2_dirent_t *ent);
 
+/* Set a file's length to `len`, growing into a hole or zeroing the tail. */
+int ext2_setsize(ext2_fs_t *fs, ext2_dirent_t *ent, uint64_t len);
+
+/* Live block/inode counters for statfs(2). */
+void ext2_usage(ext2_fs_t *fs, uint64_t *blocks, uint64_t *bfree,
+                uint64_t *files, uint64_t *ffree);
+
 /* Replace the permission bits (low 12) of an inode; the type bits survive. */
 int ext2_chmod(ext2_fs_t *fs, ext2_dirent_t *ent, uint16_t mode);
 

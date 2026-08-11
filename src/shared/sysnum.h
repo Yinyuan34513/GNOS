@@ -581,6 +581,11 @@ typedef struct {
 #define AT_EMPTY_PATH      0x1000
 #define AT_FDCWD          (-100)
 
+/* renameat2(316) flags.  Only NOREPLACE is implemented -- see the syscall. */
+#define RENAME_NOREPLACE  (1u << 0)
+#define RENAME_EXCHANGE   (1u << 1)
+#define RENAME_WHITEOUT   (1u << 2)
+
 /*
  * uname(63).  Linux's new_utsname: six fixed 65-byte fields, no padding.
  * musl's struct utsname always reserves the sixth (as `domainname` under
@@ -656,6 +661,53 @@ typedef struct {
 #define CLOCK_REALTIME_COARSE    5
 #define CLOCK_MONOTONIC_COARSE   6
 #define CLOCK_BOOTTIME           7
+
+/*
+ * statfs(137)/fstatfs(138).  Linux's x86-64 struct statfs, byte for byte as
+ * musl declares it: 120 bytes with f_fsid as two ints.  df(1) reads f_blocks,
+ * f_bfree and f_bavail; `stat -f` prints the rest.
+ */
+typedef struct {
+    uint64_t f_type;
+    uint64_t f_bsize;
+    uint64_t f_blocks;
+    uint64_t f_bfree;
+    uint64_t f_bavail;
+    uint64_t f_files;
+    uint64_t f_ffree;
+    int32_t  f_fsid[2];
+    uint64_t f_namelen;
+    uint64_t f_frsize;
+    uint64_t f_flags;
+    uint64_t f_spare[4];
+} kstatfs_t;
+
+/* f_type magics, from Linux's magic.h -- coreutils recognises these by name. */
+#define EXT2_SUPER_MAGIC   0xEF53
+#define TMPFS_MAGIC        0x01021994
+#define PROC_SUPER_MAGIC   0x9FA0
+
+/*
+ * sysinfo(99).  Linux's struct sysinfo on 64-bit: no padding needed because
+ * every field is already 8 bytes except the trailing pair, and `_f` pads the
+ * whole thing out to 112 bytes.
+ */
+typedef struct {
+    int64_t  uptime;
+    uint64_t loads[3];
+    uint64_t totalram;
+    uint64_t freeram;
+    uint64_t sharedram;
+    uint64_t bufferram;
+    uint64_t totalswap;
+    uint64_t freeswap;
+    uint16_t procs;
+    uint16_t pad;
+    uint64_t totalhigh;
+    uint64_t freehigh;
+    uint32_t mem_unit;
+    char     _f[8];
+} ksysinfo_t;
 
 /* ---- auxv (AT_*) -------------------------------------------------------
  * Types passed to a new process on its initial stack, right after envp and
