@@ -345,6 +345,7 @@ typedef struct {
 #define TIOCSPGRP   0x5410
 #define TIOCGWINSZ  0x5413
 #define TIOCSWINSZ  0x5414
+#define TIOCNOTTY   0x5422
 
 /*
  * struct termios, in the *kernel's* x86-64 layout: 36 bytes, c_cc[19].

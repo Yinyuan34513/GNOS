@@ -38,6 +38,7 @@
 #include "subsys.h"
 #include "fbcon.h"
 #include "idt.h"
+#include "vmm.h"
 #include "vfs.h"
 #include "proc.h"
 #include "timer.h"
@@ -627,7 +628,74 @@ static int32_t tty_node_write(vfs_node_t *n, uint64_t off, const void *buf,
     return tty_write((const char *)buf, len);
 }
 
-static const vfs_ops_t g_tty_ops = { .read = tty_node_read, .write = tty_node_write };
+/*
+ * Terminal ioctls, answered on the VFS char-device path rather than via the
+ * syscall-layer tty_ops() fallback.  This is what makes musl's isatty()
+ * (a TCGETS probe) and tcgetattr()/tcsetattr() succeed on /dev/tty and
+ * /dev/console -- without it a shell like bash refuses to start in interactive
+ * mode, because it decides "interactive" from isatty(0) && isatty(1).
+ */
+static int32_t tty_node_ioctl(vfs_node_t *n, uint64_t cmd, uint64_t arg)
+{
+    (void)n;
+
+    switch (cmd) {
+    case TCGETS:
+        if (!user_ptr_ok(arg, sizeof(termios_t)))
+            return -E_FAULT;
+        tty_get_termios((termios_t *)(uintptr_t)arg);
+        return 0;
+
+    case TCSETS:
+    case TCSETSW:
+    case TCSETSF:
+        if (!user_ptr_ok(arg, sizeof(termios_t)))
+            return -E_FAULT;
+        if (tty_check_ttou())
+            return -E_INTR;
+        tty_set_termios((const termios_t *)(uintptr_t)arg, cmd == TCSETSF);
+        return 0;
+
+    case TIOCGWINSZ:
+        if (!user_ptr_ok(arg, sizeof(winsize_t)))
+            return -E_FAULT;
+        tty_get_winsize((winsize_t *)(uintptr_t)arg);
+        return 0;
+
+    case TIOCSWINSZ:
+        /* The console is exactly as large as the framebuffer makes it. */
+        return 0;
+
+    case TIOCGPGRP:
+        if (!user_ptr_ok(arg, sizeof(int)))
+            return -E_FAULT;
+        *(int *)(uintptr_t)arg = tty_get_pgrp();
+        return 0;
+
+    case TIOCSPGRP:
+        if (!user_ptr_ok(arg, sizeof(int)))
+            return -E_FAULT;
+        if (tty_check_ttou())
+            return -E_INTR;
+        tty_set_pgrp(*(const int *)(uintptr_t)arg);
+        return 0;
+
+    /* There is one terminal and every process shares it, so acquiring or
+     * releasing it as a controlling tty is already true by the time you ask. */
+    case TIOCSCTTY:
+    case TIOCNOTTY:
+        return 0;
+
+    default:
+        return -E_NOTTY;
+    }
+}
+
+static const vfs_ops_t g_tty_ops = {
+    .read  = tty_node_read,
+    .write = tty_node_write,
+    .ioctl = tty_node_ioctl,
+};
 
 const void *tty_ops(void)
 {

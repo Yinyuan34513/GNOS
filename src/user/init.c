@@ -17,7 +17,8 @@
  */
 #include "ulib.h"
 
-#define SHELL_PATH  "/bin/sh"
+#define SHELL_PATH  "/bin/bash"   /* the interactive login shell */
+#define RC_SHELL    "/bin/sh"     /* the one-shot startup script */
 #define RC_PATH     "/etc/rc"
 
 /* If the shell cannot even start, stop trying: an exec that fails instantly
@@ -57,7 +58,7 @@ static void run_rc(void)
 
     if (pid == 0) {
         char *av[3];
-        av[0] = (char *)SHELL_PATH;
+        av[0] = (char *)RC_SHELL;
         av[1] = (char *)RC_PATH;
         av[2] = 0;
 
@@ -71,7 +72,7 @@ static void run_rc(void)
 
         setpgid(0, 0);
         default_terminal_signals();
-        execv(SHELL_PATH, av);
+        execv(RC_SHELL, av);
         exit(127);
     }
 

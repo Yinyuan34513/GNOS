@@ -370,6 +370,8 @@ $(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) $(BASH_BIN) $(CC_BIN) src/user/rc | $
 	# C resolver actually work: ping/wget do DNS via /etc/resolv.conf, getent
 	# reads /etc/passwd, and `hostname` uses /etc/hostname.
 	cp -a src/rootfs/etc/. $(BUILD)/initrd-root/etc/
+	# ---- root home: ~/.bashrc is sourced by the interactive login shell ----
+	cp -a src/rootfs/root/. $(BUILD)/initrd-root/root/
 	# ---- OpenRC 0.56 tree ------------------------------------------------
 	# The full install (built separately with meson + musl, see
 	# build/orcsrc/) drops in here: /sbin/openrc (+ openrc-run, rc-status,

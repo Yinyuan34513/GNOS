@@ -40,6 +40,16 @@ echo GNOS rc: busybox
 /usr/bin/rm /tmp/bb/moved
 /usr/bin/ls /tmp/bb
 echo GNOS rc: busybox done
+
+# Phase 1 probe: the login shell is /bin/bash and it must start interactive.
+# bash -i forces interactive mode; an interactive bash sources ~/.bashrc, which
+# prints the banner below -- so seeing the banner proves both that bash's
+# interactive machinery initialises (job control, readline, signals) and that the
+# new /root/.bashrc is in the image.  The tty ioctl fix is what makes
+# isatty()/tcgetattr() succeed, without which bash refused interactive mode.
+/bin/bash -i -c 'echo GNOS rc: bash interactive mode ok'
+echo GNOS rc: bash-probe exited with status $?
+
 # termios: assert the terminal answers the ioctls a real libc issues, that
 # the defaults match Linux's, and that a background process gets SIGTTOU for
 # reconfiguring it.  All of it is non-interactive, so it runs on every boot.
