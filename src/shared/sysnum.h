@@ -41,6 +41,7 @@
 #define SYS_exit          60
 #define SYS_wait4         61
 #define SYS_kill          62
+#define SYS_ptrace       101
 #define SYS_poll           7
 #define SYS_ppoll        271
 #define SYS_getcwd        79
@@ -125,6 +126,8 @@
 #define SYS_setgroups    116
 #define SYS_getresuid    118
 #define SYS_getresgid    120
+#define SYS_setresuid    117
+#define SYS_setresgid    119
 #define SYS_sigaltstack  131
 #define SYS_sigsuspend   130
 #define SYS_statfs       137
@@ -162,7 +165,26 @@
 #define SYS_chroot       161
 #define SYS_reboot       169
 #define SYS_personality  135
+
+/* Kernel module syscalls, same numbers as Linux x86-64.  init_module
+ * loads an image from memory, finit_module from an fd, delete_module
+ * unloads by name. */
+#define SYS_init_module  175
+#define SYS_delete_module 176
+#define SYS_finit_module 313
 #define SYS_sched_getaffinity 204
+
+/* Anonymous-fd syscalls for the Wayland plumbing (wl_shm pools, the
+ * compositor's event loop), same numbers as Linux x86-64: memfd_create
+ * backs wl_shm, eventfd/eventfd2 carry wakeups, epoll drives the loop. */
+#define SYS_epoll_create  213
+#define SYS_epoll_wait    232
+#define SYS_epoll_ctl     233
+#define SYS_epoll_pwait   281
+#define SYS_eventfd       284
+#define SYS_eventfd2      290
+#define SYS_epoll_create1 291
+#define SYS_memfd_create  319
 #define SYS_clock_getres 229
 #define SYS_clock_nanosleep 230
 
@@ -175,6 +197,14 @@
  * handling on a headless `make test` run -- see src/user/readlinetest.c.
  */
 #define SYS_ttyinject    404
+
+/*
+ * inputinject(405) is the input twin of ttyinject(404): it pushes one
+ * synthetic evdev event (type/code/value triple) into the /dev/input/event0
+ * queue as though the PS/2 keyboard IRQ had produced it.  Headless tests
+ * use it to drive read/poll/ioctl on the evdev node -- see src/user/evtest.c.
+ */
+#define SYS_inputinject  405
 
 /* ---- sockets -----------------------------------------------------------
  * x86-64 has no socketcall(2) multiplexer -- that is a 32-bit i386 thing --
@@ -209,6 +239,18 @@
  * bash's trap handling reaches it during startup; it is just access() with an
  * explicit dirfd and flags, both of which this single-root kernel can ignore. */
 #define SYS_faccessat2    439
+
+/* Report how many cores came online (BSP + any APs Limine started).  Lets a
+ * boot assertion program confirm SMP bring-up without parsing the boot log. */
+#define SYS_smp_count     440
+
+/*
+ * dbgputs(441) -- copy a NUL-terminated user string to the debug console
+ * (isa-debugcon), the mirror image of ttyinject(404).  Headless tests write
+ * their verdicts through this so `make test` can grep build/dbg.log.  A
+ * GNOS extension, not a Linux syscall.
+ */
+#define SYS_dbgputs       441
 
 /*
  * struct sockaddr_in as it crosses the syscall boundary: 16 bytes, and the
@@ -275,6 +317,9 @@ typedef struct {
 #define SIGHUP   1
 #define SIGINT   2
 #define SIGQUIT  3
+/* SIGTRAP is only produced by ptrace: the tracer's wait status after a
+ * PTRACE_SYSCALL/PTRACE_CONT stop. */
+#define SIGTRAP  5
 #define SIGKILL  9
 #define SIGSEGV 11
 #define SIGPIPE 13
@@ -304,6 +349,9 @@ typedef struct {
 #define O_RDONLY   0
 #define O_WRONLY   1
 #define O_RDWR     2
+#ifndef O_ACCMODE
+#define O_ACCMODE  3
+#endif
 #define O_CREAT    0100
 #define O_EXCL     0200
 #define O_NOCTTY   0400
@@ -346,6 +394,46 @@ typedef struct {
 #define TIOCGWINSZ  0x5413
 #define TIOCSWINSZ  0x5414
 #define TIOCNOTTY   0x5422
+
+/* ---- virtual terminals (ioctl on any /dev/tty*) -------------------------
+ * The console is not one terminal but several, only one of which is on
+ * screen; Ctrl-Alt-F<n> puts a different one there.  These are the same
+ * request numbers Linux uses, so chvt/openvt-style programs work unchanged,
+ * and -- more usefully here -- a headless test can drive a console switch
+ * without a keyboard.
+ *
+ * VT_ACTIVATE and VT_WAITACTIVE take the terminal number *by value* in the
+ * argument, numbered from 1 like the /dev/ttyN names.  VT_OPENQRY and
+ * VT_GETSTATE take pointers.
+ */
+#define VT_OPENQRY    0x5600    /* int *: lowest terminal with no session   */
+#define VT_GETMODE    0x5601    /* struct vt_mode *                         */
+#define VT_SETMODE    0x5602    /* struct vt_mode *                         */
+#define VT_GETSTATE   0x5603    /* struct vt_stat *                         */
+#define VT_ACTIVATE   0x5606    /* int: switch to this terminal             */
+#define VT_WAITACTIVE 0x5607    /* int: block until it is the one on screen */
+#define VT_DISALLOCATE 0x5608   /* int: release a terminal                  */
+
+/* VT_GETSTATE payload.  v_state is a bitmap of terminals in use, bit N for
+ * terminal N, with bit 0 set for historical reasons. */
+typedef struct {
+    uint16_t v_active;          /* the terminal currently on screen */
+    uint16_t v_signal;          /* unused, reported as 0 */
+    uint16_t v_state;           /* bitmap of allocated terminals */
+} vt_stat_t;
+
+/* VT_GETMODE/VT_SETMODE payload.  Only VT_AUTO is supported: the kernel
+ * switches terminals by itself and never asks a process for permission. */
+#define VT_AUTO      0x00
+#define VT_PROCESS   0x01
+
+typedef struct {
+    uint8_t mode;
+    uint8_t waitv;
+    int16_t relsig;
+    int16_t acqsig;
+    int16_t frsig;
+} vt_mode_t;
 
 /*
  * struct termios, in the *kernel's* x86-64 layout: 36 bytes, c_cc[19].

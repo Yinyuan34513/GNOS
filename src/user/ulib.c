@@ -18,10 +18,26 @@ static long syscall3(long nr, long a, long b, long c)
     return ret;
 }
 
+static long syscall1(long nr, long a)
+{
+    long ret;
+    asm volatile("int $0x80"
+                 : "=a"(ret)
+                 : "a"(nr), "D"(a)
+                 : "memory", "rcx", "r11");
+    return ret;
+}
+
 /* ---- raw system calls -------------------------------------------------- */
 long sys_read(int fd, void *buf, long n)
 {
     return syscall3(SYS_read, fd, (long)buf, n);
+}
+
+/* dbgputs(441): copy a NUL-terminated string to the debug console. */
+long sys_dbgputs(const char *s)
+{
+    return syscall1(SYS_dbgputs, (long)s);
 }
 
 long sys_write(int fd, const void *buf, long n)

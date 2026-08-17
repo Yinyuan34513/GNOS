@@ -31,6 +31,16 @@ SECTIONS
         *(.rodata*)
     } :rodata
 
+    /* The exported-symbol table for loadable modules (EXPORT_SYMBOL in
+     * module.h).  Bounded symbols are defined here so the module loader
+     * does not depend on ld's __start_/__stop_ auto-symbols. */
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __ksymtab : {
+        __start___ksymtab = .;
+        KEEP(*(__ksymtab))
+        __stop___ksymtab = .;
+    } :rodata
+
     . = ALIGN(CONSTANT(MAXPAGESIZE));
     .dynamic : {
         *(.dynamic)

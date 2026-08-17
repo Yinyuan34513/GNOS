@@ -1,0 +1,9 @@
+[package]
+name = "cthulhu"
+version = "0.1.0"
+edition = "2021"
+description = "A Turing-complete tongue of the Outer Gods: the eight quote-glyphs are the only real letters; all other text is chaff."
+license = "MIT OR Apache-2.0"
+rust-version = "1.75"
+
+[dependencies]

@@ -17,6 +17,8 @@
 /* ---- raw system calls -------------------------------------------------- */
 long sys_read(int fd, void *buf, long n);
 long sys_write(int fd, const void *buf, long n);
+/* dbgputs(441): copy a NUL-terminated string to the debug console. */
+long sys_dbgputs(const char *s);
 int  sys_open(const char *path, int flags);
 int  sys_close(int fd);
 int  sys_dup(int fd);

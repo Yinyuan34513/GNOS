@@ -25,7 +25,8 @@ OBJCOPY := objcopy
 BASEFLAGS := -m64 -ffreestanding -nostdlib -fno-stack-protector -fno-builtin \
              -nostdinc -std=gnu11 -mno-red-zone -mgeneral-regs-only \
              -mno-sse -mno-sse2 -mno-mmx -mno-80387 -fvisibility=hidden \
-             -Wall -Wextra -O2 -g -Isrc/include -Isrc/shared -Isrc/kernel
+             -Wall -Wextra -O2 -g -Isrc/include -Isrc/shared \
+             -Isrc/kernel/core -Isrc/kernel/driver
 
 # kernel: PIE so Limine can relocate it into the higher half
 KCFLAGS := $(BASEFLAGS) -fpie
@@ -43,20 +44,25 @@ ISO     := $(BUILD)/gnos.iso
 ISO_ROOT := $(BUILD)/iso
 
 KOBJS := $(BUILD)/kernel.o $(BUILD)/loader.o $(BUILD)/fbcon.o $(BUILD)/gfx.o \
-         $(BUILD)/fbdev.o $(BUILD)/subsys.o $(BUILD)/acpi.o \
+         $(BUILD)/fbdev.o $(BUILD)/drm.o $(BUILD)/subsys.o $(BUILD)/acpi.o \
          $(BUILD)/debugcon.o $(BUILD)/ext2.o $(BUILD)/panic.o \
          $(BUILD)/gdt.o $(BUILD)/idt.o $(BUILD)/isr.o \
          $(BUILD)/kstring.o $(BUILD)/vfs.o $(BUILD)/procfs.o $(BUILD)/tmpfs.o $(BUILD)/tty.o $(BUILD)/heap.o \
-         $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/proc.o \
-         $(BUILD)/signal.o $(BUILD)/switch.o $(BUILD)/timer.o \
-         $(BUILD)/syscall.o \
-         $(BUILD)/net.o $(BUILD)/tcp.o $(BUILD)/sock.o \
+         $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/proc.o $(BUILD)/ptrace.o \
+        $(BUILD)/signal.o $(BUILD)/switch.o $(BUILD)/timer.o \
+        $(BUILD)/syscall.o \
+        $(BUILD)/smp.o $(BUILD)/ap_trampoline.o \
+        $(BUILD)/net.o $(BUILD)/tcp.o $(BUILD)/sock.o \
          $(BUILD)/pci.o $(BUILD)/e1000.o $(BUILD)/audio.o \
-         $(BUILD)/hda.o \
-         $(BUILD)/limine_requests.o
+        $(BUILD)/hda.o $(BUILD)/ata.o $(BUILD)/cjkfont.o \
+        $(BUILD)/cjkfont_data.o \
+        $(BUILD)/input.o \
+        $(BUILD)/anonfd.o $(BUILD)/epoll.o \
+        $(BUILD)/module.o $(BUILD)/module_elf.o $(BUILD)/exports.o \
+        $(BUILD)/limine_requests.o
 
 # User programs: name -> build/<name>.elf, all linked from crt0 + ulib.
-UPROGS  := init shell count ls cat tail tac rm mkdir touch
+UPROGS  := init shell count ls cat tail tac rm mkdir touch scan dbgcat
 UELFS   := $(addprefix $(BUILD)/,$(addsuffix .elf,$(UPROGS)))
 UCRT    := $(BUILD)/user/crt0.o $(BUILD)/user/ulib.o
 
@@ -71,7 +77,7 @@ MUSL_INC  := $(MUSL_PREFIX)/include
 MUSL_GCC  := $(MUSL_PREFIX)/bin/musl-gcc
 
 # Programs built against musl rather than ulib.
-MUSLPROGS := hello ttytest sigtest readlinetest fstest mounttest mount fbtest coldplug
+MUSLPROGS := hello mount coldplug chvt getty login installer ttytest thrtest drmtest ptracetest modtest insmod rmmod evtest eventest
 MUSL_OBJS := $(addprefix $(BUILD)/user/,$(addsuffix .o,$(MUSLPROGS)))
 MUSL_ELFS := $(addprefix $(BUILD)/,$(addsuffix .elf,$(MUSLPROGS)))
 
@@ -146,6 +152,31 @@ CC_SRC  := $(BUILD)/ccsrc/coreutils-9.9
 CC_STUB := $(BUILD)/ccsrc/linux-stub/include
 CC_BIN  := $(CC_SRC)/src/ls
 
+# GNU binutils 2.47 — assembler, linker and the ELF inspection tools, so the
+# guest can build and dissect its own binaries.  Fetched by hand into
+# build/busrcc and configured with:
+#
+#   ./configure --host=x86_64-linux-musl CC=<musl-gcc> AR=gcc-ar \
+#               RANLIB=gcc-ranlib CFLAGS="-O2 -static -no-pie -fno-pie" \
+#               LDFLAGS="-static" --disable-nls --disable-werror \
+#               --disable-gdb --disable-gprofng --without-debuginfod
+#
+# AR/RANLIB are gcc-ar/gcc-ranlib rather than bare ar because 2.47's
+# configure probe for the libsframe archiver interface trips on plain ar.
+#
+# Two more hand edits live in the tree and must be re-applied after any
+# re-configure:
+#   - the libtool script in each subdirectory swallows `-static` as one of
+#     its own mode flags and never passes it to the compiler driver, so the
+#     tools come out dynamically linked against libc and die instantly on
+#     this kernel (no ld-musl).  The `-static | -static-libtool-libs)`
+#     branch in func_mode_link is patched to append " -static" to the
+#     compile/finalize commands instead of `continue`.
+#   - `disable-shared` in configure makes the bfd/opcodes/ctf libraries
+#     static archives, otherwise libtool links the executables against
+#     uninstalled .so files.
+BU_SRC := $(BUILD)/busrcc/binutils-2.47
+
 # musl programs see musl's headers and nothing else.  Two things matter here:
 #   -nostdinc stays (BASEFLAGS already has it) so glibc's /usr/include cannot
 #   leak in, and -Isrc/include / -Isrc/kernel are dropped because they shadow
@@ -158,7 +189,8 @@ CC_BIN  := $(CC_SRC)/src/ls
 # doubles over under a different convention than printf expects and the value
 # silently reads back as zero.  User mode is safe here -- vmm.c sets
 # CR4.OSFXSR and proc.c fxsaves/fxrstors per process.
-MUSLCFLAGS := $(filter-out -Isrc/include -Isrc/kernel -mgeneral-regs-only \
+MUSLCFLAGS := $(filter-out -Isrc/include -Isrc/kernel/core -Isrc/kernel/driver \
+                           -mgeneral-regs-only \
                            -mno-sse -mno-sse2 -mno-mmx -mno-80387,$(BASEFLAGS)) \
               -isystem $(MUSL_INC) -Isrc/user -fno-pie -fno-pic
 
@@ -178,7 +210,34 @@ QEMU_NET   := -nic none -netdev user,id=net0 -device e1000,netdev=net0
 QEMU_AUDIO := -audiodev none,id=snd0 \
               -device AC97,audiodev=snd0 \
               -device intel-hda -device hda-duplex,audiodev=snd0
-QEMU_DEVICES := $(QEMU_NET) $(QEMU_AUDIO)
+
+# A hard disk for the guest to install onto.  `-cdrom` already occupies the
+# secondary master (that is where the boot ISO is, and why ata.c has to detect
+# and skip ATAPI devices), so this goes on the primary channel and comes up as
+# /dev/sda.  `if=ide` and not virtio deliberately: the point of src/kernel/ata.c
+# is to drive the 1986 interface every PC still emulates, so the guest sees a
+# disk that needs no driver it does not already have.
+#
+# The image is sparse -- 256 MiB of address space costs a few kilobytes on the
+# host until something writes to it -- and is *not* removed by `clean`: once
+# the installer has put a system on it, that system is the interesting artifact.
+DISK    := $(BUILD)/disk.img
+DISK_MB ?= 256
+QEMU_DISK := -drive file=$(DISK),format=raw,if=ide,index=0,media=disk
+
+# The initrd's explicit size.  mke2fs -d auto-sizes to the content, which is
+# exactly what must not happen: the kernel mounts this read-write in RAM and
+# every byte the filesystem grows at runtime comes out of this headroom.
+# fastfetch alone added ~4 MiB of binaries, so 96M.
+INITRD_MB ?= 96
+
+# Number of virtual cores QEMU exposes.  The SMP bring-up path brings up
+# every core Limine reports, so changing this also changes what smpinfo.elf
+# (run from /etc/rc) must assert -- keep the two in sync.
+SMP_CPUS ?= 4
+QEMU_SMP := -smp $(SMP_CPUS)
+
+QEMU_DEVICES := $(QEMU_NET) $(QEMU_AUDIO) $(QEMU_DISK) $(QEMU_SMP)
 
 # The same hardware, but with a backend you can actually hear.  Override on
 # the command line if PulseAudio is not what your desktop runs, e.g.
@@ -189,7 +248,7 @@ GUI_AUDIO := -audiodev $(AUDIO_BACKEND),id=snd0 \
              -device AC97,audiodev=snd0 \
              -device intel-hda -device hda-duplex,audiodev=snd0
 
-.PHONY: all run run-uefi guistart test clean distclean
+.PHONY: all run run-uefi guistart clean distclean
 all: $(ISO)
 
 # musl's headers only become usable after `make install` assembles them into a
@@ -205,9 +264,14 @@ $(MUSL_LIB)/libc.a $(MUSL_GCC):
 # AR=gcc-ar is not cosmetic: binutils 2.41's plain `ar` segfaults while
 # auto-loading the LTO plugin on this host, and BusyBox archives every
 # subdirectory into a .a before the final link.
+#
+# CONFIG_STATIC must be y in $(BB_SRC)/.config or the result is a dynamic
+# PIE with an ld-musl interpreter -- which the kernel's loader cannot run
+# (ET_EXEC only, no dynamic linker).  -no-pie -fno-pie on top because the
+# host gcc defaults to PIE, and "-static -pie" is still an ET_DYN.
 $(BB_BIN): $(BB_SRC)/.config | $(MUSL_GCC)
 	$(MAKE) -C $(BB_SRC) CC=$(abspath $(MUSL_GCC)) HOSTCC=gcc AR=gcc-ar \
-	  SKIP_STRIP=y
+	  SKIP_STRIP=y CFLAGS_EXTRA="-fno-pie -no-pie" LDFLAGS_EXTRA="-static -no-pie"
 
 # GNU Bash.  Like BusyBox, the tree is fetched and configured by hand (see
 # the BASH_SRC comment above) and this rule only relinks it when the binary
@@ -221,10 +285,31 @@ $(BASH_BIN): $(BASH_SRC)/Makefile | $(MUSL_GCC)
 $(CC_BIN): $(CC_SRC)/Makefile | $(MUSL_GCC)
 	$(MAKE) -C $(CC_SRC) SUBDIRS="po ." HELP2MAN=: MAKEINFO=:
 
+# GNU binutils.  Configured by hand (see BU_SRC above); this only relinks it
+# when the tool binaries are gone.
+$(BU_SRC)/binutils/readelf: $(BU_SRC)/Makefile | $(MUSL_GCC)
+	$(MAKE) -C $(BU_SRC)
+
+# fastfetch — the system-info tool GNOS exists to run.  Fetched into
+# build/ffsrc (https://github.com/fastfetch-cli/fastfetch.git) and built by
+# tools/build-fastfetch.sh with the locally built clang 24 (fastfetch needs
+# C23, host gcc 12 cannot do it) against musl, statically, with every
+# optional dependency disabled.  See that script for the full flag list.
+#
+# This rule must live below `all`: make takes the first target in the file
+# as its default goal.
+FF_SRC := $(BUILD)/ffsrc
+FF_BIN := $(BUILD)/ffbuild/fastfetch
+FFLASH  := $(BUILD)/ffbuild/flashfetch
+
+$(FF_BIN): $(FF_SRC)/CMakeLists.txt | $(MUSL_GCC)
+	chmod +x tools/build-fastfetch.sh
+	tools/build-fastfetch.sh
+
 # Both directories are listed separately: `clean` leaves $(BUILD) standing (the
 # third-party trees live there), so a rule keyed only on $(BUILD) would never
 # fire again and $(BUILD)/user would stay missing.
-$(BUILD) $(BUILD)/user:
+$(BUILD) $(BUILD)/user $(BUILD)/modules:
 	mkdir -p $@
 
 # ---------- header dependencies ----------
@@ -242,15 +327,62 @@ DEPS := $(KOBJS:.o=.d) $(UOBJS:.o=.d) $(MUSL_OBJS:.o=.d) $(UCRT:.o=.d) \
 -include $(DEPS)
 
 # ---------- kernel (Limine entry point) ----------
-$(BUILD)/%.o: src/kernel/%.c | $(BUILD)
+# Sources live in three trees -- core (arch/mem/fs/proc) and driver
+# (hardware-facing) subdirectories plus the root for the two entry-point
+# files -- while every .o lands flat in $(BUILD).  vpath lets the %.o rules
+# below find a source by bare name no matter which directory it is in.
+vpath %.c src/kernel src/kernel/core src/kernel/driver
+vpath %.asm src/kernel src/kernel/core src/kernel/driver
+vpath %.S src/kernel src/kernel/core src/kernel/driver
+
+$(BUILD)/%.o: %.c | $(BUILD)
 	$(CC) $(KCFLAGS) $(DEPFLAGS) -c -o $@ $<
 
-$(BUILD)/%.o: src/kernel/%.asm | $(BUILD)
+$(BUILD)/%.o: %.asm | $(BUILD)
 	$(AS) -f elf64 -o $@ $<
+
+# GNU-as sources, for the one thing nasm cannot do here: .incbin of a file the
+# C compiler must not see.  Run through the C driver so the preprocessor and
+# the kernel's flags apply.
+$(BUILD)/%.o: %.S | $(BUILD)
+	$(CC) $(KCFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+# The font blob is checked in, so this is a dependency rather than a rule that
+# fires: `make cjkfont` regenerates it deliberately, a normal build never does.
+$(BUILD)/cjkfont_data.o: src/kernel/driver/cjkfont.bin
+
+# The CJK bitmap is stapled into the kernel image by GNU-as (.incbin of a 1 MiB
+# binary the C compiler must never see).  It is assembled into its own object,
+# cjkfont_data.o; cjkfont.c compiles to cjkfont.o.  Keeping them separate is
+# what stops the two competing for the same cjkfont.o target.
+$(BUILD)/cjkfont_data.o: src/kernel/driver/cjkfont_data.S | $(BUILD)
+	$(CC) $(KCFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+.PHONY: cjkfont
+cjkfont:
+	python3 tools/mkcjkfont.py
 
 $(KRNL): $(KOBJS) linker.ld
 	$(CC) $(KCFLAGS) -static-pie -Wl,-T,linker.ld -Wl,-z,max-page-size=0x1000 \
 	  -Wl,--build-id=none -o $@ $(KOBJS)
+
+# ---------- loadable kernel modules (.ko) ----------
+# src/kernel/modules/*.c -> build/modules/*.ko.  These are plain ET_REL
+# objects (no -fpie, no -fpic): the loader maps and relocates them itself.
+# The module toolchain is the kernel's minus the PIE codegen; -fno-pie /
+# -fno-pic undo what BASEFLAGS -fpie would otherwise add.
+KMSRC := $(wildcard src/kernel/modules/*.c)
+KMODS := $(patsubst src/kernel/modules/%.c,$(BUILD)/modules/%.ko,$(KMSRC))
+
+$(BUILD)/modules/%.o: src/kernel/modules/%.c \
+	  src/kernel/modules/module_info.h src/kernel/core/module.h \
+	  src/kernel/core/kstring.h | $(BUILD)/modules
+	$(CC) $(BASEFLAGS) -fno-pie -fno-pic -fno-stack-protector \
+	  -fno-asynchronous-unwind-tables -fno-omit-frame-pointer \
+	  $(DEPFLAGS) -c -o $@ $<
+
+$(BUILD)/modules/%.ko: $(BUILD)/modules/%.o
+	$(LD) -m elf_x86_64 -r --build-id=none -o $@ $<
 
 # ---------- user programs ----------
 $(BUILD)/user/%.o: src/user/%.c | $(BUILD)/user
@@ -286,7 +418,8 @@ $(MUSL_ELFS): $(BUILD)/%.elf: $(BUILD)/user/%.o \
 # neither a loopback mount nor root.  The feature set is trimmed on purpose:
 # ^dir_index keeps every directory a plain linear list, which is all the
 # kernel driver knows how to rewrite.
-$(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) $(BASH_BIN) $(CC_BIN) src/user/rc | $(BUILD)
+$(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) $(BASH_BIN) $(CC_BIN) $(KRNL) \
+           $(FF_BIN) $(KMODS) src/user/rc | $(BUILD)
 	rm -rf $(BUILD)/initrd-root
 	mkdir -p $(BUILD)/initrd-root
 	# ---- FHS skeleton (empty dirs are harmless placeholders for now) ----
@@ -306,6 +439,23 @@ $(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) $(BASH_BIN) $(CC_BIN) src/user/rc | $
 	mkdir -p $(BUILD)/initrd-root/home
 	mkdir -p $(BUILD)/initrd-root/mnt
 	mkdir -p $(BUILD)/initrd-root/run
+	# ---- /sys: the static sysfs tree the DRM client tooling reads ---------
+	# There is no sysfs backend, so the handful of nodes fastfetch's GPU
+	# detection consults are laid down here, by hand, exactly as the Linux
+	# sysfs would lay them out for a QEMU bochs VGA behind bochsdrm.  They
+	# describe the real hardware: 1234:1111 stdvga, class 03/00, on
+	# 0000:00:02.0 -- the device GNOS's drm.c actually drives.
+	mkdir -p $(BUILD)/initrd-root/sys/class/drm/card0
+	mkdir -p $(BUILD)/initrd-root/sys/class/drm/renderD128
+	mkdir -p $(BUILD)/initrd-root/sys/devices/0000:00:02.0/drm/renderD128
+	echo 'pci:v00001234d00001111sv00001AF4sd00001100bc03sc00' \
+	  > $(BUILD)/initrd-root/sys/devices/0000:00:02.0/modalias
+	ln -sfn ../../../bus/pci/drivers/bochsdrm \
+	  $(BUILD)/initrd-root/sys/devices/0000:00:02.0/driver
+	ln -sfn ../../devices/0000:00:02.0 \
+	  $(BUILD)/initrd-root/sys/class/drm/card0/device
+	ln -sfn ../../devices/0000:00:02.0 \
+	  $(BUILD)/initrd-root/sys/class/drm/renderD128/device
 	# ---- user programs live in /bin ----
 	for p in $(UPROGS); do \
 	  cp $(BUILD)/$$p.elf $(BUILD)/initrd-root/bin/$$p.elf; \
@@ -320,6 +470,25 @@ $(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) $(BASH_BIN) $(CC_BIN) src/user/rc | $
 	# scripts, so it must sit on PATH as /bin/mount (not /bin/mount.elf).  The
 	# rest of the musl programs are only ever called by absolute path.
 	cp $(BUILD)/mount.elf $(BUILD)/initrd-root/bin/mount
+	# getty, login and chvt are named without the .elf suffix: /etc/inittab
+	# style callers, the shell and /etc/issue all refer to them by the names
+	# every other Unix uses, and `login` in particular is what getty execs by
+	# a compiled-in absolute path.
+	cp $(BUILD)/getty.elf $(BUILD)/initrd-root/sbin/getty
+	cp $(BUILD)/login.elf $(BUILD)/initrd-root/bin/login
+	cp $(BUILD)/chvt.elf  $(BUILD)/initrd-root/usr/bin/chvt
+	# ---- loadable kernel modules: /lib/modules, like every Linux ---------
+	mkdir -p $(BUILD)/initrd-root/lib/modules
+	for k in $(KMODS); do \
+	  cp $$k $(BUILD)/initrd-root/lib/modules/; \
+	done
+	# insmod/rmmod are typed by name at the shell, no .elf suffix (and
+	# /sbin, like the Linux kmod tools they stand in for).
+	cp $(BUILD)/insmod.elf $(BUILD)/initrd-root/sbin/insmod
+	cp $(BUILD)/rmmod.elf  $(BUILD)/initrd-root/sbin/rmmod
+	# The installer is typed by name at the shell, exactly like the rest of
+	# a Unix tool set -- no .elf suffix.
+	cp $(BUILD)/installer.elf $(BUILD)/initrd-root/bin/installer
 	# ---- BusyBox: the multi-call binary, plus one file per applet ----
 	# BusyBox picks its applet from basename(argv[0]) -- names that start with
 	# "busybox" fall through to the multi-call dispatcher instead -- so every
@@ -364,6 +533,50 @@ $(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) $(BASH_BIN) $(CC_BIN) src/user/rc | $
 	  cp "$$f" $(BUILD)/initrd-root/usr/bin/$$n; \
 	  strip $(BUILD)/initrd-root/usr/bin/$$n; \
 	done
+	# ---- GNU binutils ----
+	# The ELF toolchain the guest ships with.  `as`/`ld` come from their
+	# build-time names (as-new/ld-new); ld is copied twice so that the
+	# ld.bfd spelling that many build scripts probe for works too.
+	cp $(BU_SRC)/binutils/ar        $(BUILD)/initrd-root/usr/bin/ar
+	cp $(BU_SRC)/binutils/addr2line $(BUILD)/initrd-root/usr/bin/addr2line
+	cp $(BU_SRC)/binutils/cxxfilt   $(BUILD)/initrd-root/usr/bin/c++filt
+	cp $(BU_SRC)/binutils/elfedit   $(BUILD)/initrd-root/usr/bin/elfedit
+	cp $(BU_SRC)/binutils/nm-new    $(BUILD)/initrd-root/usr/bin/nm
+	cp $(BU_SRC)/binutils/objcopy   $(BUILD)/initrd-root/usr/bin/objcopy
+	cp $(BU_SRC)/binutils/objdump   $(BUILD)/initrd-root/usr/bin/objdump
+	cp $(BU_SRC)/binutils/ranlib    $(BUILD)/initrd-root/usr/bin/ranlib
+	cp $(BU_SRC)/binutils/readelf   $(BUILD)/initrd-root/usr/bin/readelf
+	cp $(BU_SRC)/binutils/size      $(BUILD)/initrd-root/usr/bin/size
+	cp $(BU_SRC)/binutils/strings   $(BUILD)/initrd-root/usr/bin/strings
+	cp $(BU_SRC)/binutils/strip-new $(BUILD)/initrd-root/usr/bin/strip
+	cp $(BU_SRC)/gas/as-new         $(BUILD)/initrd-root/usr/bin/as
+	cp $(BU_SRC)/ld/ld-new          $(BUILD)/initrd-root/usr/bin/ld
+	cp $(BU_SRC)/ld/ld-new          $(BUILD)/initrd-root/usr/bin/ld.bfd
+	cp $(BU_SRC)/gprof/gprof        $(BUILD)/initrd-root/usr/bin/gprof
+	strip $(BUILD)/initrd-root/usr/bin/ar \
+	      $(BUILD)/initrd-root/usr/bin/addr2line \
+	      $(BUILD)/initrd-root/usr/bin/c++filt \
+	      $(BUILD)/initrd-root/usr/bin/elfedit \
+	      $(BUILD)/initrd-root/usr/bin/nm \
+	      $(BUILD)/initrd-root/usr/bin/objcopy \
+	      $(BUILD)/initrd-root/usr/bin/objdump \
+	      $(BUILD)/initrd-root/usr/bin/ranlib \
+	      $(BUILD)/initrd-root/usr/bin/readelf \
+	      $(BUILD)/initrd-root/usr/bin/size \
+	      $(BUILD)/initrd-root/usr/bin/strings \
+	      $(BUILD)/initrd-root/usr/bin/strip \
+	      $(BUILD)/initrd-root/usr/bin/as \
+	      $(BUILD)/initrd-root/usr/bin/ld \
+	      $(BUILD)/initrd-root/usr/bin/ld.bfd \
+	      $(BUILD)/initrd-root/usr/bin/gprof
+	# ---- fastfetch ----
+	# The system-info tool itself, plus its single-threaded flashfetch
+	# sibling.  Stripped like everything else: the unstripped pair is
+	# mostly DWARF.
+	cp $(FF_BIN) $(BUILD)/initrd-root/usr/bin/fastfetch
+	cp $(FFLASH) $(BUILD)/initrd-root/usr/bin/flashfetch
+	strip $(BUILD)/initrd-root/usr/bin/fastfetch \
+	      $(BUILD)/initrd-root/usr/bin/flashfetch
 	cp src/user/rc $(BUILD)/initrd-root/etc/rc            # run once at boot by init
 	# Static system config (hosts, resolv.conf, nsswitch, services, protocols,
 	# passwd/group, hostname).  These make the BusyBox network tools and the
@@ -388,10 +601,46 @@ $(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) $(BASH_BIN) $(CC_BIN) src/user/rc | $
 	# devices the kernel already provides (null, tty, ...); drop it from the
 	# sysinit runlevel so the rest of OpenRC can run headless.
 	rm -f $(BUILD)/initrd-root/etc/runlevels/sysinit/devfs
+	# ---- the ordinary user's home ----------------------------------------
+	mkdir -p $(BUILD)/initrd-root/home/elaina
+	cp -a src/rootfs/home/elaina/. $(BUILD)/initrd-root/home/elaina/ 2>/dev/null || true
+	# ---- boot payload (what an installed machine boots from) ------------
+	# Every system image carries the whole boot chain inside it, so a root
+	# partition dumped onto a disk by the installer is already bootable: the
+	# disk's Limine reads /boot/limine/limine.sys (stage 2) and
+	# /boot/limine/limine.conf at boot, and the kernel_image file it points
+	# at is /GNOSKr.elf at the volume root.  Stage 1 (limine-bios.sys)
+	# handled the MBR when the installer ran.  The kernel's own modules are
+	# not copied -- installed boots have no initrd, and the root filesystem
+	# itself is the module, read off partition 1 by the kernel at boot.
+	mkdir -p $(BUILD)/initrd-root/boot/limine
+	cp limine/limine-bios.sys $(BUILD)/initrd-root/boot/limine/limine.sys
+	cp $(KRNL) $(BUILD)/initrd-root/GNOSKr.elf
+	printf 'timeout: 1\n\n/GNOS\n    protocol: limine\n    kernel_path: boot():/GNOSKr.elf\n' > $(BUILD)/initrd-root/boot/limine/limine.conf
 	dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
-	mke2fs -q -t ext2 -b 1024 -I 256 \
-	       -O ^resize_inode,^dir_index,^ext_attr \
-	       -d $(BUILD)/initrd-root -F $@
+	# ---- ownership and modes ---------------------------------------------
+	# mke2fs -d copies the *build user's* uid/gid onto every inode, which on
+	# a machine whose developer is uid 1000 means shipping an image where
+	# /etc/shadow and /bin/bash belong to an ordinary user.  That was
+	# harmless while the kernel reported st_uid = 0 for everything; now that
+	# it reads i_uid for real, it would hand the whole system away.
+	#
+	# fakeroot is what fixes it: chown(2) inside it is remembered in a side
+	# table that mke2fs's stat(2) then sees, so the image comes out
+	# root-owned without this build needing to be root.  Everything that has
+	# to differ from root:root -- the user's home, the shadow file's mode --
+	# is set in the same shell, after the blanket chown.
+	fakeroot -- sh -c '\
+	  chown -R 0:0 $(BUILD)/initrd-root; \
+	  chmod 0700 $(BUILD)/initrd-root/root; \
+	  chmod 0600 $(BUILD)/initrd-root/etc/shadow; \
+	  chmod 0644 $(BUILD)/initrd-root/etc/passwd $(BUILD)/initrd-root/etc/group; \
+	  chmod 1777 $(BUILD)/initrd-root/tmp; \
+	  chown -R 1000:1000 $(BUILD)/initrd-root/home/elaina; \
+	  chmod 0755 $(BUILD)/initrd-root/home/elaina; \
+	  mke2fs -q -t ext2 -b 1024 -I 256 \
+	         -O ^resize_inode,^dir_index,^ext_attr \
+	         -d $(BUILD)/initrd-root -F $@ $(INITRD_MB)M'
 
 # ---------- Limine hybrid ISO ----------
 $(ISO): $(KRNL) $(INITRD) limine.conf $(LIMINE_BIOS) $(LIMINE_UEFI) | $(BUILD)
@@ -407,11 +656,20 @@ $(ISO): $(KRNL) $(INITRD) limine.conf $(LIMINE_BIOS) $(LIMINE_UEFI) | $(BUILD)
 	  --efi-boot limine-uefi-cd.bin -efi-boot-part --efi-boot-image \
 	  -r -J -o $@ $(ISO_ROOT)
 
-# ---------- run / test ----------
-run: $(ISO)
+# ---------- run ----------
+# The disk is created on demand and never rebuilt once it exists -- `make run`
+# twice in a row must find whatever the guest wrote the first time.  The rule
+# lives down here rather than beside its variables because make builds the
+# *first* target in the file when given no arguments, and that has to stay
+# `all`.
+$(DISK):
+	@mkdir -p $(BUILD)
+	qemu-img create -f raw $@ $(DISK_MB)M
+
+run: $(ISO) $(DISK)
 	qemu-system-x86_64 -cdrom $(ISO) -m 512M -display gtk $(QEMU_DEVICES)
 
-run-uefi: $(ISO)
+run-uefi: $(ISO) $(DISK)
 	qemu-system-x86_64 -cdrom $(ISO) -m 512M -bios $(OVMF) -display gtk \
 	  $(QEMU_DEVICES)
 
@@ -425,30 +683,23 @@ run-uefi: $(ISO)
 #   - -no-reboot turns a triple fault into a stopped VM you can look at
 #     instead of an endless reboot loop.
 # The ISO is a prerequisite, so this rebuilds anything stale first.
-guistart: $(ISO)
+guistart: $(ISO) $(DISK)
 	@echo "GNOS: booting in a window (audio backend: $(AUDIO_BACKEND));"
 	@echo "      boot log is also being written to $(BUILD)/dbg.log"
 	qemu-system-x86_64 -cdrom $(ISO) -m 512M \
-	  $(QEMU_NET) $(GUI_AUDIO) \
+	  $(QEMU_NET) $(GUI_AUDIO) $(QEMU_DISK) \
 	  -device isa-debugcon,chardev=dbg -chardev file,id=dbg,path=$(BUILD)/dbg.log \
 	  -display gtk -no-reboot
-
-test: $(ISO)
-	timeout 20 qemu-system-x86_64 -cdrom $(ISO) -m 512M $(QEMU_DEVICES) \
-	  -device isa-debugcon,chardev=dbg -chardev file,id=dbg,path=$(BUILD)/dbg.log \
-	  -serial none -display none -no-reboot || true
-	@echo "----- debugcon log -----"
-	@cat $(BUILD)/dbg.log
 
 # `clean` deliberately spares the third-party source trees under $(BUILD).
 # musl was fetched and built by hand and there is no rule to get it back, so a
 # plain `rm -rf build` would destroy the toolchain irrecoverably.  Everything
 # this Makefile knows how to rebuild is listed explicitly instead.
 THIRD_PARTY := $(BUILD)/muslsrc $(BUILD)/bbsrc $(BUILD)/bashsrc \
-               $(BUILD)/orcsrc $(BUILD)/ccsrc
+               $(BUILD)/orcsrc $(BUILD)/ccsrc $(BUILD)/busrcc
 
 clean:
-	rm -rf $(BUILD)/user $(BUILD)/initrd-root $(ISO_ROOT)
+	rm -rf $(BUILD)/user $(BUILD)/initrd-root $(BUILD)/modules $(ISO_ROOT)
 	rm -f  $(BUILD)/*.o $(BUILD)/*.elf $(BUILD)/*.img $(BUILD)/*.iso \
 	       $(BUILD)/*.log
 

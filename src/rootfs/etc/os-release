@@ -1,0 +1,16 @@
+# /etc/os-release — what GNOS tells the world it is.
+#
+# fastfetch (and every other os-release consumer) keys its distro detection
+# off this file: ID is matched first against the logo table, NAME second,
+# and PRETTY_NAME is what goes in the OS line.  GNOS has a matching entry in
+# fastfetch's logo builtins (src/logo/ascii/g/gnos.txt in the fastfetch
+# tree), so detection and the system icon resolve to the same name.
+NAME=GNOS
+ID=gnos
+ID_LIKE=linux
+PRETTY_NAME="GNOS"
+VERSION="0.1"
+VERSION_ID="0.1"
+HOME_URL="https://example.invalid/gnos"
+SUPPORT_URL="https://example.invalid/gnos"
+BUILD_ID=rolling

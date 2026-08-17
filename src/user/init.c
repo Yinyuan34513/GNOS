@@ -5,21 +5,32 @@
  *
  *   - makes itself immune to the terminal's signals, so that a stray Ctrl-C
  *     can never take the whole system down,
- *   - starts /shell.elf in a process group of its own and hands that group
- *     the terminal, which is what makes the shell the foreground job,
+ *   - runs /etc/rc once, then starts a getty on each of the six virtual
+ *     terminals, each in a session of its own,
  *   - reaps children forever, including the orphans the kernel re-parents
- *     onto it, and restarts the shell whenever it dies.
+ *     onto it, and restarts whichever getty died.
  *
- * Keeping the shell in a separate process is not decoration: job control is
- * defined in terms of process groups and a controlling terminal, and neither
- * concept means anything if the only process on the system is also the one
- * reading the keyboard.
+ * The getty layer is what makes this a multi-user system rather than a
+ * single-user one with credentials bolted on.  init runs as root and must
+ * stay that way -- it is the only process that can start a session -- so the
+ * privilege drop has to happen somewhere downstream, and "somewhere" is
+ * login(1), one exec later.  Each terminal therefore runs:
+ *
+ *     init (root) -> getty (root, owns /dev/ttyN) -> login (root, then not)
+ *                 -> the user's shell
+ *
+ * Keeping each of those in a process of its own is not decoration: job
+ * control is defined in terms of process groups and a controlling terminal,
+ * and a session that never called setsid() has neither.
  */
 #include "ulib.h"
 
-#define SHELL_PATH  "/bin/bash"   /* the interactive login shell */
-#define RC_SHELL    "/bin/sh"     /* the one-shot startup script */
+#define GETTY_PATH  "/sbin/getty"  /* one per virtual terminal */
+#define FALLBACK_SH "/bin/bash"    /* if getty is missing entirely */
+#define RC_SHELL    "/bin/sh"      /* the one-shot startup script */
 #define RC_PATH     "/etc/rc"
+
+#define NR_TTY      6              /* must match the kernel's NR_VT */
 
 /* If the shell cannot even start, stop trying: an exec that fails instantly
  * in a restart loop is a fork bomb with extra steps. */
@@ -53,8 +64,10 @@ static void default_terminal_signals(void)
 static void run_rc(void)
 {
     int pid = fork();
-    if (pid < 0)
+    if (pid < 0) {
+        print("init: fork failed for rc\n");
         return;
+    }
 
     if (pid == 0) {
         char *av[3];
@@ -72,7 +85,9 @@ static void run_rc(void)
 
         setpgid(0, 0);
         default_terminal_signals();
+        print("init: execing " RC_SHELL "\n");
         execv(RC_SHELL, av);
+        print("init: execv " RC_SHELL " failed\n");
         exit(127);
     }
 
@@ -86,35 +101,59 @@ static void run_rc(void)
 
     int status = 0;
     waitpid(pid, &status, 0);
+    print("init: rc finished, status ");
+    printn((long)status);
+    print("\n");
 }
 
-static int spawn_shell(void)
+/*
+ * Start a getty on /dev/tty<n>.  The child does not touch the terminal here:
+ * getty itself calls setsid() and TIOCSCTTY, which is the only way the new
+ * session ends up owning the line rather than inheriting init's idea of it.
+ * All we do is get out of its way -- close the descriptors we inherited from
+ * the boot console and put the child in a group of its own.
+ */
+static int spawn_getty(int n)
 {
+    char name[8];
+    name[0] = 't'; name[1] = 't'; name[2] = 'y';
+    name[3] = (char)('0' + n);
+    name[4] = 0;
+
     int pid = fork();
     if (pid < 0)
         return pid;
 
     if (pid == 0) {
-        char *av[2];
-        av[0] = (char *)SHELL_PATH;
-        av[1] = 0;
+        char *av[3];
+        av[0] = (char *)GETTY_PATH;
+        av[1] = name;
+        av[2] = 0;
 
-        /* A job control session starts here: our own group, and the
-         * terminal handed to it. */
         setpgid(0, 0);
-        tcsetpgrp(0, getpid());
         default_terminal_signals();
 
-        execv(SHELL_PATH, av);
+        /* Our inherited stdin/stdout/stderr are terminal 1's.  getty opens
+         * the terminal it was told to and dup2()s it over 0/1/2, but until it
+         * does, an error message from the exec below would land on the wrong
+         * screen -- so leave them alone rather than closing them, and let
+         * getty overwrite them. */
+        execv(GETTY_PATH, av);
 
-        print("init: cannot exec " SHELL_PATH "\n");
+        /* No getty in the image: fall back to a bare root shell on terminal
+         * 1 so the machine is still usable, and do not loop on the others. */
+        if (n == 1) {
+            char *sh[2];
+            sh[0] = (char *)FALLBACK_SH;
+            sh[1] = 0;
+            tcsetpgrp(0, getpid());
+            execv(FALLBACK_SH, sh);
+        }
+        print("init: cannot exec " GETTY_PATH "\n");
         exit(127);
     }
 
-    /* Do it on this side too -- whoever gets scheduled first, the shell is
-     * in its own group before it can matter. */
     setpgid(pid, pid);
-    tcsetpgrp(0, pid);
     return pid;
 }
 
@@ -125,54 +164,69 @@ int main(int argc, char **argv)
 
     ignore_terminal_signals();
 
+    sys_dbgputs("INITDBG: main entered (new init)");
+
     print("\nGNOS init: pid ");
     printn(getpid());
     print(" - starting the session\n");
 
-    run_rc();                       /* one-shot /etc/rc before the prompt */
+    run_rc();                       /* one-shot /etc/rc before the prompts */
 
-    int failed_execs = 0;
+    /*
+     * One getty per virtual terminal, respawned for ever -- the classic
+     * inittab "respawn" action, with the table compiled in.  gettys[i] holds
+     * the pid currently serving terminal i+1, or a negative number when that
+     * terminal has been given up on.
+     */
+    int gettys[NR_TTY];
+    int failed[NR_TTY];
+    for (int i = 0; i < NR_TTY; i++) {
+        failed[i] = 0;
+        gettys[i] = spawn_getty(i + 1);
+    }
 
     for (;;) {
-        int shell = spawn_shell();
-        if (shell < 0) {
-            print("init: fork failed, giving up\n");
-            return 1;
-        }
+        int status = 0;
+        int who = waitpid(-1, &status, 0);
 
-        int shell_status = 0;
-        int shell_alive  = 1;
-        while (shell_alive) {
-            int status = 0;
-            int who = waitpid(-1, &status, 0);
-
-            if (who < 0)                /* no children at all: shouldn't be */
-                break;
-            if (who == shell) {
-                shell_alive  = 0;
-                shell_status = status;
-            } else if (who > 0) {
-                /* An orphan the kernel re-parented onto us. */
-                print("init: reaped orphan pid ");
-                printn(who);
-                print("\n");
+        if (who < 0) {
+            /* Nothing left to wait for.  Every terminal must have been given
+             * up on; there is no work left for init to do but stay alive. */
+            int any = 0;
+            for (int i = 0; i < NR_TTY; i++)
+                if (gettys[i] > 0)
+                    any = 1;
+            if (!any) {
+                print("init: no terminals left, halting supervision\n");
+                for (;;)
+                    ;
             }
+            continue;
         }
 
-        /* Take the terminal back before saying anything on it. */
-        tcsetpgrp(0, getpid());
-        print("\ninit: shell exited, restarting\n");
+        int slot = -1;
+        for (int i = 0; i < NR_TTY; i++)
+            if (gettys[i] == who)
+                slot = i;
 
-        /* Exit code 127 is the one our own child uses when execv() fails, so
-         * it is the only case where restarting cannot possibly help. */
-        if (WIFEXITED(shell_status) && WEXITSTATUS(shell_status) == 127)
-            failed_execs++;
+        if (slot < 0)                   /* an orphan re-parented onto us */
+            continue;
+
+        /* Exit code 127 is what our own child uses when execv() fails, so it
+         * is the one case where respawning cannot possibly help. */
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 127)
+            failed[slot]++;
         else
-            failed_execs = 0;
+            failed[slot] = 0;
 
-        if (failed_execs > MAX_FAST_RESTARTS) {
-            print("init: " SHELL_PATH " will not start, stopping here\n");
-            return 1;
+        if (failed[slot] > MAX_FAST_RESTARTS) {
+            print("init: giving up on terminal ");
+            printn(slot + 1);
+            print("\n");
+            gettys[slot] = -1;
+            continue;
         }
+
+        gettys[slot] = spawn_getty(slot + 1);
     }
 }

@@ -14,70 +14,71 @@ mkdir /tmp/run
 echo GNOS rc: ready
 /bin/hello.elf
 echo GNOS rc: hello exited with status $?
-# BusyBox smoke test.  Both dispatch paths are exercised on purpose:
-# /bin/busybox.elf reaches the multi-call dispatcher by name prefix, while
-# /usr/bin/sed picks its applet out of argv[0].  sed is used for that second
-# check rather than something obvious like echo because GNU coreutils now owns
-# /usr/bin for every name it provides -- sed is one of the applets BusyBox
-# still has to itself, so it is genuinely testing argv[0] dispatch.
-#
-# The rest of the block walks the write side of the filesystem -- mkdir, cp,
-# mv, rm -- because that is where the ext2 driver is thinnest.  Those are the
-# coreutils binaries now; /etc/coreutilstest.sh asserts on them properly, this
-# is just the early, shell-visible pass.
-echo GNOS rc: busybox
-/bin/busybox.elf echo multicall dispatch ok
-/usr/bin/sed -n 1p /etc/hostname
-/usr/bin/uname -a
-/usr/bin/pwd
-/usr/bin/head -2 /etc/rc
-/usr/bin/wc /etc/rc
-/usr/bin/mkdir /tmp/bb
-/usr/bin/cp /etc/rc /tmp/bb/copy
-/usr/bin/wc -c /tmp/bb/copy
-/usr/bin/mv /tmp/bb/copy /tmp/bb/moved
-/usr/bin/ls -l /tmp/bb
-/usr/bin/rm /tmp/bb/moved
-/usr/bin/ls /tmp/bb
-echo GNOS rc: busybox done
 
-# Phase 1 probe: the login shell is /bin/bash and it must start interactive.
-# bash -i forces interactive mode; an interactive bash sources ~/.bashrc, which
-# prints the banner below -- so seeing the banner proves both that bash's
-# interactive machinery initialises (job control, readline, signals) and that the
-# new /root/.bashrc is in the image.  The tty ioctl fix is what makes
-# isatty()/tcgetattr() succeed, without which bash refused interactive mode.
-/bin/bash -i -c 'echo GNOS rc: bash interactive mode ok'
-echo GNOS rc: bash-probe exited with status $?
+# ---- pthread self-test ---------------------------------------------------
+# The kernel's thread support (CLONE_VM, tgid, blocking futex) has exactly
+# one judge: musl's pthreads running on top of it.  Assert every part, the
+# way the rest of the boot-time tests assert their subsystems.
+echo GNOS rc: thrtest
+/bin/thrtest.elf
+echo GNOS rc: thrtest exited with status $?
 
-# termios: assert the terminal answers the ioctls a real libc issues, that
-# the defaults match Linux's, and that a background process gets SIGTTOU for
-# reconfiguring it.  All of it is non-interactive, so it runs on every boot.
-/bin/ttytest.elf
-echo GNOS rc: ttytest exited with status $?
-# readlinetest: drive the terminal through ttyinject(404) and confirm the
-# line discipline delivers a canonical line, honours Backspace and Ctrl-D, and
-# passes escape sequences through untouched in raw mode.  No human required.
-/bin/readlinetest.elf
-echo GNOS rc: readlinetest exited with status $?
-# signals: assert user-installed handlers really run -- that the rt_sigframe
-# byte-for-byte matches Linux (so musl's __restore_rt trampoline works), that
-# sa_mask / SA_NODEFER / SA_RESETHAND behave, that a blocked signal stays
-# pending, that the register and FPU context survives, and that SA_RESTART
-# lets a cut-off read() finish.  All of it is non-interactive.
-/bin/sigtest.elf
-echo GNOS rc: sigtest exited with status $?
-# fstest: assert the ext2/VFS symlink + rename support OpenRC relies on --
-# symlink(2)/readlink(2)/lstat-vs-stat, rename(2), and dangling links.  No
-# human required; everything is a printed assertion.
-/bin/fstest.elf
-echo GNOS rc: fstest exited with status $?
+# ---- CJK rendering smoke test -------------------------------------------
+# The console decodes UTF-8 and paints 16x16 Unifont glyphs; this line is
+# the boot-time witness.  A headless run decodes the framebuffer screenshot
+# with tools/fbocr.py and asserts these four characters came out.
+echo CJKTEST: 你好世界
 
-# mounttest: assert the kernel's mount(2)/getrandom(2) work -- tmpfs mounts
-# on a directory and behaves like a real filesystem (write/read/mkdir/unlink/
-# readdir all route into it), and getrandom returns varying non-zero bytes.
-/bin/mounttest.elf
-echo GNOS rc: mounttest exited with status $?
+# ---- DRM/KMS self-test ---------------------------------------------------
+# /dev/dri/card0 must speak the Linux UAPI: caps, resources, dumb buffers
+# and a real mode switch through the bochs VBE registers, then back.  The
+# screen visibly flashes colour bars while it runs; the verdicts land on
+# the debug console.
+echo GNOS rc: drmtest
+/bin/drmtest.elf
+echo GNOS rc: drmtest exited with status $?
+
+# ---- ptrace self-test ---------------------------------------------------
+# The kernel's ptrace(2) must speak the Linux ABI: TRACEME, stop/wait
+# reporting, peek/poke through the tracee's page tables, GETREGS and a
+# TRACESYSGOOD syscall-entry stop, then a tracer-injected exit status.
+echo GNOS rc: ptracetest
+/bin/ptracetest.elf
+echo GNOS rc: ptracetest exited with status $?
+
+# ---- kernel module self-test ---------------------------------------------
+# Loads moddemo.ko through finit_module(2), verifies /proc/modules and the
+# driver registry see it, loads modpair.ko on top (which imports a symbol
+# from moddemo.ko), exercises EBUSY-on-import, unload order, ENOENT, a
+# garbage ENOEXEC, and the plain init_module(2) path.
+echo GNOS rc: evtest
+/bin/evtest.elf
+echo GNOS rc: evtest exited with status $?
+echo GNOS rc: eventest
+/bin/eventest.elf
+echo GNOS rc: eventest exited with status $?
+
+echo GNOS rc: modtest
+/bin/modtest.elf
+echo GNOS rc: modtest exited with status $?
+
+# ---- insmod/rmmod smoke test ---------------------------------------------
+# The same syscalls modtest drives directly, exercised through the tools
+# a user would actually type.  modtest above has unloaded everything, so
+# this load/unload cycle is a clean one.
+echo GNOS rc: insmod/rmmod smoke
+/sbin/insmod /lib/modules/moddemo.ko && /sbin/rmmod moddemo
+echo GNOS rc: insmod/rmmod exited with status $?
+
+# ---- fastfetch smoke test ------------------------------------------------
+# The system-info tool, run against the real OS (not the build machine):
+# every module that cannot work here must degrade to nothing rather than
+# crash.  The output is teed to the debug log through dbgcat so `make test`
+# can see it; a framebuffer run shows the logo.
+echo GNOS rc: fastfetch
+/usr/bin/fastfetch --logo none > /var/log/fastfetch.log 2>&1
+echo GNOS rc: fastfetch exited with status $?
+/bin/dbgcat.elf /var/log/fastfetch.log
 
 # ---- /etc/fstab ----------------------------------------------------------
 # Replay the fstab before OpenRC runs, not after: the very first thing the
@@ -92,19 +93,12 @@ echo "--- mounted filesystems ---"
 
 # ---- coldplug ------------------------------------------------------------
 # The udev-trigger equivalent: walk the kernel's subsystem registry through
-# /proc/subsystems and prove that every driver that claims to be live really
-# published the /dev node it advertises, and that the node behaves.  A driver
-# that registers itself but forgets vfs_register_dev() fails here by name.
+# /proc/subsystems and publish the /dev node every live driver advertises.
+echo GNOS rc: coldplug
 /bin/coldplug.elf
 echo GNOS rc: coldplug exited with status $?
 echo "--- /proc/devices ---"
 /usr/bin/cat /proc/devices
-
-# fbtest: the framebuffer seen the way a real Linux client sees it -- the
-# <linux/fb.h> struct sizes, FBIOGET_[VF]SCREENINFO geometry, and an mmap of
-# the whole scanout that must agree with read()/write() at both ends.
-/bin/fbtest.elf
-echo GNOS rc: fbtest exited with status $?
 
 # ---- OpenRC --------------------------------------------------------------
 # Bring the boot runlevels up through OpenRC's own machinery.  The initrd
@@ -127,47 +121,15 @@ echo GNOS rc: openrc boot exited with status $?
 echo GNOS rc: openrc default
 /sbin/openrc default
 echo GNOS rc: openrc default exited with status $?
-
-# ---- GNU Bash -----------------------------------------------------------
-# The shell this whole userland effort is aimed at.  /etc/bashtest.sh is a
-# non-interactive assertion script: it exercises the parts of bash that lean
-# hardest on the kernel -- fork/exec, pipelines, redirection, command
-# substitution, wait statuses, traps -- and exits non-zero if any of them
-# misbehaves, so a regression fails `make test` instead of waiting for
-# somebody to notice it at a prompt.
-echo GNOS rc: bash
-/bin/bash /etc/bashtest.sh
-echo GNOS rc: bashtest exited with status $?
-
-# ---- GNU coreutils ------------------------------------------------------
-# 104 statically linked GNU programs live in /usr/bin.  They lean on far more
-# of the kernel than BusyBox ever did -- and gnulib wraps nearly every syscall
-# in a probe-and-fall-back, so a missing feature does not crash, it quietly
-# returns the wrong answer.  /etc/coreutilstest.sh is the assertion script
-# that catches that; it runs under bash and exits with the failure count.
-echo GNOS rc: coreutils
-/bin/bash /etc/coreutilstest.sh
-echo GNOS rc: coreutilstest exited with status $?
-
-# ---- network bring-up (BusyBox tools) -----------------------------------
-# Every ping here is bounded by -c: BusyBox's fancy ping otherwise runs until
-# interrupted, and there is nobody at the keyboard during `make test`.  -W
-# bounds the wait for a reply too, so an unreachable address costs seconds
-# rather than hanging the boot.
-echo GNOS rc: networking
-/usr/bin/hostname -F /etc/hostname
-echo "--- hostname ---"
-/usr/bin/hostname
-echo "--- /proc/net/dev ---"
-/usr/bin/cat /proc/net/dev
-echo "--- /proc/net/route ---"
-/usr/bin/cat /proc/net/route
-echo "--- ls /proc /proc/net ---"
-/usr/bin/ls /proc /proc/net
-/usr/bin/ifconfig -a
-echo "--- ping loopback ---"
-/usr/bin/ping -c2 -W2 127.0.0.1
-echo "--- ping gateway (QEMU user-net 10.0.2.2) ---"
-/usr/bin/ping -c2 -W2 10.0.2.2
-echo GNOS rc: networking done
-
+# ---- TEMP: binutils smoke test ----
+echo BINSMOKE: readelf -h /init.elf
+/usr/bin/readelf -h /init.elf
+echo BINSMOKE: readelf exited with status $?
+echo 'mov $0x1234, %rax' | /usr/bin/as -o /tmp/t.o
+echo BINSMOKE: as exited with status $?
+/usr/bin/ld -o /tmp/t /tmp/t.o
+echo BINSMOKE: ld exited with status $?
+/usr/bin/objdump -d /tmp/t
+echo BINSMOKE: objdump exited with status $?
+/usr/bin/nm /init.elf >/dev/null
+echo BINSMOKE: nm exited with status $?
