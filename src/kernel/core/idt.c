@@ -14,7 +14,10 @@
 #include "panic.h"
 #include "proc.h"
 #include "vmm.h"
+#include "pmm.h"
 #include "debugcon.h"
+#include "smp.h"
+#include "lapic.h"
 
 struct idt_entry {
     uint16_t off_lo;
@@ -136,6 +139,16 @@ static void __attribute__((noreturn)) fault_halt(regs_t *r, const char *tag)
     dbg_puts_hex(r ? r->cs : 0);
     dbg_puts("\r\n");
 
+    uint32_t gslo, gshi;
+    uint64_t cr3;
+    asm volatile("rdmsr" : "=a"(gslo), "=d"(gshi) : "c"((uint32_t)0xC0000101));
+    dbg_puts(" gsbase=");
+    dbg_puts_hex(((uint64_t)gshi << 32) | gslo);
+    dbg_puts(" cr3=");
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    dbg_puts_hex(cr3);
+    dbg_puts("\r\n");
+
     for (;;)
         asm volatile("cli; hlt");
 }
@@ -143,6 +156,19 @@ static void __attribute__((noreturn)) fault_halt(regs_t *r, const char *tag)
 /* ---- dispatch -------------------------------------------------------- */
 void isr_dispatch(regs_t *r)
 {
+    /* A trap taken from ring 3 runs in the interrupted process's kernel
+     * execution, so it takes the big kernel lock: the kernel is otherwise
+     * lock-free, and this is the one point every entry into it passes.
+     * Kernel-mode interrupts (nested inside a BKL holder) never take it.
+     * The release happens on the single `out` path below, and a process
+     * that blocks or is pre-empted hands the lock to whoever resumes it
+     * (see bkl_leave_for_switch in proc.c). */
+    if ((r->cs & 3) == 3) {
+        bkl_acquire();
+        if (proc_current())
+            proc_current()->bkl_held = 1;
+    }
+
     /* A double fault means the normal fault handler faulted again; report it
      * and park the CPU instead of letting it escalate to a triple fault. */
     if (r->vector == 8) {
@@ -155,7 +181,7 @@ void isr_dispatch(regs_t *r)
             dbg_puts("GNOS: breakpoint at ");
             dbg_puts_hex(r->rip);
             dbg_puts("\r\n");
-            return;
+            goto out;
         }
 
         /*
@@ -175,6 +201,27 @@ void isr_dispatch(regs_t *r)
                 asm volatile("mov %%cr2, %0" : "=r"(cr2));
                 if (vmm_grow_stack(proc_current()->as, cr2))
                     return;
+                /* Demand-paging for recorded anonymous mmap regions: musl and
+                 * labwc expect a freshly-mmap'd region to be lazily backed, so
+                 * the first touch of a mapping that has no PTE yet just gets a
+                 * zeroed page instead of a SIGSEGV.  The records live in the
+                 * shared address space, so a fault in a region any thread of
+                 * the process mapped is served -- but a region that was
+                 * munmap'd (record dropped) is NOT resurrected, which keeps
+                 * freed stacks/heaps from being silently zeroed. */
+                proc_t *fp = proc_current();
+                addrspace_t *as = fp->as;
+                for (int i = 0; i < as->nmmaps; i++) {
+                    uint64_t mb = as->mmaps[i].base;
+                    uint64_t ms = as->mmaps[i].size;
+                    if (cr2 >= mb && cr2 < mb + ms) {
+                        uint64_t frame = pmm_alloc_zeroed();
+                        if (frame && vmm_map(as, cr2 & ~0xFFFULL,
+                                            frame, VM_USER | VM_WRITE))
+                            return;
+                        break;
+                    }
+                }
             }
 
             dbg_puts("GNOS: fault in user pid ");
@@ -197,10 +244,67 @@ void isr_dispatch(regs_t *r)
             }
             dbg_puts(" rsp=");
             dbg_puts_hex(r->rsp);
+            dbg_puts(" rdi=");
+            dbg_puts_hex(r->rdi);
+            dbg_puts(" rsi=");
+            dbg_puts_hex(r->rsi);
+            dbg_puts(" rax=");
+            dbg_puts_hex(r->rax);
             dbg_puts("\r\n");
+            /* Dump the last few syscalls so a NULL-deref shows what led to
+             * it: nr=return pairs, oldest-first. */
+            proc_t *hp = proc_current();
+            if (hp && hp->sys_hist_idx) {
+                dbg_puts("  last syscalls: ");
+                uint8_t n = hp->sys_hist_idx > 8 ? 8 : hp->sys_hist_idx;
+                for (uint8_t k = 0; k < n; k++) {
+                    uint8_t i = (hp->sys_hist_idx - n + k) & 7;
+                    dbg_puts_dec((uint32_t)hp->sys_hist_nr[i]);
+                    dbg_puts("=");
+                    dbg_puts_dec((uint32_t)(int32_t)hp->sys_hist_ret[i]);
+                    dbg_puts(" ");
+                }
+                dbg_puts("\r\n");
+            }
+            /* Dump return addresses from the user stack so the call chain
+             * into the fault is recoverable.  Scan a window for values that
+             * fall inside the text segment of a static no-PIE binary (the
+             * only kind GNOS runs): those are call-chain return addresses. */
+            if (proc_current()) {
+                dbg_puts("  rbp=");
+                dbg_puts_hex(r->rbp);
+                dbg_puts("\r\n");
+                dbg_puts("  bt: ");
+                for (int64_t s = -16; s < 512; s++) {
+                    uint64_t ua = r->rsp + (uint64_t)s * 8;
+                    if (ua < 0x400000)
+                        continue;
+                    uint64_t phys = vmm_resolve(proc_current()->as, ua);
+                    if (!phys)
+                        continue;
+                    uint64_t *wp = (uint64_t *)pmm_virt(phys);
+                    uint64_t w = wp[(ua & 0xFFF) / 8];
+                    if (w >= 0x400000 && w < 0x1000000) {
+                        dbg_puts_hex(w);
+                        dbg_puts(" ");
+                    }
+                }
+                dbg_puts("\r\n");
+                dbg_puts("  ustack: ");
+                for (int64_t s = -8; s < 40; s++) {
+                    uint64_t ua = r->rsp + (uint64_t)s * 8;
+                    uint64_t phys = vmm_resolve(proc_current()->as, ua);
+                    if (!phys) { dbg_puts("?? "); continue; }
+                    uint64_t *wp = (uint64_t *)pmm_virt(phys);
+                    uint64_t w = wp[(ua & 0xFFF) / 8];
+                    dbg_puts_hex(w);
+                    dbg_puts(" ");
+                }
+                dbg_puts("\r\n");
+            }
             proc_signal(proc_current(), SIGSEGV);
             proc_check_signals(r);
-            return;
+            goto out;
         }
 
         fault_halt(r, "GNOS: RING0 FAULT");
@@ -212,7 +316,18 @@ void isr_dispatch(regs_t *r)
         else
             r->rax = (uint64_t)-38;      /* -ENOSYS */
         proc_check_signals(r);
-        return;
+        goto out;
+    }
+
+    /* The per-CPU LAPIC timer: every AP's clock.  Acknowledge first, for
+     * the same reason the PIC path does -- the handler may switch tasks. */
+    if (r->vector == LAPIC_TIMER_VECTOR) {
+        lapic_eoi();
+        irq_handler_t h = lapic_timer_handler();
+        if (h)
+            h(r);
+        proc_check_signals(r);
+        goto out;
     }
 
     if (r->vector >= IRQ_BASE && r->vector < IRQ_BASE + 16) {
@@ -225,10 +340,19 @@ void isr_dispatch(regs_t *r)
         if (g_irq[irq])
             g_irq[irq](r);
         proc_check_signals(r);
-        return;
+        goto out;
     }
 
-    /* Anything else is a spurious software interrupt; ignore it. */
+out:
+    /* Release the big kernel lock on the way back to ring 3.  The check is
+     * on the flag rather than the CS: an interrupt that pre-empted a ring-3
+     * task and switched to another one leaves `r` describing the old frame,
+     * while bkl_held belongs to whoever is current now. */
+    proc_t *cur = proc_current();
+    if (cur && cur->bkl_held) {
+        cur->bkl_held = 0;
+        bkl_release();
+    }
 }
 
 void idt_init(void)

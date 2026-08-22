@@ -83,36 +83,36 @@ section .note.GNU-stack noalloc noexec nowrite progbits
 ;
 ; Unlike int 0x80, the CPU does NOT push a frame and does NOT switch stacks:
 ; on entry RCX holds the user RIP, R11 holds the user RFLAGS, and RSP is still
-; the user stack.  We stash RSP in a scratch word (interrupts are off and the
-; kernel is uniprocessor, so it cannot be clobbered under us), switch to the
-; running process's kernel stack -- g_kernel_rsp0 mirrors TSS.RSP0, so this
-; path lands exactly where a trap through isr_stub_base would have, and a
-; syscall that blocks parks its frame somewhere no other process can tread --
-; build the same regs_t frame isr_stub_base would have
+; the user stack.  We stash RSP in a per-CPU scratch word (interrupts are off
+; and the scratch is reached through GS, so no other core can clobber it),
+; switch to the running process's kernel stack -- the per-CPU mirror of
+; TSS.RSP0, so this path lands exactly where a trap through isr_stub_base
+; would have, and a syscall that blocks parks its frame somewhere no other
+; process can tread -- build the same regs_t frame isr_stub_base would have
 ; made -- note the pushes must run high address to low address, i.e. ss first
 ; and r15 last, or the frame comes out mirrored -- then call the shared
 ; syscall_handler(), then iretq back.  (iretq lets us use the real user code/
 ; data selectors instead of dancing with IA32_STAR's sysret CS arithmetic.)
 ; RCX and R11 are clobbered by the instruction and cannot be recovered -- that
 ; is the normal x86-64 syscall ABI, and musl saves them itself.
+;
+; The two per-CPU slots are struct cpu offsets (smp.h); GS base points at the
+; current core's cpu_t, so these reads are per-CPU by construction.
 ; ---------------------------------------------------------------------------
-section .bss
-align 8
-syscall_user_rsp:
-    resq 1
+%define CPU_KERNEL_RSP0 32
+%define CPU_USER_RSP    40
 
 section .text
-extern g_kernel_rsp0
 global syscall_entry
 syscall_entry:
     cli                         ; run the handler with interrupts off
-    mov [rel syscall_user_rsp], rsp
-    mov rsp, [rel g_kernel_rsp0]     ; this process's kernel stack
+    mov [gs:CPU_USER_RSP], rsp
+    mov rsp, [gs:CPU_KERNEL_RSP0]    ; this process's kernel stack
 
     ; Build the frame in *descending* address order, exactly like the CPU +
     ; isr_stub_base pair does, so that the final RSP points at regs_t.r15.
     push qword 0x1B                  ; ss     = SEL_UDATA
-    push qword [rel syscall_user_rsp]; rsp    = user RSP
+    push qword [gs:CPU_USER_RSP]     ; rsp    = user RSP
     push r11                         ; rflags = user RFLAGS (syscall put it here)
     push qword 0x23                  ; cs     = SEL_UCODE
     push rcx                         ; rip    = user RIP  (syscall put it here)

@@ -44,14 +44,22 @@ typedef struct {
 } drm_set_client_cap_t;                 /* 16 bytes */
 
 typedef struct {
+    uint32_t magic;
+} drm_auth_t;                           /* 4 bytes */
+
+typedef struct {
     uint64_t unique_len;
     void    *unique;
 } drm_unique_t;                         /* 16 bytes */
 
 #define DRM_IOCTL_VERSION       0xc0406400
 #define DRM_IOCTL_GET_UNIQUE    0xc0106401
+#define DRM_IOCTL_GET_MAGIC     0x80046402
 #define DRM_IOCTL_GET_CAP       0xc010640c
 #define DRM_IOCTL_SET_CLIENT_CAP 0x4010640d
+#define DRM_IOCTL_AUTH_MAGIC    0x40046411
+#define DRM_IOCTL_SET_MASTER    0x4000641e
+#define DRM_IOCTL_DROP_MASTER   0x4000641f
 
 #define DRM_CAP_DUMB_BUFFER             1
 #define DRM_CAP_DUMB_PREFERRED_DEPTH    3
@@ -172,7 +180,7 @@ typedef struct {
     uint32_t gamma_size;
     uint32_t count_format_types;
     uint64_t format_type_ptr;
-} drm_mode_get_plane_t;                 /* 40 bytes */
+} drm_mode_get_plane_t;                 /* 32 bytes */
 
 typedef struct {
     uint64_t value;
@@ -208,6 +216,29 @@ typedef struct {
     uint64_t user_data;
 } drm_mode_atomic_t;                    /* 56 bytes */
 
+/* drm_mode.h: connector property set (wlroots' legacy path turns DPMS on
+ * before every SETCRTC) */
+typedef struct {
+    uint64_t value;
+    uint32_t connector_id;
+    uint32_t prop_id;
+} drm_mode_connector_set_property_t;    /* 16 bytes */
+
+/* drm_mode.h: property blob get (EDID, IN_FORMATS, ...) */
+typedef struct {
+    uint32_t blob_id;
+    uint32_t length;
+    uint64_t data;
+} drm_mode_get_blob_t;                  /* 16 bytes */
+
+/* drm_mode.h: object property set (atomic-style, used for VRR etc.) */
+typedef struct {
+    uint64_t value;
+    uint32_t obj_id;
+    uint32_t obj_type;
+    uint32_t prop_id;
+} drm_mode_obj_set_property_t;          /* 20 bytes */
+
 #define DRM_IOCTL_MODE_GETRESOURCES  0xc04064a0
 #define DRM_IOCTL_MODE_GETCRTC       0xc06864a1
 #define DRM_IOCTL_MODE_SETCRTC       0xc06864a2
@@ -220,10 +251,13 @@ typedef struct {
 #define DRM_IOCTL_MODE_MAP_DUMB      0xc01064b3
 #define DRM_IOCTL_MODE_DESTROY_DUMB  0xc00464b4
 #define DRM_IOCTL_MODE_GETPLANERESOURCES 0xc01064b5
-#define DRM_IOCTL_MODE_GETPLANE      0xc02864b6
+#define DRM_IOCTL_MODE_GETPLANE      0xc02064b6
 #define DRM_IOCTL_MODE_ADDFB         0xc01c64ae
 #define DRM_IOCTL_MODE_ADDFB2        0xc06864b8
 #define DRM_IOCTL_MODE_OBJ_GETPROPERTIES 0xc02064b9
+#define DRM_IOCTL_MODE_SETPROPERTY    0xc01064ab
+#define DRM_IOCTL_MODE_GETPROPBLOB    0xc01064ac
+#define DRM_IOCTL_MODE_OBJ_SETPROPERTY 0xc01464ba
 #define DRM_IOCTL_MODE_ATOMIC        0xc03864bc
 
 #define DRM_MODE_CONNECTOR_VGA        1
@@ -243,6 +277,10 @@ typedef struct {
 #define DRM_MODE_SUBPIXEL_UNKNOWN     0
 #define DRM_MODE_SUBPIXEL_HORIZONTAL_RGB 1
 
+/* drm_mode.h: page flip flags */
+#define DRM_MODE_PAGE_FLIP_EVENT       0x01
+#define DRM_MODE_PAGE_FLIP_ASYNC       0x02
+
 #define DRM_FORMAT_XRGB8888 0x34325258u /* 'XR24' little-endian */
 #define DRM_FORMAT_ARGB8888 0x34324152u /* 'AR24' */
 #define DRM_FORMAT_MOD_LINEAR 0
@@ -251,8 +289,32 @@ typedef struct {
 #define DRM_CLIENT_CAP_STEREO_3D       1
 #define DRM_CLIENT_CAP_UNIVERSAL_PLANES 2
 #define DRM_CLIENT_CAP_ATOMIC          3
+#define DRM_CAP_PRIME                  0x05
 #define DRM_CAP_TIMESTAMP_MONOTONIC    6
+#define DRM_CAP_CRTC_IN_VBLANK_EVENT   0x12
 #define DRM_CAP_ADDFB2_MODIFIERS       0x10
+#define DRM_PRIME_CAP_IMPORT           1
+#define DRM_PRIME_CAP_EXPORT           2
+
+/* drm.h: kernel->user events (read back from the drm fd).  wlroots runs the
+ * legacy uAPI and waits for DRM_EVENT_FLIP_COMPLETE after every page flip,
+ * so this is the event the flip ioctl queues. */
+#define DRM_EVENT_VBLANK               0x01
+#define DRM_EVENT_FLIP_COMPLETE        0x01
+
+typedef struct {
+    uint32_t length;                /* sizeof(struct drm_event) */
+    uint32_t type;
+} drm_event_t;                      /* 8 bytes */
+
+typedef struct {
+    drm_event_t base;               /* length = 24, type = FLIP_COMPLETE */
+    uint64_t    user_data;
+    uint32_t    tv_sec;
+    uint32_t    tv_usec;
+    uint32_t    sequence;
+    uint32_t    crtc_id;
+} drm_event_vblank_t;               /* 32 bytes */
 
 /* drm_mode.h */
 #define DRM_MODE_FB_MODIFIERS          (1 << 1) /* enables modifier[] */
@@ -261,6 +323,7 @@ typedef struct {
 #define DRM_MODE_PROP_ENUM             (1 << 3)
 #define DRM_MODE_PROP_BLOB             (1 << 4)
 #define DRM_MODE_PROP_ATOMIC           0x80000000
+#define DRM_MODE_OBJECT_ANY           0
 #define DRM_MODE_OBJECT_CRTC           0xccccccccu
 #define DRM_MODE_OBJECT_CONNECTOR      0xc0c0c0c0u
 #define DRM_MODE_OBJECT_ENCODER        0xe0e0e0e0u
@@ -269,7 +332,6 @@ typedef struct {
 /* Object ids and property ids this driver hands out (kernel-side, not UAPI).
  * crtc 1 and connector 1 also appear in GETRESOURCES/GETCONNECTOR. */
 #define DRM_PROP_ID_DPMS               1
-#define DRM_PROP_ID_EDID               2
 #define DRM_PROP_ID_PLANE_TYPE         3
 
 /* ---- kernel-side entry (not part of the UAPI) ---------------------------- */

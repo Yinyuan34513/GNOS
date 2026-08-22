@@ -32,6 +32,8 @@
 #include "kstring.h"
 #include "timer.h"
 #include "debugcon.h"
+#include "net.h"
+#include "proc.h"
 
 /* ---- register offsets (from BAR0) ---------------------------------- */
 #define E1000_CTRL    0x0000    /* device control */
@@ -227,9 +229,11 @@ static uint16_t phy_read(uint8_t reg)
 /*
  * Reading ICR is what acknowledges the interrupt at the card; if the handler
  * forgets, the line stays asserted and the machine livelocks in the IRQ
- * stub.  There is no work queue above this driver yet, so all the handler
- * does is ack, count, and note a link transition -- arriving frames sit in
- * the ring until someone calls e1000_recv().
+ * stub.  Frames arriving after the RX timer fires are drained here, inside
+ * the interrupt: a process blocked in recvfrom would otherwise sleep for
+ * ever, because nothing else in a single-client system ever comes round to
+ * calling net_poll() again.  net_poll()'s re-entrancy guard makes this safe
+ * if a system call happens to be halfway through its own poll.
  */
 static void e1000_irq(regs_t *r)
 {
@@ -243,6 +247,10 @@ static void e1000_irq(regs_t *r)
     if (icr & ICR_LSC) {
         dbg_puts("E1000: link ");
         dbg_puts((reg_read(E1000_STATUS) & STATUS_LU) ? "up\r\n" : "down\r\n");
+    }
+    if (icr & (ICR_RXT0 | ICR_RXO | ICR_RXDMT0)) {
+        net_poll();
+        sched_wake_reason(WAIT_NET);
     }
     if (icr & ICR_RXO)
         dbg_puts("E1000: receiver overrun (ring not drained)\r\n");

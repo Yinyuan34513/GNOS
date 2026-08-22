@@ -4,11 +4,13 @@
 #include <stdint.h>
 
 #include "timer.h"
+#include "timerfd.h"
 #include "idt.h"
 #include "net.h"
 #include "proc.h"
 #include "panic.h"
 #include "debugcon.h"
+#include "lapic.h"
 
 #define PIT_CH0    0x40
 #define PIT_CH2    0x42
@@ -44,14 +46,17 @@ static void timer_irq(regs_t *r)
      * mode: a VTIME sleeper is often the *only* thing on the machine, so the
      * idle loop -- which runs at ring 0 -- is exactly who we interrupt. */
     sched_expire_timeouts();
+    timerfd_tick();
 
-    /*
-     * Only pre-empt a task that was interrupted in user mode.  The kernel
-     * has no locks, so switching away from a task that is halfway through a
-     * system call could leave the process table or the open-file table in a
-     * state the next task would trip over.  Kernel code therefore only ever
-     * gives up the CPU where it says so itself (sched_block / sched_yield).
-     */
+/*
+ * Only pre-empt a task that was interrupted in user mode.  The kernel's
+ * shared state is serialised by the big kernel lock, but a pre-empted
+ * kernel-mode frame has already parked that process's BKL claim in
+ * sched_tick; switching away from a task that is halfway through a system
+ * call is still unsafe for other reasons (its syscall bookkeeping), so
+ * kernel code only ever gives up the CPU where it says so itself
+ * (sched_block / sched_yield).
+ */
     if ((r->cs & 3) == 3) {
         /*
          * ARP expiry, TCP retransmission and the receive poll ride the same
@@ -62,6 +67,23 @@ static void timer_irq(regs_t *r)
          * polls on its own wakeup (see sock.c), so nothing depends on this
          * running while the machine is idle.
          */
+        net_tick();
+        sched_tick();
+    }
+}
+
+/*
+ * The APs' clock: the same housekeeping as timer_irq, minus the global tick
+ * counter, which the BSP's PIT owns.  The LAPIC itself already did the EOI
+ * (idt.c routes LAPIC_TIMER_VECTOR).  sched_tick() on an AP parks and
+ * resumes tasks with the BKL handed over like any other core.
+ */
+static void ap_timer_irq(regs_t *r)
+{
+    sched_expire_timeouts();
+    timerfd_tick();
+
+    if ((r->cs & 3) == 3) {
         net_tick();
         sched_tick();
     }
@@ -84,6 +106,7 @@ void timer_init(unsigned hz)
     outb(PIT_CH0, (uint8_t)(divisor >> 8));
 
     irq_install(0, timer_irq);
+    lapic_timer_install(ap_timer_irq);
     rtc_read_boot_epoch();
 
     dbg_puts("TIMER: PIT at ");

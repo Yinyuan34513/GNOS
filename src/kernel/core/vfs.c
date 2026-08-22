@@ -28,6 +28,7 @@
 #include "procfs.h"
 #include "tmpfs.h"
 #include "sock.h"
+#include "unix.h"
 #include "kstring.h"
 #include "debugcon.h"
 #include "subsys.h"
@@ -342,7 +343,7 @@ int vfs_init(uint8_t *img, uint32_t img_size)
 
 /* ---- /dev ------------------------------------------------------------- */
 static int register_dev(const char *name, const vfs_ops_t *ops, void *priv,
-                        int kind, uint64_t size)
+                        int kind, uint64_t size, uint32_t rdev)
 {
     if (g_dev_count >= VFS_MAX_DEV)
         return -E_NOMEM;
@@ -354,6 +355,7 @@ static int register_dev(const char *name, const vfs_ops_t *ops, void *priv,
     n->size = size;
     n->ops  = ops;
     n->priv = priv;
+    n->rdev = rdev;
 
     dbg_puts("VFS: registered /dev/");
     dbg_puts(n->name);
@@ -361,15 +363,23 @@ static int register_dev(const char *name, const vfs_ops_t *ops, void *priv,
     return 0;
 }
 
+int vfs_register_devnum(const char *name, const vfs_ops_t *ops, void *priv,
+                        uint32_t maj, uint32_t min)
+{
+    /* Linux's new_encode_dev() */
+    uint32_t rdev = (min & 0xff) | (maj << 8) | ((min & ~0xffu) << 12);
+    return register_dev(name, ops, priv, VFS_CHARDEV, 0, rdev);
+}
+
 int vfs_register_dev(const char *name, const vfs_ops_t *ops, void *priv)
 {
-    return register_dev(name, ops, priv, VFS_CHARDEV, 0);
+    return register_dev(name, ops, priv, VFS_CHARDEV, 0, 0);
 }
 
 int vfs_register_blkdev(const char *name, const vfs_ops_t *ops, void *priv,
                         uint64_t size)
 {
-    return register_dev(name, ops, priv, VFS_BLOCKDEV, size);
+    return register_dev(name, ops, priv, VFS_BLOCKDEV, size, 0);
 }
 
 int vfs_unregister_dev(const char *name)
@@ -481,7 +491,12 @@ static int resolve(const char *path, vfs_node_t *out, int follow)
     if (!path || path[0] != '/')
         return -E_INVAL;
 
-    if (strncmp(path, "/dev/", 5) == 0) {
+    /* /dev/shm is a real tmpfs mount, not a synthetic device node: POSIX
+     * shared memory (shm_open) creates files in it.  It must fall through to
+     * the tmpfs routing below, or every open under it bounces off dev_lookup
+     * and dies with ENOENT. */
+    if (strncmp(path, "/dev/shm/", 9) != 0 &&
+        strncmp(path, "/dev/", 5) == 0) {
         vfs_node_t *d = dev_lookup(path + 5);
         if (!d)
             return -E_NOENT;
@@ -551,10 +566,14 @@ static void fill_stat(const vfs_node_t *n, lstat_t *st)
     st->st_mode    = type | perms;
     st->st_uid     = n->e2.uid;
     st->st_gid     = n->e2.gid;
-    st->st_rdev    = 0;
-    st->st_size    = n->size;
+    st->st_rdev    = (n->kind == VFS_CHARDEV || n->kind == VFS_BLOCKDEV)
+                     ? n->rdev : 0;
+    /* tmpfs files report their live size: the vfs_node copy is frozen at
+     * open time but ftruncate moves the real one (see tmpfs_file_size). */
+    st->st_size    = (n->kind == VFS_FILE && tmpfs_is_file_node(n))
+                     ? tmpfs_file_size(n) : n->size;
     st->st_blksize = 4096;
-    st->st_blocks  = (n->size + 511) / 512;
+    st->st_blocks  = (st->st_size + 511) / 512;
 }
 
 int vfs_stat_linux(const char *path, lstat_t *st, int follow)
@@ -804,7 +823,9 @@ static int may_mutate_dir(const char *path, const char *victim)
 
 int vfs_unlink(const char *path)
 {
-    if (strncmp(path, "/dev/", 5) == 0)
+    /* /dev/shm holds real tmpfs files; shm_unlink() must be able to remove
+     * them even though other /dev paths are synthetic device nodes. */
+    if (strncmp(path, "/dev/", 5) == 0 && strncmp(path, "/dev/shm/", 9) != 0)
         return -E_PERM;
     int g = may_mutate_dir(path, path);
     if (g < 0)
@@ -877,6 +898,47 @@ int vfs_symlink(const char *target, const char *path)
     return fs_errno(ext2_symlink(&g_fs, target, path));
 }
 
+int vfs_link(const char *oldpath, const char *newpath)
+{
+    if (strncmp(oldpath, "/dev/", 5) == 0 || strncmp(newpath, "/dev/", 5) == 0)
+        return -E_PERM;
+    int g = may_mutate_dir(newpath, NULL);
+    if (g < 0)
+        return g;
+    char rel[GNUOS_PATH_MAX];
+    tmpfs_t *fs = vfs_route_tmpfs(newpath, rel);
+    if (fs)
+        return -E_OPNOTSUPP;            /* tmpfs has no inode sharing */
+    return fs_errno(ext2_link(&g_fs, oldpath, newpath));
+}
+
+/* statfs(2)/fstatfs(2).  GNOS has one real filesystem (the ext2 root) plus
+ * tmpfs mounts; both report through this single shape, with the ext2
+ * superblock as the honest source for the root. */
+int vfs_statfs(const char *path, void *out)
+{
+    (void)path;
+    if (!out || !g_fs_ok)
+        return -E_NOENT;
+
+    kstatfs_t *st = (kstatfs_t *)out;
+    memset(st, 0, sizeof *st);
+
+    uint64_t blocks = 0, bfree = 0, files = 0, ffree = 0;
+    ext2_usage(&g_fs, &blocks, &bfree, &files, &ffree);
+
+    st->f_type    = EXT2_SUPER_MAGIC;
+    st->f_bsize   = g_fs.block_size;
+    st->f_frsize  = g_fs.block_size;
+    st->f_blocks  = blocks;
+    st->f_bfree   = bfree;
+    st->f_bavail  = bfree;
+    st->f_files   = files;
+    st->f_ffree   = ffree;
+    st->f_namelen = 255;
+    return 0;
+}
+
 int vfs_readlink(const char *path, char *buf, uint32_t cap)
 {
     if (strncmp(path, "/dev/", 5) == 0)
@@ -944,7 +1006,9 @@ int vfs_rename(const char *src, const char *dst)
  */
 int vfs_truncate(const char *path, uint64_t len)
 {
-    if (strncmp(path, "/dev/", 5) == 0)
+    /* /dev/shm is a tmpfs mount, not a synthetic device, so truncating a
+     * shared-memory file must reach the tmpfs routing below. */
+    if (strncmp(path, "/dev/", 5) == 0 && strncmp(path, "/dev/shm/", 9) != 0)
         return -E_INVAL;
 
     char rel[GNUOS_PATH_MAX];
@@ -1017,6 +1081,10 @@ int vfs_file_open(const char *path, int flags)
         node.size = 0;
     }
 
+    /* The fd is about to hold a reference on this node.  For a tmpfs file
+     * that is what keeps an unlinked shared-memory object alive. */
+    tmpfs_retain(&node);
+
     int h = slot_alloc();
     if (h < 0)
         return h;
@@ -1034,6 +1102,17 @@ const char *vfs_file_path(int h)
 {
     vfs_file_t *f = get(h);
     return f ? f->path : NULL;
+}
+
+/* Read `len` bytes from fd at `off` into kernel `buf`; returns the byte
+ * count (<= len), 0 at EOF, or a negative errno.  Used by mmap of regular
+ * files so the kernel can populate the mapping with the file's contents. */
+int vfs_pread_fd(int h, uint64_t off, void *buf, uint32_t len)
+{
+    const vfs_node_t *n = vfs_file_node(h);
+    if (!n)
+        return -E_BADF;
+    return (int)fs_node_read((vfs_node_t *)n, off, buf, len);
 }
 
 /* The opening path of the current process's descriptor `fd`, for procfs's
@@ -1304,11 +1383,16 @@ void vfs_file_unref(int h)
         return;
 
     /* The last descriptor onto a socket closes it -- and for TCP that is not
-     * a bookkeeping detail, it is what sends the FIN. */
+     * a bookkeeping detail, it is what sends the FIN.  A negative priv is
+     * an AF_UNIX socket (index -2 - priv); see unix.c. */
     if (f->node.kind == VFS_SOCKET) {
         if (--f->refs <= 0) {
             f->refs = 0;
-            sock_close((int)(uintptr_t)f->node.priv);
+            int s = (int)(uintptr_t)f->node.priv;
+            if (s < 0)
+                unix_close(-2 - s);
+            else
+                sock_close(s);
         }
         return;
     }

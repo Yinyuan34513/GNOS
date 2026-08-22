@@ -13,7 +13,11 @@
 BUILD := build
 OVMF  := /usr/share/ovmf/OVMF.fd
 
-CC      := gcc
+# The system compiler for the userland programs.  Must be gcc-13: the
+# stock gcc 12.3 on this machine has a libcpp ICE (_cpp_process_line_notes,
+# libcpp/lex.cc:1163) that randomly kills preprocessing of perfectly
+# ordinary files (getty.c, ncurses's make_hash.c, ...).
+CC      := gcc-13
 AS      := nasm
 LD      := ld
 OBJCOPY := objcopy
@@ -52,12 +56,14 @@ KOBJS := $(BUILD)/kernel.o $(BUILD)/loader.o $(BUILD)/fbcon.o $(BUILD)/gfx.o \
         $(BUILD)/signal.o $(BUILD)/switch.o $(BUILD)/timer.o \
         $(BUILD)/syscall.o \
         $(BUILD)/smp.o $(BUILD)/ap_trampoline.o \
+        $(BUILD)/lapic.o \
         $(BUILD)/net.o $(BUILD)/tcp.o $(BUILD)/sock.o \
          $(BUILD)/pci.o $(BUILD)/e1000.o $(BUILD)/audio.o \
         $(BUILD)/hda.o $(BUILD)/ata.o $(BUILD)/cjkfont.o \
         $(BUILD)/cjkfont_data.o \
         $(BUILD)/input.o \
-        $(BUILD)/anonfd.o $(BUILD)/epoll.o \
+        $(BUILD)/anonfd.o $(BUILD)/epoll.o $(BUILD)/timerfd.o \
+        $(BUILD)/unix.o \
         $(BUILD)/module.o $(BUILD)/module_elf.o $(BUILD)/exports.o \
         $(BUILD)/limine_requests.o
 
@@ -77,7 +83,7 @@ MUSL_INC  := $(MUSL_PREFIX)/include
 MUSL_GCC  := $(MUSL_PREFIX)/bin/musl-gcc
 
 # Programs built against musl rather than ulib.
-MUSLPROGS := hello mount coldplug chvt getty login installer ttytest thrtest drmtest ptracetest modtest insmod rmmod evtest eventest
+MUSLPROGS := hello mount coldplug chvt getty login installer ttytest thrtest drmtest ptracetest insmod rmmod evtest eventest socktest
 MUSL_OBJS := $(addprefix $(BUILD)/user/,$(addsuffix .o,$(MUSLPROGS)))
 MUSL_ELFS := $(addprefix $(BUILD)/,$(addsuffix .elf,$(MUSLPROGS)))
 
@@ -119,6 +125,62 @@ BB_APPLETS := cat cp echo false head ls mkdir mv pwd rm true uname wc sh ash \
 # instead of falling back to cross-compilation guesses.
 BASH_SRC := $(BUILD)/bashsrc/bash-5.3
 BASH_BIN := $(BASH_SRC)/bash
+
+# curl — the network client, built against musl and statically linked.
+# Fetched into build/curlsrc and configured by hand with every optional
+# dependency disabled (no TLS: the kernel has no crypto, and GNOS's network
+# is HTTP to the QEMU slirp gateway).  Two things matter at link time:
+#   - `-static` in LDFLAGS is swallowed by libtool as one of its own mode
+#     flags (the same trap binutils fell into), so the binary comes out
+#     dynamically linked against libc and dies on this kernel (no ld-musl).
+#     CURL_LDFLAGS_BIN="-all-static" is what actually makes it static.
+#   - the kernel's gcc 12.3 ICEs in libcpp on some inputs, so musl-gcc is
+#     always pointed at gcc-13 via REALGCC (see dynhello).
+CURL_BIN := $(BUILD)/curlsrc/curl-8.9.1/src/curl
+
+# mbedtls 2.28.9 -- the TLS library curl links against, vendored in-tree
+# (src/user/third_party/mbedtls, Apache-2.0).  It is compiled against
+# musl's headers exactly like the musl programs, with the GNOS
+# configuration: include/mbedtls/mbedtls_config.h *is* config-gnos.h (a
+# client-only TLS 1.2 with ECDHE + AES-GCM + SHA-256 suites, entropy fed
+# by the kernel's getrandom through mbedtls_hardware_poll).  mbedtls's own
+# library Makefile builds the three split archives curl's configure probes
+# for (libmbedtls/x509/crypto.a), and the result is copied into an
+# installed prefix (include/ + lib/) curl's configure understands.
+MBEDTLS_SRC    := src/user/third_party/mbedtls
+MBEDTLS_INC    := $(MBEDTLS_SRC)/include
+MBEDTLS_PREFIX := $(BUILD)/mbedtls-inst
+MBEDTLS_LIBS   := $(MBEDTLS_PREFIX)/lib/libmbedtls.a \
+                  $(MBEDTLS_PREFIX)/lib/libmbedx509.a \
+                  $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a
+MBEDTLS_CFLAGS := $(MUSLCFLAGS) -I$(MBEDTLS_SRC) -I$(MBEDTLS_INC)
+
+$(MBEDTLS_LIBS): $(MBEDTLS_SRC)/library/Makefile $(wildcard $(MBEDTLS_SRC)/library/*.c) $(MBEDTLS_INC)/mbedtls/mbedtls_config.h $(MBEDTLS_INC)/mbedtls/config.h
+	mkdir -p $(MBEDTLS_PREFIX)/lib
+	$(MAKE) -C $(MBEDTLS_SRC)/library clean
+	$(MAKE) -C $(MBEDTLS_SRC)/library -j"$(nproc)" \
+	  CC=$(CC) AR=ar CFLAGS="$(MBEDTLS_CFLAGS) -O2 -g" \
+	  libmbedtls.a libmbedx509.a libmbedcrypto.a
+	cp -r $(MBEDTLS_INC) $(MBEDTLS_PREFIX)/
+	cp $(MBEDTLS_SRC)/library/libmbedtls.a \
+	   $(MBEDTLS_SRC)/library/libmbedx509.a \
+	   $(MBEDTLS_SRC)/library/libmbedcrypto.a $(MBEDTLS_PREFIX)/lib/
+
+# GNU nano — the editor, against a wide-char ncurses built by hand into
+# build/nanosrc/ncstage (also musl, also static).  ncurses 6.4 needs its
+# generated lib_gen.c rebuilt with gcc-13's cpp (the gcc 12 ICE strikes the
+# MKlib_gen.sh pipeline too), and the initrd carries the xterm + linux
+# terminfo entries it was installed with so TERM=xterm nano has a terminal
+# description to talk to.
+NANO_SRC := $(BUILD)/nanosrc
+NANO_BIN := $(NANO_SRC)/nano-7.2/src/nano
+NC_STAGE := $(NANO_SRC)/ncstage
+
+# The desktop stack (wayland/wlroots 0.19/labwc 0.9 + friends), cross-built
+# by hand into build/desk/stage with musl-gcc (see build/desk/env.sh).  The
+# initrd's labwc section copies the compositor, xkb data and config out of
+# this stage.
+DESK_STAGE := $(BUILD)/desk/stage
 
 # GNU coreutils 9.9 — the other half of what makes a shell prompt feel like a
 # system.  Fetched into build/ccsrc and configured by hand with:
@@ -248,7 +310,7 @@ GUI_AUDIO := -audiodev $(AUDIO_BACKEND),id=snd0 \
              -device AC97,audiodev=snd0 \
              -device intel-hda -device hda-duplex,audiodev=snd0
 
-.PHONY: all run run-uefi guistart clean distclean
+.PHONY: all run run-uefi guistart headless clean distclean
 all: $(ISO)
 
 # musl's headers only become usable after `make install` assembles them into a
@@ -278,6 +340,20 @@ $(BB_BIN): $(BB_SRC)/.config | $(MUSL_GCC)
 # is missing, so a hand-run `make` inside the tree is never undone.
 $(BASH_BIN): $(BASH_SRC)/Makefile | $(MUSL_GCC)
 	$(MAKE) -C $(BASH_SRC)
+
+# curl.  Configured by hand (see CURL_BIN above); this rule only relinks it
+# when the binary is missing.  The link flags are forced on the command line
+# because libtool eats -static from LDFLAGS (see the CURL_BIN comment).
+$(CURL_BIN): $(BUILD)/curlsrc/curl-8.9.1/Makefile $(MBEDTLS_LIBS) | $(MUSL_GCC)
+	REALGCC=gcc-13 $(MAKE) -C $(BUILD)/curlsrc/curl-8.9.1 CURL_LDFLAGS_BIN="-all-static"
+
+# GNU nano against the ncursesw build in build/nanosrc/ncstage.  Same
+# hand-configured-tree pattern; CFLAGS is forced on the command line so the
+# stage's headers (and the linux uapi copy that musl's sys/vt.h needs) are
+# always on the include path.
+$(NANO_BIN): $(NANO_SRC)/nano-7.2/Makefile | $(MUSL_GCC)
+	REALGCC=gcc-13 $(MAKE) -C $(NANO_SRC)/nano-7.2 CFLAGS="-O2 -g -static -fno-pie \
+	  -isystem $(BUILD)/desk/stage/include"
 
 # GNU coreutils.  Same deal: the tree is configured by hand (see CC_SRC above)
 # and this only rebuilds when the binaries are gone.  SUBDIRS is overridden to
@@ -413,13 +489,24 @@ $(MUSL_ELFS): $(BUILD)/%.elf: $(BUILD)/user/%.o \
 	  $(MUSL_CRT)/crt1.o $(MUSL_CRT)/crti.o $< \
 	  $(MUSL_LIB)/libc.a $(MUSL_CRT)/crtn.o
 
+# dynhello — the one *dynamically linked* program on the system.  musl-gcc
+# links it as a PIE (ET_DYN) with a PT_INTERP pointing at
+# /lib/ld-musl-x86_64.so.1; the kernel loader maps the PIE, reads the
+# interpreter path, loads the linker, and hands the entry point to it, the
+# way a Linux loader would.  Everything else stays -static: this file exists
+# to prove the ET_DYN + PT_INTERP path, not to be a production choice.
+$(BUILD)/dynhello.elf: src/user/dynhello.c $(MUSL_GCC)
+	REALGCC=gcc-13 $(MUSL_GCC) -O2 -g -o $@ $<
+	file $@
+
 # ---------- initrd (ext2 image holding the user programs) ----------
 # mke2fs -d fills the image straight from a staging directory, so this needs
 # neither a loopback mount nor root.  The feature set is trimmed on purpose:
 # ^dir_index keeps every directory a plain linear list, which is all the
 # kernel driver knows how to rewrite.
-$(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) $(BASH_BIN) $(CC_BIN) $(KRNL) \
-           $(FF_BIN) $(KMODS) src/user/rc | $(BUILD)
+$(INITRD): $(UELFS) $(MUSL_ELFS) $(BUILD)/dynhello.elf $(BB_BIN) $(BASH_BIN) \
+           $(CC_BIN) $(KRNL) $(FF_BIN) $(KMODS) $(CURL_BIN) $(NANO_BIN) \
+           src/user/rc | $(BUILD)
 	rm -rf $(BUILD)/initrd-root
 	mkdir -p $(BUILD)/initrd-root
 	# ---- FHS skeleton (empty dirs are harmless placeholders for now) ----
@@ -448,13 +535,28 @@ $(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) $(BASH_BIN) $(CC_BIN) $(KRNL) \
 	mkdir -p $(BUILD)/initrd-root/sys/class/drm/card0
 	mkdir -p $(BUILD)/initrd-root/sys/class/drm/renderD128
 	mkdir -p $(BUILD)/initrd-root/sys/devices/0000:00:02.0/drm/renderD128
+	# /sys/dev/char/<maj>:<min> is where libdrm maps an fd back to its
+	# /dev node: drmGetDeviceNameFromFd2() fstats the fd and reads
+	# DEVNAME= out of /sys/dev/char/N/uevent.  drmNodeIsDRM() additionally
+	# stats /sys/dev/char/N/device/drm, so the char node needs its 'device'
+	# symlink and the PCI device needs a drm/ subdir, exactly as Linux lays
+	# it out.  Without all three wlroots refuses the whole DRM backend.
+	mkdir -p $(BUILD)/initrd-root/sys/dev/char/226:0
+	mkdir -p $(BUILD)/initrd-root/sys/dev/char/226:128
+	echo 'DEVNAME=dri/card0' > $(BUILD)/initrd-root/sys/dev/char/226:0/uevent
+	echo 'DEVNAME=dri/renderD128' > $(BUILD)/initrd-root/sys/dev/char/226:128/uevent
+	ln -sfn ../../../devices/0000:00:02.0 \
+	  $(BUILD)/initrd-root/sys/dev/char/226:0/device
+	ln -sfn ../../../devices/0000:00:02.0 \
+	  $(BUILD)/initrd-root/sys/dev/char/226:128/device
+	mkdir -p $(BUILD)/initrd-root/sys/devices/0000:00:02.0/drm/card0
 	echo 'pci:v00001234d00001111sv00001AF4sd00001100bc03sc00' \
 	  > $(BUILD)/initrd-root/sys/devices/0000:00:02.0/modalias
 	ln -sfn ../../../bus/pci/drivers/bochsdrm \
 	  $(BUILD)/initrd-root/sys/devices/0000:00:02.0/driver
-	ln -sfn ../../devices/0000:00:02.0 \
+	ln -sfn ../../../devices/0000:00:02.0 \
 	  $(BUILD)/initrd-root/sys/class/drm/card0/device
-	ln -sfn ../../devices/0000:00:02.0 \
+	ln -sfn ../../../devices/0000:00:02.0 \
 	  $(BUILD)/initrd-root/sys/class/drm/renderD128/device
 	# ---- user programs live in /bin ----
 	for p in $(UPROGS); do \
@@ -466,6 +568,15 @@ $(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) $(BASH_BIN) $(CC_BIN) $(KRNL) \
 	for p in $(MUSLPROGS); do \
 	  cp $(BUILD)/$$p.elf $(BUILD)/initrd-root/bin/$$p.elf; \
 	done
+	# ---- the dynamically linked hello, and the loader it needs ----
+	# dynhello.elf is an ET_DYN with PT_INTERP=/lib/ld-musl-x86_64.so.1, so
+	# the initrd must carry the interpreter at exactly that path.  musl's
+	# libc.so *is* the dynamic linker (the two names are the same file in a
+	# musl install), so a plain copy provides both the interpreter and the
+	# libc.so it is asked to load.
+	cp $(BUILD)/dynhello.elf $(BUILD)/initrd-root/bin/dynhello.elf
+	cp $(MUSL_LIB)/libc.so $(BUILD)/initrd-root/lib/ld-musl-x86_64.so.1
+	cp $(MUSL_LIB)/libc.so $(BUILD)/initrd-root/lib/libc.so
 	# `mount` is invoked by its bare name from OpenRC's init.sh and service
 	# scripts, so it must sit on PATH as /bin/mount (not /bin/mount.elf).  The
 	# rest of the musl programs are only ever called by absolute path.
@@ -577,6 +688,56 @@ $(INITRD): $(UELFS) $(MUSL_ELFS) $(BB_BIN) $(BASH_BIN) $(CC_BIN) $(KRNL) \
 	cp $(FFLASH) $(BUILD)/initrd-root/usr/bin/flashfetch
 	strip $(BUILD)/initrd-root/usr/bin/fastfetch \
 	      $(BUILD)/initrd-root/usr/bin/flashfetch
+	# ---- curl ----
+	# The network client that proves the TCP/UDP stack end to end.  Stripped
+	# on the way in like everything else.
+	cp $(CURL_BIN) $(BUILD)/initrd-root/usr/bin/curl
+	strip $(BUILD)/initrd-root/usr/bin/curl
+	# curl's CA store: the host's root bundle, at the path curl was
+	# configured with --with-ca-bundle.  Without it https fails loudly;
+	# `curl -k` remains the escape hatch.
+	mkdir -p $(BUILD)/initrd-root/etc/ssl/certs
+	cp /etc/ssl/certs/ca-certificates.crt \
+	   $(BUILD)/initrd-root/etc/ssl/certs/ca-bundle.pem
+	# ---- nano + terminfo ----
+	# The editor, plus the xterm and linux terminfo entries it needs when
+	# TERM=xterm (getty sets TERM=linux by default, so nano must have that
+	# entry too).  The whole ncurses terminfo tree is 6.7 MB; x/ and linux/
+	# are the only entries this machine will ever ask for.
+	cp $(NANO_BIN) $(BUILD)/initrd-root/usr/bin/nano
+	strip $(BUILD)/initrd-root/usr/bin/nano
+	mkdir -p $(BUILD)/initrd-root/usr/share/terminfo
+	cp -a $(NC_STAGE)/share/terminfo/x $(BUILD)/initrd-root/usr/share/terminfo/
+	mkdir -p $(BUILD)/initrd-root/usr/share/terminfo/l
+	cp -a $(NC_STAGE)/share/terminfo/l/linux $(BUILD)/initrd-root/usr/share/terminfo/l/
+	# v/ is ncurses's fallback terminal (vt220) when TERM is unset, so it
+	# rides along too.
+	mkdir -p $(BUILD)/initrd-root/usr/share/terminfo/v
+	cp -a $(NC_STAGE)/share/terminfo/v $(BUILD)/initrd-root/usr/share/terminfo/
+	# ---- labwc: the wayland compositor -----------------------------------
+	# The labwc stack (wlroots 0.19 + labwc 0.9, built by hand into
+	# build/desk/stage) is the desktop itself.  It needs three things the
+	# initrd must carry: the binary, the xkb keyboard-layout data that
+	# libxkbcommon reads (rules/keycodes/symbols), and its rc.xml/menu.xml
+	# config.  xkbcommon looks at XKB_CONFIG_ROOT, which rc exports, so the
+	# data lands at the standard /usr/share/X11/xkb path.
+	cp $(DESK_STAGE)/bin/labwc $(BUILD)/initrd-root/usr/bin/labwc
+	strip $(BUILD)/initrd-root/usr/bin/labwc
+	mkdir -p $(BUILD)/initrd-root/usr/share/X11/xkb
+	cp -a /usr/share/X11/xkb/. $(BUILD)/initrd-root/usr/share/X11/xkb/
+	mkdir -p $(BUILD)/initrd-root/etc/xdg/labwc
+	cp $(DESK_STAGE)/../labwc-etc/rc.xml $(BUILD)/initrd-root/etc/xdg/labwc/rc.xml
+	cp $(DESK_STAGE)/../labwc-etc/menu.xml $(BUILD)/initrd-root/etc/xdg/labwc/menu.xml
+	# labwc draws text through pango/cairo/fontconfig: the initrd must carry
+	# fontconfig's config tree (fonts.conf + conf.d) and at least one
+	# TrueType face, or pango fails font resolution and the compositor
+	# refuses to start.  Two DejaVu faces (sans + mono) are plenty.
+	mkdir -p $(BUILD)/initrd-root/etc/fonts
+	cp -a /etc/fonts/. $(BUILD)/initrd-root/etc/fonts/
+	mkdir -p $(BUILD)/initrd-root/usr/share/fonts/truetype/dejavu
+	cp /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
+	   /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf \
+	   $(BUILD)/initrd-root/usr/share/fonts/truetype/dejavu/
 	cp src/user/rc $(BUILD)/initrd-root/etc/rc            # run once at boot by init
 	# Static system config (hosts, resolv.conf, nsswitch, services, protocols,
 	# passwd/group, hostname).  These make the BusyBox network tools and the
@@ -690,6 +851,16 @@ guistart: $(ISO) $(DISK)
 	  $(QEMU_NET) $(GUI_AUDIO) $(QEMU_DISK) \
 	  -device isa-debugcon,chardev=dbg -chardev file,id=dbg,path=$(BUILD)/dbg.log \
 	  -display gtk -no-reboot
+
+# headless — guistart without the window: the headless self-test target.
+# The debug console is teed to build/dbg.log, exactly like guistart, so
+# `make headless; grep PASS build/dbg.log` is the whole verification loop.
+headless: $(ISO) $(DISK)
+	@echo "GNOS: booting headless; log is $(BUILD)/dbg.log"
+	qemu-system-x86_64 -cdrom $(ISO) -m 512M \
+	  $(QEMU_NET) $(QEMU_DISK) \
+	  -device isa-debugcon,chardev=dbg -chardev file,id=dbg,path=$(BUILD)/dbg.log \
+	  -display none -no-reboot -smp 4
 
 # `clean` deliberately spares the third-party source trees under $(BUILD).
 # musl was fetched and built by hand and there is no rule to get it back, so a

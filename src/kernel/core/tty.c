@@ -593,9 +593,17 @@ static void kbd_irq(regs_t *r)
         /* The 8042's data port is shared with the auxiliary (mouse) port.
          * Status bit 5 marks a byte the aux device produced: those belong
          * to the mouse driver's IRQ 12 drain, not to the keyboard, and
-         * stealing one would corrupt the mouse packet stream. */
+         * stealing one would corrupt the mouse packet stream.
+         *
+         * This must be `break`, not `continue`: the loop condition is the
+         * output-buffer-full bit, which stays set while the aux byte sits
+         * unread in the data port.  `continue` would spin forever inside
+         * IRQ 1 with interrupts disabled, freezing the whole machine the
+         * moment a mouse packet is pending and the user presses a key --
+         * the "login 卡死" symptom.  Stopping here leaves the byte for
+         * IRQ 12 (mouse_irq) to drain. */
         if (inb(KBD_STATUS) & 0x20)
-            continue;
+            break;
         uint8_t sc = inb(KBD_DATA);
         kbd_feed(sc);
     } while (inb(KBD_STATUS) & 1);

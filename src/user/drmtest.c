@@ -117,7 +117,7 @@ typedef struct {
 #define DRM_IOCTL_MODE_GETPROPERTY 0xc04064aa
 #define DRM_IOCTL_MODE_OBJ_GETPROPERTIES 0xc02064b9
 #define DRM_IOCTL_MODE_GETPLANERESOURCES 0xc01064b5
-#define DRM_IOCTL_MODE_GETPLANE   0xc02864b6
+#define DRM_IOCTL_MODE_GETPLANE   0xc02064b6
 
 #define DRM_CAP_DUMB_BUFFER 1
 #define DRM_FORMAT_XRGB8888 0x34325258u
@@ -366,7 +366,9 @@ int main(void)
         check(ok, 20, "GETPROPERTY(type)");
     }
 
-    /* 10. object properties: connector carries DPMS+EDID, the plane "type" */
+    /* 10. object properties: connector carries DPMS (no EDID blob is fitted
+     * on a panel that has no monitor, so the property is not offered and
+     * wlroots skips its blob read), the plane "type" */
     {
         drm_mode_obj_get_properties_t o;
         unsigned pids[8];
@@ -378,7 +380,7 @@ int main(void)
         o.obj_id = 1;
         o.obj_type = DRM_MODE_OBJECT_CONNECTOR;
         int ok = ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &o) == 0 &&
-                 o.count_props == 2 && pids[0] == 1 && pids[1] == 2;
+                 o.count_props == 1 && pids[0] == 1;
         check(ok, 21, "OBJ_GETPROPERTIES(connector)");
 
         memset(&o, 0, sizeof o);

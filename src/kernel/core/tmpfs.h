@@ -53,4 +53,14 @@ int tmpfs_setsize(tmpfs_t *fs, const char *rel, uint64_t len);
 /* readlink(2): returns the target length, or a negative errno. */
 int tmpfs_readlink(tmpfs_t *fs, const char *rel, char *buf, uint32_t cap);
 
+/* Open-file references (POSIX shm semantics): a resolved node that names a
+ * tmpfs file keeps its data alive until the last fd closes, even across
+ * unlink.  vfs_file_open() calls tmpfs_retain() when it creates an fd from
+ * the node; the file ops' release hook drops it. */
+int  tmpfs_is_file_node(const vfs_node_t *n);
+void tmpfs_retain(const vfs_node_t *n);
+/* Live size of a resolved tmpfs file node (the vfs_node copy is frozen at
+ * open time; ftruncate can move the real size afterwards). */
+uint64_t tmpfs_file_size(const vfs_node_t *n);
+
 #endif

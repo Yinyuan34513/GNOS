@@ -125,6 +125,12 @@ int main(int argc, char **argv)
 
     print_issue(name);
 
+    /* GNOS's console is a Linux-console-style terminal: hand the shell
+     * (and anything it execs, nano included) a TERM it can actually use.
+     * ncurses assumes vt220 when TERM is unset, which would make editors
+     * fail with "Error opening terminal" if the vt220 entry were missing. */
+    setenv("TERM", "linux", 1);
+
     char *av[2] = { (char *)lgin, NULL };
     execv(lgin, av);
 

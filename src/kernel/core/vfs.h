@@ -150,6 +150,7 @@ typedef struct vfs_node {
     uint64_t         size;
     const vfs_ops_t *ops;
     void            *priv;
+    uint32_t         rdev;       /* Linux new_encode_dev() value; 0 = none */
     ext2_dirent_t    e2;         /* valid when the node lives on the ext2 mount */
 } vfs_node_t;
 
@@ -163,6 +164,13 @@ int  vfs_init(uint8_t *img, uint32_t img_size);
 
 /* Publish a character device as "/dev/<name>". */
 int  vfs_register_dev(const char *name, const vfs_ops_t *ops, void *priv);
+
+/* Publish a character device with a Linux device number.  `maj`/`min` are
+ * what stat(2) reports as st_rdev -- libdrm (drmGetDeviceNameFromFd2) and
+ * friends decide whether an fd is a DRM node from exactly this pair, so
+ * card0 must read back as (226, 0), event0 as (13, 64) and so on. */
+int  vfs_register_devnum(const char *name, const vfs_ops_t *ops, void *priv,
+                         uint32_t maj, uint32_t min);
 
 /* Create an anonymous open file -- no directory entry, no path.  This is
  * what memfd_create, eventfd and epoll_create1 hand back: a slot in the
@@ -188,6 +196,7 @@ int  vfs_truncate(const char *path, uint64_t len);
 int  vfs_unlink(const char *path);
 int  vfs_rmdir(const char *path);
 int  vfs_mkdir(const char *path);
+int  vfs_link(const char *oldpath, const char *newpath);
 int  vfs_symlink(const char *target, const char *path);
 int  vfs_readlink(const char *path, char *buf, uint32_t cap);
 int  vfs_rename(const char *src, const char *dst);
@@ -195,6 +204,10 @@ int  vfs_rename(const char *src, const char *dst);
 /* Linux-style stat (144-byte struct) used by musl/BusyBox. */
 int  vfs_stat_linux(const char *path, lstat_t *st, int follow);
 int  vfs_fstat(int h, lstat_t *st);
+
+/* statfs(137)/fstatfs(138): fill the kstatfs_t (sysnum.h) for the filesystem
+ * backing `path` (or the root fs when path is NULL). */
+int  vfs_statfs(const char *path, void *out);
 
 /* Mount a fresh tmpfs instance at `path` (absolute, normalised).  Returns 0 or
  * a negative errno.  This is the VFS side of mount(2); only tmpfs is
@@ -230,6 +243,10 @@ const vfs_ops_t *vfs_file_ops(int h);
  * their per-device state out of node->priv.  The pointer is into the
  * open-file table and only valid until the next VFS call. */
 const vfs_node_t *vfs_file_node(int h);
+
+/* Read `len` bytes from fd at `off` into kernel `buf`; returns the byte
+ * count (<= len) or a negative errno.  Lets mmap populate a file mapping. */
+int  vfs_pread_fd(int h, uint64_t off, void *buf, uint32_t len);
 
 /* Change the permission bits (low 12) of a path's inode; returns 0 or errno. */
 int  vfs_chmod(const char *path, uint32_t mode);

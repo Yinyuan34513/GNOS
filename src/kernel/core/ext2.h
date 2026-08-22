@@ -1,11 +1,19 @@
 /*
- * ext2.h — read/write ext2 driver over an in-memory image. (GPLv2)
+ * ext2.h — read/write ext2 driver over an in-memory image, or a block device.
+ * (GPLv2)
  *
- * The image is the initrd the bootloader dropped in RAM, so there is no block
- * layer underneath: a "block read" is just a pointer into the image, and a
- * write is a store to that same RAM.  The volume is genuinely writable --
- * mkdir, rm and friends really do allocate blocks and inodes and rewrite the
- * bitmaps -- but only until the machine is switched off.
+ * Two backends share one driver.  In the default "image" mode the volume is
+ * the initrd the bootloader dropped in RAM, so a "block read" is just a
+ * pointer into the image and a write is a store to that same RAM; the volume
+ * is genuinely writable -- mkdir, rm and friends really do allocate blocks
+ * and inodes -- but only until the machine is switched off.
+ *
+ * In "disk" mode the same routines sit on top of a caller-supplied block
+ * device (e.g. /dev/sda1) through a small block cache: every lookup borrows a
+ * cache slot and hands the borrow back when the block is no longer needed,
+ * and returning a borrowed slot flushes it if it was written to.  The borrow
+ * discipline is what keeps this single-threaded kernel honest -- a borrowed
+ * slot is never evicted, so a live pointer stays valid.
  *
  * ext3 images mount too.  ext3 is ext2 plus a journal, and the journal lives
  * in an ordinary inode described by a *compatible* feature flag, which by
@@ -64,9 +72,41 @@
 #define EXT2_EINVAL     (-6)
 #define EXT2_EISDIR     (-7)
 
+/*
+ * Block cache geometry for disk mode.  The cache is a fixed array of
+ * whole-block slots.  EXT2_CACHE_SLOTS is sized for the deepest nesting any
+ * routine here reaches -- a rename over a full directory allocates at most
+ * eight simultaneously-borrowed blocks -- and each borrow pins its slot, so
+ * a live pointer can never be evicted out from under its user.
+ */
+#define EXT2_CACHE_SLOTS   16
+#define EXT2_MAX_BLOCK     4096
+
+/*
+ * Raw block I/O for disk mode.  `ctx` is whatever the caller passed to
+ * ext2_mount_bdev; `off` is a byte offset into the device and `len` a byte
+ * count.  Each call returns the number of bytes transferred, or a negative
+ * errno.  NULL callbacks are the image-mode marker.
+ */
+typedef struct {
+    int32_t (*read)(void *ctx, uint64_t off, void *buf, uint32_t len);
+    int32_t (*write)(void *ctx, uint64_t off, const void *buf, uint32_t len);
+    void    *ctx;
+} ext2_blkio_t;
+
 typedef struct {
     uint8_t *img;
     uint32_t img_size;
+
+    /* Block-device backend; NULL callbacks mean image mode. */
+    ext2_blkio_t blkio;
+
+    /* Block cache (disk mode only): one whole block per slot. */
+    uint8_t  cache_data[EXT2_CACHE_SLOTS][EXT2_MAX_BLOCK];
+    uint32_t cache_blk[EXT2_CACHE_SLOTS];     /* 0xFFFFFFFF = free */
+    uint8_t  cache_borrow[EXT2_CACHE_SLOTS];  /* borrowed slots are never evicted */
+    uint32_t cache_tick;                      /* LRU clock */
+    uint32_t cache_age[EXT2_CACHE_SLOTS];
 
     uint32_t block_size;
     uint32_t inodes_count;
@@ -115,6 +155,15 @@ typedef struct {
  * volume or it uses features we would misread. */
 int ext2_mount(ext2_fs_t *fs, uint8_t *img, uint32_t img_size);
 
+/* Mount the same driver on a block device.  `blkio` must stay valid for as
+ * long as the fs does; its callbacks move whole blocks.  Returns 1 on
+ * success (the superblock and geometry were read and validated), 0 on
+ * failure.  `fs` must be zeroed first, exactly as with ext2_mount. */
+int ext2_mount_bdev(ext2_fs_t *fs, const ext2_blkio_t *blkio);
+
+/* True when the fs was mounted on a block device rather than a RAM image. */
+int ext2_is_bdev(const ext2_fs_t *fs);
+
 /* Start iterating a directory.  ino == 0 means the root directory. */
 void ext2_opendir(ext2_fs_t *fs, uint32_t ino, ext2_dir_t *dir);
 
@@ -151,6 +200,9 @@ int ext2_create(ext2_fs_t *fs, const char *path, int isdir, ext2_dirent_t *out);
 
 /* Create a symbolic link `path` pointing at `target`. */
 int ext2_symlink(ext2_fs_t *fs, const char *target, const char *path);
+
+/* Create a hard link `newpath` to the file named by `oldpath`. */
+int ext2_link(ext2_fs_t *fs, const char *oldpath, const char *newpath);
 
 /* Read a symlink's target into `buf` (size `cap`).  Returns the length, or a
  * negative EXT2_* code on error. */

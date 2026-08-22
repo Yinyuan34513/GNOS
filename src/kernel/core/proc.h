@@ -202,16 +202,33 @@ typedef struct proc {
     uint64_t      fs_base;          /* TLS base (arch_prctl ARCH_SET_FS) */
     uint64_t      clear_child_tid;  /* set_tid_address: futex word to clear */
 
-    /* Anonymous mappings we handed out, so munmap()/exit can free them.
-     * musl's malloc grabs a fresh mmap for each heap "group", so a busy
-     * process (or a full libc program like BusyBox) can hold far more than a
-     * handful; 128 keeps the per-PCB bookkeeping small but out of the way. */
-    struct { uint64_t base; uint64_t size; } mmaps[128];
-    int           nmmaps;
+    /* Ring of the last 8 syscalls (nr + return), dumped by the fault handler
+     * so a NULL-deref crash shows what the process was doing. */
+    uint16_t      sys_hist_nr[8];
+    int32_t       sys_hist_ret[8];
+    uint8_t       sys_hist_idx;
 
     /* Per-process FPU/SSE state.  fxsave needs the buffer 16-byte aligned,
      * so the field carries that alignment and the whole struct inherits it. */
     uint8_t       fpu[512] __attribute__((aligned(16)));
+
+    /* ---- EEVDF scheduling --------------------------------------------
+     * Virtual run time in ticks, the global virtual clock, and the virtual
+     * deadline (vruntime + slice) the run queue's binary heap is keyed on.
+     * All weights are 1, so virtual time is just the CPU time a process
+     * has consumed.  `rq_index` is the process's slot in the heap, -1 while
+     * not queued; `bkl_held` records whether this process's kernel
+     * execution owns the big kernel lock, so the answer survives a context
+     * switch; `on_cpu` is the core running it (or -1).  The block is 48
+     * bytes so the whole struct stays a multiple of 16 (fpu's alignment). */
+    uint64_t      vruntime;       /* CPU time consumed, in ticks         */
+    uint64_t      deadline;       /* vruntime + slice when last granted  */
+    uint64_t      slice;          /* slice granted per pick, in ticks    */
+    uint64_t      last_run_tick;  /* tick the CPU was last handed over   */
+    int           rq_index;       /* heap slot, -1 when not queued       */
+    int           bkl_held;       /* this kernel execution owns the BKL  */
+    int           on_cpu;         /* core this process runs on, or -1    */
+    int           rsvd;
 
     /*
      * The current directory, stored as a normalised absolute path rather than

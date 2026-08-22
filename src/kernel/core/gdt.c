@@ -15,17 +15,18 @@
 #define DESC_UDATA  0x00CFF2000000FFFFULL   /* P DPL3 S data rw      */
 #define DESC_UCODE  0x00AFFA000000FFFFULL   /* P DPL3 S exec rw, L=1 */
 
-/* A mirror of the TSS's RSP0, readable from assembly.  The `syscall`
- * instruction does no stack switching of its own and never consults the TSS,
- * so syscall_entry has to load the kernel stack by hand; keeping the copy in
- * lockstep here is what stops the two kernel entry paths from disagreeing
- * about which stack the current process owns. */
-uint64_t g_kernel_rsp0;
-
+/*
+ * Point the current CPU's TSS.RSP0 -- and, in lockstep, the per-CPU slot
+ * isr.asm's syscall_entry loads -- at the current process's kernel stack.
+ * Keeping the two mirrors together is what stops the interrupt path (which
+ * the CPU routes through the TSS) and the `syscall` path (which loads RSP
+ * by hand) from disagreeing about which stack the process owns.
+ */
 void tss_set_rsp0(uint64_t rsp0)
 {
-    g_cpu[0].tss.rsp[0]  = rsp0;
-    g_kernel_rsp0 = rsp0;
+    cpu_t *c = cpu_self();
+    c->tss.rsp[0] = rsp0;
+    c->kernel_rsp0 = rsp0;
 }
 
 /* Fill c->gdt and c->tss with a complete descriptor set for one CPU.  The
@@ -63,6 +64,20 @@ void gdt_init(void)
      * fills the rest; here we just make sure CPU 0 has a stack to point at. */
     if (!g_cpu[0].stack_top)
         g_cpu[0].stack_top = (void *)((uintptr_t)g_cpu_stack[0] + PERCPU_KSTACK);
+
+    /* The BSP finds its own cpu_t through %gs:0, so point GS at it before
+     * anything touches cpu_self().  APs do the same in ap_main(). */
+    g_cpu[0].self = &g_cpu[0];
+    uint64_t gsbase = (uint64_t)(uintptr_t)&g_cpu[0];
+    asm volatile("wrmsr" :: "c"((uint32_t)IA32_GS_BASE),
+                            "a"((uint32_t)(gsbase & 0xFFFFFFFFu)),
+                            "d"((uint32_t)(gsbase >> 32))
+                 : "memory");
+    uint32_t gl, gh;
+    asm volatile("rdmsr" : "=a"(gl), "=d"(gh) : "c"((uint32_t)IA32_GS_BASE));
+    dbg_puts("GDT: gsbase=");
+    dbg_puts_hex(((uint64_t)gh << 32) | gl);
+    dbg_puts(" (cpu 0)\r\n");
 
     gdt_build(&g_cpu[0]);
 

@@ -24,6 +24,7 @@
  * 100 Hz timer does the same job from interrupt context.
  */
 #include "sock.h"
+#include "unix.h"
 #include "net.h"
 #include "tcp.h"
 #include "pmm.h"
@@ -294,17 +295,27 @@ int sock_bind(int s, uint32_t ip, uint16_t port)
         return -E_BADF;
     if (ip != IP_ANY && !net_is_local(ip))
         return -E_ADDRNOTAVAIL;
-    if (!port)
-        return -E_INVAL;
 
-    if (sk->type == SOCK_STREAM)
+    if (sk->type == SOCK_STREAM) {
+        if (!port)
+            return -E_INVAL;              /* tcp_bind needs an explicit port */
         return tcp_bind(sk->tcp, ip, port);
+    }
     if (sk->type == SOCK_RAW) {
-        sk->lip = ip;                 /* raw has no ports; bind only filters */
+        sk->lip = ip;                     /* raw has no ports; bind only filters */
         return 0;
     }
-    if (udp_port_in_use(ip, port))
+
+    /* UDP: a zero port means "pick a free ephemeral port" -- musl's DNS
+     * resolver binds an all-zero sockaddr (sin_port == 0) before sendto,
+     * and rejecting it breaks getaddrinfo(3) with EINVAL. */
+    if (!port) {
+        port = udp_ephemeral_port();
+        if (!port)
+            return -E_ADDRINUSE;
+    } else if (udp_port_in_use(ip, port)) {
         return -E_ADDRINUSE;
+    }
     sk->lip   = ip;
     sk->lport = port;
     return 0;
@@ -365,6 +376,7 @@ void udp_input(uint32_t src, uint32_t dst, const uint8_t *seg, uint16_t len)
         if (s->connected && (s->rip != src || s->rport != sport))
             continue;
         ring_put(s, src, sport, seg + 8, (uint16_t)(ulen - 8));
+        sched_wake_reason(WAIT_NET);   /* wake poll()/select()/recvfrom waiters */
         return;
     }
     /* No listener: silence.  A full stack would answer with an ICMP port
@@ -740,12 +752,18 @@ int sock_writable(int s)
 int32_t sock_node_read(vfs_node_t *n, uint64_t off, void *buf, uint32_t len)
 {
     (void)off;
-    return sock_recvfrom((int)(uintptr_t)n->priv, buf, len, 0, NULL, NULL);
+    int s = (int)(uintptr_t)n->priv;
+    if (s < 0)                          /* -2 - u: an AF_UNIX socket */
+        return unix_node_read(n, off, buf, len);
+    return sock_recvfrom(s, buf, len, 0, NULL, NULL);
 }
 
 int32_t sock_node_write(vfs_node_t *n, uint64_t off, const void *buf,
                         uint32_t len)
 {
     (void)off;
-    return sock_sendto((int)(uintptr_t)n->priv, buf, len, 0, 0, 0);
+    int s = (int)(uintptr_t)n->priv;
+    if (s < 0)
+        return unix_node_write(n, off, buf, len);
+    return sock_sendto(s, buf, len, 0, 0, 0);
 }

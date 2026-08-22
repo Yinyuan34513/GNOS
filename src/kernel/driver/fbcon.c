@@ -37,6 +37,7 @@
 #include "cjkfont.h"
 #include "kstring.h"
 #include "debugcon.h"
+#include "heap.h"
 
 /* ---- the framebuffer, shared by every console --------------------------- */
 static struct {
@@ -80,6 +81,17 @@ typedef struct {
     uint32_t saved_cx, saved_cy;
     uint32_t saved_fg, saved_bg, saved_attrs;
     cell_t   cells[FBCON_MAX_ROWS * FBCON_MAX_COLS];
+
+    /* Alternate screen (?1049h): a full-screen TUI (nano, vi) switches to a
+     * private buffer on entry and back to the normal screen on exit, which
+     * is what restores the shell prompt instead of leaving the editor's last
+     * frame behind.  alt_cells is a heap copy of the normal screen made on
+     * entry; everything else records where the cursor/scroll state was. */
+    int      alt_screen;
+    uint32_t alt_cx, alt_cy;
+    uint32_t alt_fg, alt_bg, alt_attrs;
+    uint32_t alt_scroll_top, alt_scroll_bot;
+    cell_t  *alt_cells;
 } console_t;
 
 static console_t g_con[FBCON_MAX_CONS];
@@ -420,6 +432,40 @@ static void refresh_cursor_cell(console_t *c, uint32_t col, uint32_t row)
     draw_cell(c, col, row);
 }
 
+/* ---- alternate screen (?1049h / ?1047h / ?47h) ---------------------------
+ * Entering swaps the live cell grid into a heap copy and hands the app a
+ * clean screen; exiting copies it back, restoring the prompt exactly. */
+static void alt_screen_enter(console_t *c)
+{
+    if (c->alt_screen)
+        return;
+    if (!c->alt_cells) {
+        c->alt_cells = kmalloc(sizeof(c->cells));
+        if (!c->alt_cells)
+            return;
+    }
+    memcpy(c->alt_cells, c->cells, sizeof(c->cells));
+    c->alt_cx = c->cx; c->alt_cy = c->cy;
+    c->alt_fg = c->cur_fg; c->alt_bg = c->cur_bg; c->alt_attrs = c->attrs;
+    c->alt_scroll_top = c->scroll_top; c->alt_scroll_bot = c->scroll_bot;
+    c->alt_screen = 1;
+    clear_console(c);               /* also paints the blank screen */
+}
+
+static void alt_screen_exit(console_t *c)
+{
+    if (!c->alt_screen)
+        return;
+    memcpy(c->cells, c->alt_cells, sizeof(c->cells));
+    c->alt_screen = 0;
+    c->cx = c->alt_cx; c->cy = c->alt_cy;
+    c->cur_fg = (uint8_t)c->alt_fg; c->cur_bg = (uint8_t)c->alt_bg;
+    c->attrs = (uint8_t)c->alt_attrs;
+    c->scroll_top = c->alt_scroll_top; c->scroll_bot = c->alt_scroll_bot;
+    if (c == &g_con[g_active] && g_fb.fb)
+        repaint(c);
+}
+
 static void handle_csi(console_t *c, esc_t *e, char fin)
 {
     int n, m;
@@ -646,8 +692,15 @@ static void handle_csi(console_t *c, esc_t *e, char fin)
     case 'h': case 'l':  /* DEC private modes via '?' */
         if (e->private == '?') {
             for (int i = 0; i < e->nparams; i++) {
-                if (e->params[i] == 25)   /* DECTCEM: visible cursor */
+                int p = e->params[i];
+                if (p == 25)               /* DECTCEM: visible cursor */
                     c->cursor_on = (fin == 'h');
+                else if (p == 1049 || p == 1047 || p == 47) {
+                    if (fin == 'h')        /* alternate screen on */
+                        alt_screen_enter(c);
+                    else                   /* ... and back */
+                        alt_screen_exit(c);
+                }
             }
         }
         break;
@@ -701,7 +754,29 @@ static int esc_feed(console_t *c, uint8_t b)
             c->attrs = 0; c->cur_fg = 0; c->cur_bg = 0;
             c->cursor_on = 1;
             c->scroll_top = 0; c->scroll_bot = g_fb.rows - 1;
-            clear_console(c);
+            if (c->alt_screen)
+                alt_screen_exit(c);
+            else
+                clear_console(c);
+            return 1;
+        }
+        if (b == '7') {                   /* DECSC: save cursor + attrs */
+            e->state = ST_GROUND;
+            c->saved_cx = c->cx; c->saved_cy = c->cy;
+            c->saved_fg = c->cur_fg; c->saved_bg = c->cur_bg;
+            c->saved_attrs = c->attrs;
+            return 1;
+        }
+        if (b == '8') {                   /* DECRC: restore cursor + attrs */
+            e->state = ST_GROUND;
+            c->cx = c->saved_cx; c->cy = c->saved_cy;
+            c->cur_fg = (uint8_t)c->saved_fg; c->cur_bg = (uint8_t)c->saved_bg;
+            c->attrs = (uint8_t)c->saved_attrs;
+            refresh_cursor_cell(c, c->cx, c->cy);
+            return 1;
+        }
+        if (b == '=' || b == '>') {       /* DECKPAM/DECKPNM: keypad mode */
+            e->state = ST_GROUND;         /* no keypad here: ignore */
             return 1;
         }
         if (b == '(' || b == ')' || b == '*' || b == '+') {

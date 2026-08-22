@@ -27,6 +27,7 @@
 #include "panic.h"
 #include "kstring.h"
 #include "debugcon.h"
+#include "smp.h"
 
 /* switch.asm */
 extern void switch_context(uint64_t *save_rsp, uint64_t load_rsp);
@@ -48,7 +49,7 @@ extern void ret_to_user(void);
 #define MAX_ARGS      128
 #define MAX_ENVS      128
 #define ARG_BYTES     16384
-#define IMAGE_MAX     (8 * 1024 * 1024)
+#define IMAGE_MAX     (16 * 1024 * 1024)
 
 /* How many `#!` lines deep execve will chase an interpreter before giving up
  * with ELOOP.  Linux uses 4; a script whose interpreter is a script whose
@@ -65,12 +66,33 @@ static uint32_t g_argused;
 static char *g_args[MAX_ARGS + 1];
 static char *g_envs[MAX_ENVS + 1];
 
-static proc_t *g_current;
+/* The current process, one per core: schedule() parks the outgoing task's
+ * context in its own saved_rsp and stores the incoming one here. */
+#define g_current (cpu_self()->current)
+
 static int     g_next_pid = 1;
 
-/* The scheduler's own context: where switch_context parks the boot thread
- * (and where it returns to when there is nothing runnable at all). */
-static uint64_t g_sched_rsp;
+/* ---- EEVDF run queue --------------------------------------------------
+ * A binary min-heap of runnable processes keyed on virtual deadline,
+ * guarded by g_proc_lock -- the one lock every core can contend for, so it
+ * is held only for the few instructions of a heap step and never across a
+ * context switch (see schedule()). */
+static spinlock_t g_proc_lock;
+static proc_t    *g_rq[MAX_PROCS];
+static unsigned   g_rq_size;
+
+/* The global virtual clock, in ticks.  Advances by the time a process
+ * actually runs; an idle CPU advances nothing. */
+static uint64_t g_vtime;
+
+/* Default slice in ticks (SCHED_HZ = 100, so 50 ms per pick). */
+#define EEVDF_SLICE_TICKS 5
+
+/* spawn_init/fork/clone all finish a fresh process the same way; the
+ * SIGCONT/SIGKILL paths enqueue too (enqueue_fresh under g_proc_lock). */
+static void enqueue_fresh(proc_t *p);
+static void rq_remove(proc_t *p);
+static void proc_make_runnable(proc_t *p);
 
 /* Scratch buffer for reading executables.  One at a time, in kernel BSS. */
 static uint8_t g_image[IMAGE_MAX];
@@ -103,6 +125,13 @@ static proc_t *proc_alloc(void)
         p->tgid       = p->pid;      /* a fresh process is its own group leader */
         p->start_tick = timer_ticks();
         p->kstack_top = (uint64_t)(uintptr_t)g_kstacks[i] + KSTACK_SIZE;
+        /* EEVDF: the slice is fixed; vruntime/deadline are set when the
+         * process joins the run queue.  Fresh processes own no BKL and
+         * run nowhere yet. */
+        p->rq_index     = -1;
+        p->bkl_held     = 0;
+        p->on_cpu       = -1;
+        p->slice        = EEVDF_SLICE_TICKS;
         for (int f = 0; f < PROC_MAX_FD; f++)
             p->fds[f] = -1;
         /* Per-process memory bookkeeping musl expects the kernel to keep.
@@ -113,7 +142,6 @@ static proc_t *proc_alloc(void)
         p->brk            = USER_BRK_BASE;
         p->fs_base        = 0;
         p->clear_child_tid = 0;
-        p->nmmaps         = 0;
         /* Defaults for a process with no parent to inherit from; fork()
          * overwrites both from the parent a moment later. */
         strncpy(p->cwd, "/", GNUOS_PATH_MAX - 1);
@@ -156,6 +184,11 @@ static void fpu_load(uint8_t *area)
 void proc_init(void)
 {
     memset(g_procs, 0, sizeof(g_procs));
+    uint32_t gl, gh;
+    asm volatile("rdmsr" : "=a"(gl), "=d"(gh) : "c"((uint32_t)0xC0000101));
+    dbg_puts("PROC: gsbase=");
+    dbg_puts_hex(((uint64_t)gh << 32) | gl);
+    dbg_puts("\r\n");
     g_current = NULL;
     fpu_init_once();
 }
@@ -259,7 +292,8 @@ static uint64_t g_strptr[MAX_ARGS + MAX_ENVS];
 static uint64_t push_args(addrspace_t *as, uint64_t stack_top,
                           char *const argv[], int argc,
                           char *const envp[], int envc,
-                          uint64_t phdr, uint16_t phnum, uint64_t entry)
+                          uint64_t phdr, uint16_t phnum, uint64_t entry,
+                          uint64_t ldso_base)
 {
     uint64_t *arg_ptr = g_strptr;
     uint64_t *env_ptr = g_strptr + MAX_ARGS;
@@ -318,6 +352,18 @@ static uint64_t push_args(addrspace_t *as, uint64_t stack_top,
     if (!push_aux(as, &sp, AT_CLKTCK, SCHED_HZ))   return 0;
     if (!push_aux(as, &sp, AT_SECURE, 0))          return 0;
     if (!push_aux(as, &sp, AT_RANDOM, at_random))  return 0;
+    /* AT_BASE: the load address of the dynamic linker, if there is one.
+     * musl's dynlink derives its own base from this (falling back to
+     * AT_PHDR & -4096 when absent); a statically linked process has no
+     * linker and gets no entry, which is exactly the Linux behaviour. */
+    if (ldso_base) {
+        if (!push_aux(as, &sp, AT_BASE, ldso_base))  return 0;
+        dbg_puts("EXEC: pushed AT_BASE=");
+        dbg_puts_hex(ldso_base);
+        dbg_puts(" at sp=");
+        dbg_puts_hex(sp);
+        dbg_puts("\r\n");
+    }
     if (phnum) {
         if (!push_aux(as, &sp, AT_PHNUM, phnum))                return 0;
         if (!push_aux(as, &sp, AT_PHENT, ELF64_PHDR_SIZE))      return 0;
@@ -389,12 +435,49 @@ static int build_image(const char *path, char *const argv[], int argc,
     uint64_t entry = 0;
     uint64_t phdr = 0;
     uint16_t phnum = 0;
+    char interp[64];
     /* ENOEXEC, not EINVAL: "I read the file and it is not something I can
      * run" is a distinct answer from "your arguments were wrong", and bash
      * keys its fallback-to-shell-script behaviour off exactly this errno. */
-    if (load_executable(as, g_image, size, &entry, &phdr, &phnum) <= 0) {
+    if (load_executable(as, g_image, size, DYN_PROG_BASE, &entry, &phdr,
+                        &phnum, interp, sizeof interp) <= 0) {
         vmm_destroy(as);
         return -E_NOEXEC;
+    }
+
+    /* A PT_INTERP in the image means this is a dynamically linked program:
+     * the interpreter (ld-musl) is a second ELF, loaded at LDSO_BASE, and it
+     * -- not the main program -- receives the entry point.  The main
+     * program's own entry travels to it via AT_ENTRY; AT_BASE tells it where
+     * it lives.  Load the interpreter into the same fresh address space. */
+    uint64_t ldso_base = 0;
+    if (interp[0]) {
+        uint32_t isize = 0;
+        if (!vfs_read_all(interp, g_image, sizeof(g_image), &isize)) {
+            vmm_destroy(as);
+            return -E_NOENT;
+        }
+        uint64_t ientry = 0;
+        uint64_t iphdr = 0;
+        uint16_t iphnum = 0;
+        if (load_executable(as, g_image, isize, LDSO_BASE, &ientry, &iphdr,
+                            &iphnum, NULL, 0) <= 0) {
+            vmm_destroy(as);
+            return -E_NOEXEC;
+        }
+        ldso_base = LDSO_BASE;
+        entry = ientry;             /* the process starts in the linker */
+        dbg_puts("EXEC: dyn interp=");
+        dbg_puts(interp);
+        dbg_puts(" ientry=");
+        dbg_puts_hex(ientry);
+        dbg_puts(" ldso_base=");
+        dbg_puts_hex(ldso_base);
+        dbg_puts(" main_entry=");
+        dbg_puts_hex(entry);
+        dbg_puts(" main_phdr=");
+        dbg_puts_hex(phdr);
+        dbg_puts("\r\n");
     }
 
     if (!vmm_alloc_range(as, USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE,
@@ -404,10 +487,36 @@ static int build_image(const char *path, char *const argv[], int argc,
     }
 
     uint64_t sp = push_args(as, USER_STACK_TOP - 16, argv, argc, envp, envc,
-                            phdr, phnum, entry);
+                            phdr, phnum, entry, ldso_base);
     if (!sp) {
         vmm_destroy(as);
         return -E_NOMEM;
+    }
+
+    /* DEBUG: dump the user stack words from sp upward so the auxv layout can
+     * be verified against what musl's _dlstart_c expects. */
+    dbg_puts("EXEC: stack dump argc=");
+    dbg_puts_dec((uint32_t)argc);
+    dbg_puts(" envc=");
+    dbg_puts_dec((uint32_t)envc);
+    dbg_puts(" sp=");
+    dbg_puts_hex(sp);
+    dbg_puts("\r\n");
+    {
+        uint64_t addr = sp;
+        for (int w = 0; w < 24; w++) {
+            uint64_t pa = vmm_resolve(as, addr);
+            uint32_t val = 0;
+            if (pa) {
+                const uint8_t *k = (const uint8_t *)pmm_virt(pa);
+                val = *(const uint32_t *)(k + (addr & 0xFFF));
+            }
+            dbg_puts_hex((uint64_t)addr);
+            dbg_puts(": ");
+            dbg_puts_hex((uint64_t)val);
+            dbg_puts("\r\n");
+            addr += 8;
+        }
     }
 
     *out_as    = as;
@@ -500,7 +609,7 @@ int proc_spawn_init(const char *path)
     regs_t f;
     make_user_frame(&f, entry, sp);
     p->saved_rsp = build_startup_stack(p, &f);
-    p->state     = PROC_READY;
+    proc_make_runnable(p);
 
     dbg_puts("PROC: init is pid ");
     dbg_puts_dec((uint32_t)p->pid);
@@ -606,9 +715,6 @@ int proc_fork(regs_t *r)
     child->brk             = parent->brk;
     child->fs_base         = parent->fs_base;
     child->clear_child_tid = parent->clear_child_tid;
-    child->nmmaps          = parent->nmmaps;
-    for (int m = 0; m < parent->nmmaps; m++)
-        child->mmaps[m] = parent->mmaps[m];
     /* The current directory and the file-creation mask are inherited too;
      * that is what lets a shell `cd` once and have every command it forks
      * start there. */
@@ -633,7 +739,7 @@ int proc_fork(regs_t *r)
     regs_t f = *r;
     f.rax = 0;
     child->saved_rsp = build_startup_stack(child, &f);
-    child->state     = PROC_READY;
+    proc_make_runnable(child);
 
     return child->pid;
 }
@@ -710,9 +816,6 @@ int proc_clone(regs_t *r)
     child->clear_child_tid = (flags & CLONE_CHILD_CLEARTID)
                                  ? (uintptr_t)child_tid
                                  : parent->clear_child_tid;
-    child->nmmaps      = parent->nmmaps;
-    for (int m = 0; m < parent->nmmaps; m++)
-        child->mmaps[m] = parent->mmaps[m];
     strncpy(child->cwd, parent->cwd, GNUOS_PATH_MAX - 1);
     child->umask       = parent->umask;
     inherit_creds(child, parent);
@@ -746,7 +849,7 @@ int proc_clone(regs_t *r)
     if (child_stack)
         f.rsp = (uint64_t)child_stack;
     child->saved_rsp = build_startup_stack(child, &f);
-    child->state     = PROC_READY;
+    proc_make_runnable(child);
 
     return child->pid;
 }
@@ -994,7 +1097,10 @@ int proc_execve(const char *path, char *const argv[], char *const envp[],
     p->brk             = USER_BRK_BASE;
     p->fs_base         = 0;
     p->clear_child_tid = 0;
-    p->nmmaps          = 0;
+    /* execve starts a fresh program image, so drop the old address space's
+     * mmap records; the page tables are rebuilt for the new binary. */
+    if (p->as)
+        p->as->nmmaps = 0;
 
     /*
      * Every caught signal goes back to its default action.  This is not a
@@ -1153,6 +1259,11 @@ void proc_exit_group(int status)
      * it -- which must not happen while we are still running on it.
      */
     if (leader != p) {
+        /* The leader will never run again; if it is sitting in the run
+         * queue, take it out before zombifying it. */
+        spin_lock(&g_proc_lock);
+        rq_remove(leader);
+        spin_unlock(&g_proc_lock);
         proc_teardown(leader, 0);
         leader->exit_status = status;
         leader->term_sig    = p->term_sig;
@@ -1358,7 +1469,11 @@ int proc_signal(proc_t *p, int sig)
             if (p->traced && p->ptrace_stopped)
                 return 0;
             p->reported = 0;
-            p->state    = PROC_READY;
+            /* A stopped process is not queued; put it back with a fresh
+             * slice, exactly like a wake. */
+            spin_lock(&g_proc_lock);
+            enqueue_fresh(p);
+            spin_unlock(&g_proc_lock);
         }
         return 0;
     }
@@ -1378,8 +1493,11 @@ int proc_signal(proc_t *p, int sig)
      * stopped state. */
     if (p->state == PROC_BLOCKED)
         sched_wake(p);
-    else if (p->state == PROC_STOPPED && sig == SIGKILL)
-        p->state = PROC_READY;
+    else if (p->state == PROC_STOPPED && sig == SIGKILL) {
+        spin_lock(&g_proc_lock);
+        enqueue_fresh(p);
+        spin_unlock(&g_proc_lock);
+    }
 
     return 0;
 }
@@ -1521,87 +1639,272 @@ p->sig_pending &= ~SIGMASK(sig);
     }
 }
 
-/* ---- scheduler -------------------------------------------------------- */
-static proc_t *pick_next(void)
-{
-    /* Start scanning after the current slot so nobody starves. */
-    int start = 0;
-    if (g_current)
-        start = (int)(g_current - g_procs) + 1;
+/* ---- EEVDF run queue -------------------------------------------------- */
+/* A binary min-heap of runnable processes keyed on virtual deadline.  All
+ * queue operations run with g_proc_lock held (their callers say so). */
 
-    for (int i = 0; i < MAX_PROCS; i++) {
-        proc_t *p = &g_procs[(start + i) % MAX_PROCS];
-        if (p->state == PROC_READY)
-            return p;
+static int rq_before(proc_t *a, proc_t *b)
+{
+    if (a->deadline != b->deadline)
+        return a->deadline < b->deadline;
+    return a->pid < b->pid;                 /* deterministic tie-break */
+}
+
+static void rq_sift_up(unsigned i)
+{
+    while (i > 0) {
+        unsigned parent = (i - 1) / 2;
+        if (!rq_before(g_rq[i], g_rq[parent]))
+            break;
+        proc_t *t = g_rq[i];
+        g_rq[i] = g_rq[parent];
+        g_rq[parent] = t;
+        g_rq[i]->rq_index = (int)i;
+        g_rq[parent]->rq_index = (int)parent;
+        i = parent;
     }
-    return NULL;
+}
+
+static void rq_sift_down(unsigned i)
+{
+    for (;;) {
+        unsigned l = 2 * i + 1;
+        unsigned r = 2 * i + 2;
+        unsigned best = i;
+        if (l < g_rq_size && rq_before(g_rq[l], g_rq[best]))
+            best = l;
+        if (r < g_rq_size && rq_before(g_rq[r], g_rq[best]))
+            best = r;
+        if (best == i)
+            break;
+        proc_t *t = g_rq[i];
+        g_rq[i] = g_rq[best];
+        g_rq[best] = t;
+        g_rq[i]->rq_index = (int)i;
+        g_rq[best]->rq_index = (int)best;
+        i = best;
+    }
+}
+
+static void rq_push(proc_t *p)
+{
+    p->rq_index = (int)g_rq_size;
+    g_rq[g_rq_size++] = p;
+    rq_sift_up(g_rq_size - 1);
+}
+
+static proc_t *rq_peek(void)
+{
+    return g_rq_size ? g_rq[0] : NULL;
+}
+
+static proc_t *rq_pop(void)
+{
+    if (!g_rq_size)
+        return NULL;
+    proc_t *top = g_rq[0];
+    proc_t *last = g_rq[--g_rq_size];
+    top->rq_index = -1;
+    if (g_rq_size) {
+        g_rq[0] = last;
+        last->rq_index = 0;
+        rq_sift_down(0);
+    }
+    return top;
+}
+
+/* Take a process out of the heap, wherever it sits.  Caller holds
+ * g_proc_lock; a no-op for a process that is not queued. */
+static void rq_remove(proc_t *p)
+{
+    if (p->rq_index < 0)
+        return;
+    unsigned i = (unsigned)p->rq_index;
+    proc_t *last = g_rq[--g_rq_size];
+    p->rq_index = -1;
+    if (i == g_rq_size)                 /* p was the last element */
+        return;
+    g_rq[i] = last;
+    last->rq_index = (int)i;
+    if (i > 0 && rq_before(last, g_rq[(i - 1) / 2]))
+        rq_sift_up(i);
+    else
+        rq_sift_down(i);
+}
+
+/* Put a process on the run queue with a fresh slice.  Caller holds
+ * g_proc_lock.  EEVDF: a waking, continued or brand-new task's lag is
+ * reset -- it enters as if newly runnable at the current virtual time. */
+static void enqueue_fresh(proc_t *p)
+{
+    p->vruntime = g_vtime;
+    p->deadline = g_vtime + p->slice;
+    p->state    = PROC_READY;
+    if (p->rq_index < 0)
+        rq_push(p);
+}
+
+/* Make a brand-new process runnable.  Used by fork/clone/init so all three
+ * share the "fresh task" rules. */
+static void proc_make_runnable(proc_t *p)
+{
+    spin_lock(&g_proc_lock);
+    enqueue_fresh(p);
+    spin_unlock(&g_proc_lock);
 }
 
 /*
- * Hand the CPU to the next runnable process.  Called both voluntarily
- * (sched_yield) and from the timer interrupt.
+ * Hand the current CPU to the next runnable process.  Called voluntarily
+ * (sched_yield, sched_block) and from the timer interrupt (sched_tick).
+ * Returns 1 if the CPU context was switched away (and this frame resumed
+ * later), 0 if nothing was runnable and the caller may carry on.
+ *
+ * g_proc_lock is held *across* switch_context and released on the resume
+ * path, Xv6-style: the parking side never runs again until another core
+ * picks its process, so the release is always performed by whoever comes
+ * back.  That closes the race where a task marked READY but not yet saved
+ * would be picked by another core -- the picker cannot take the lock until
+ * the switch that saved it has finished.
  */
-static void schedule(void)
+static int schedule(void)
 {
-    proc_t *prev = g_current;
-    proc_t *next = pick_next();
+    spin_lock(&g_proc_lock);
 
-    /* Park the outgoing task's FPU/SSE registers.  We must do this whenever
-     * we leave a real process -- including one that voluntarily blocked
-     * (sched_block() sets it PROC_BLOCKED *before* calling schedule()) -- so
-     * its XMM state is not lost.  The idle thread has g_current == NULL and
-     * owns no FPU state, so it is skipped.  FXSAVE copies the live FPU into
-     * the buffer without disturbing the live state, so returning early
-     * (prev == next) simply keeps running with the same registers. */
-    if (prev)
-        fpu_save(prev->fpu);
+    proc_t *prev = cpu_self()->current;
 
-    if (!next) {
-        /* Nothing else is runnable.  If the caller is still running it may
-         * simply carry on -- bouncing to the idle thread here would park a
-         * perfectly runnable task and hang the machine. */
-        if (!prev || prev->state == PROC_RUNNING)
-            return;
-        g_current = NULL;
-        vmm_switch_kernel();
-        uint64_t *save = &prev->saved_rsp;
-        switch_context(save, g_sched_rsp);
-        return;
+    /* Account the outgoing task's CPU time.  Virtual time only advances
+     * while a process actually runs; the idle context (prev == NULL)
+     * contributes nothing. */
+    if (prev) {
+        uint64_t now  = timer_ticks();
+        uint64_t used = now - prev->last_run_tick;
+        prev->vruntime += used;
+        g_vtime        += used;
+        prev->last_run_tick = now;
+        if (prev->state == PROC_RUNNING) {
+            prev->state = PROC_READY;
+            /* A slice that has been fully consumed earns a fresh deadline
+             * when it goes back on the queue; one that still has time left
+             * keeps it, so the remainder is owed to the task (EEVDF). */
+            if (prev->vruntime >= prev->deadline)
+                prev->deadline = prev->vruntime + prev->slice;
+            rq_push(prev);
+        }
     }
 
-    if (prev == next && prev->state == PROC_RUNNING)
-        return;
+    proc_t *next = rq_pop();
 
-    if (prev && prev->state == PROC_RUNNING)
-        prev->state = PROC_READY;
+    if (!next) {
+        /* Nothing runnable.  A caller that is still RUNNING may simply
+         * carry on; a blocked one parks this CPU's context in the idle
+         * slot until something wakes it. */
+        if (!prev || prev->state == PROC_RUNNING) {
+            spin_unlock(&g_proc_lock);
+            return 0;
+        }
+        if (prev->bkl_held) {
+            prev->bkl_held = 0;
+            bkl_release();
+        }
+        cpu_self()->current = NULL;
+        vmm_switch_kernel();
+        switch_context(&prev->saved_rsp, cpu_self()->sched_rsp);
+        spin_unlock(&g_proc_lock);       /* resumed: we are the idle context */
+        return 1;
+    }
 
     next->state = PROC_RUNNING;
-    g_current   = next;
+    if (next == prev) {
+        /* The queue held nothing else: we pushed and re-picked ourselves.
+         * Nothing to load, nothing to park. */
+        spin_unlock(&g_proc_lock);
+        return 1;
+    }
 
-    /* A trap from ring 3 has to land on this process's kernel stack. */
+    next->deadline      = next->vruntime + next->slice;  /* fresh slice */
+    next->last_run_tick = timer_ticks();
+    next->on_cpu        = cpu_self()->id;
+    cpu_self()->current = next;
+
+    /* Park the outgoing FPU state, then switch the stack, the TLS base,
+     * the page tables and the FPU of the incoming task. */
+    if (prev)
+        fpu_save(prev->fpu);
     tss_set_rsp0(next->kstack_top);
-    proc_set_fs(next);                 /* restore this task's TLS base */
+    proc_set_fs(next);
     vmm_switch(next->as);
-    fpu_load(next->fpu);               /* restore this task's XMM registers */
+    fpu_load(next->fpu);
 
-    uint64_t *save = prev ? &prev->saved_rsp : &g_sched_rsp;
+    /* A parked process never owns the big kernel lock: whoever resumes it
+     * re-takes it (sched_tick/sched_block/sched_yield all do).  Dropping
+     * it here is what stops one core's timer interrupt from spinning
+     * forever on a lock a descheduled process is holding. */
+    if (prev && prev->bkl_held) {
+        prev->bkl_held = 0;
+        bkl_release();
+    }
+
+    uint64_t *save = prev ? &prev->saved_rsp : &cpu_self()->sched_rsp;
     switch_context(save, next->saved_rsp);
+    spin_unlock(&g_proc_lock);           /* resumed: inherit this core's lock */
+    return 1;
+}
+
+/* Drop the BKL before parking this process's kernel execution and re-take
+ * it on resume, so the lock never rides a descheduled context. */
+static void bkl_leave_for_switch(proc_t *p)
+{
+    if (p && p->bkl_held) {
+        p->bkl_held = 0;
+        bkl_release();
+    }
+}
+
+static void bkl_return_from_switch(void)
+{
+    proc_t *p = cpu_self()->current;
+    if (p) {
+        bkl_acquire();
+        p->bkl_held = 1;
+    }
 }
 
 void sched_yield(void)
 {
     uint64_t flags;
     asm volatile("pushfq; pop %0; cli" : "=r"(flags));
+
+    bkl_leave_for_switch(cpu_self()->current);
     schedule();
+    bkl_return_from_switch();
+
     if (flags & 0x200)
         asm volatile("sti");
 }
 
 void sched_tick(void)
 {
-    /* Already inside an interrupt gate, so interrupts are off. */
-    if (g_current)
+    /* Already inside an interrupt gate, so interrupts are off.  The BKL was
+     * taken on entry from ring 3 (see isr_dispatch); a preempted task's
+     * frame parks without it and re-takes it on resume below. */
+    proc_t *cur = cpu_self()->current;
+    if (!cur)
+        return;
+
+    spin_lock(&g_proc_lock);
+    uint64_t now  = timer_ticks();
+    cur->vruntime += now - cur->last_run_tick;
+    g_vtime       += now - cur->last_run_tick;
+    cur->last_run_tick = now;
+    proc_t *head  = rq_peek();
+    int preempt   = (cur->vruntime >= cur->deadline) ||    /* slice gone */
+                    (head && head->deadline < cur->deadline); /* owed task */
+    spin_unlock(&g_proc_lock);
+
+    if (preempt) {
         schedule();
+        bkl_return_from_switch();
+    }
 }
 
 void sched_block(wait_reason_t why)
@@ -1609,10 +1912,13 @@ void sched_block(wait_reason_t why)
     uint64_t flags;
     asm volatile("pushfq; pop %0; cli" : "=r"(flags));
 
-    if (g_current) {
-        g_current->state       = PROC_BLOCKED;
-        g_current->wait_reason = why;
+    proc_t *cur = cpu_self()->current;
+    if (cur) {
+        cur->state       = PROC_BLOCKED;
+        cur->wait_reason = why;
+        bkl_leave_for_switch(cur);
         schedule();
+        bkl_return_from_switch();
     }
 
     if (flags & 0x200)
@@ -1621,32 +1927,41 @@ void sched_block(wait_reason_t why)
 
 void sched_block_irqoff(wait_reason_t why)
 {
-    if (!g_current)
+    proc_t *cur = cpu_self()->current;
+    if (!cur)
         return;
-    g_current->state       = PROC_BLOCKED;
-    g_current->wait_reason = why;
+    cur->state       = PROC_BLOCKED;
+    cur->wait_reason = why;
+    bkl_leave_for_switch(cur);
     schedule();
+    bkl_return_from_switch();
 }
 
 void sched_block_timeout(wait_reason_t why, uint64_t ticks)
 {
-    proc_t *p = g_current;
+    proc_t *p = cpu_self()->current;
     if (!p)
         return;
     p->state       = PROC_BLOCKED;
     p->wait_reason = why;
     p->wake_tick   = timer_ticks() + (ticks ? ticks : 1);
+    bkl_leave_for_switch(p);
     schedule();
+    bkl_return_from_switch();
     p->wake_tick   = 0;
 }
 
 void sched_wake(proc_t *p)
 {
-    if (p && p->state == PROC_BLOCKED) {
+    if (!p)
+        return;
+    spin_lock(&g_proc_lock);
+    if (p->state == PROC_BLOCKED) {
         p->wait_reason = WAIT_NONE;
         p->wake_tick   = 0;
-        p->state       = PROC_READY;
+        enqueue_fresh(p);
     }
+    spin_unlock(&g_proc_lock);
 }
 
 void sched_expire_timeouts(void)
@@ -1678,9 +1993,9 @@ void sched_wake_reason(wait_reason_t why)
 }
 
 /*
- * The boot thread becomes the idle loop.  It never dies: whenever every
- * process is blocked, schedule() comes back here and we halt until the next
- * interrupt makes somebody runnable again.
+ * The boot thread of every core becomes the same idle loop.  It never
+ * dies: whenever every process is blocked, schedule() comes back here and
+ * we halt until the next interrupt makes somebody runnable again.
  */
 void sched_start(void)
 {
@@ -1688,12 +2003,10 @@ void sched_start(void)
 
     for (;;) {
         asm volatile("cli");
-        if (pick_next()) {
-            schedule();
-            continue;
+        if (!schedule()) {
+            /* sti and hlt must be adjacent: sti only unmasks after the next
+             * instruction, which closes the wake-up race. */
+            asm volatile("sti; hlt");
         }
-        /* sti and hlt must be adjacent: sti only unmasks after the next
-         * instruction, which closes the wake-up race. */
-        asm volatile("sti; hlt");
     }
 }

@@ -56,11 +56,10 @@ void gdt_init(void);
  * for every AP).  The TSS's RSP0 is pointed at the CPU's own kernel stack. */
 void gdt_build(struct cpu *c);
 
-/* Point TSS.RSP0 at the stack a ring-3 -> ring-0 trap should switch to. */
+/* Point the *current* CPU's TSS.RSP0 at the stack a ring-3 -> ring-0 trap
+ * should switch to.  The same value is mirrored in the per-CPU cpu_t slot
+ * isr.asm's syscall_entry reads: the `syscall` instruction never looks at
+ * the TSS, so it loads RSP from there. */
 void tss_set_rsp0(uint64_t rsp0);
-
-/* The same value, mirrored where isr.asm's syscall_entry can reach it: the
- * `syscall` instruction never looks at the TSS, so it loads RSP from here. */
-extern uint64_t g_kernel_rsp0;
 
 #endif

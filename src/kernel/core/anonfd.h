@@ -7,6 +7,10 @@
 #include <stdint.h>
 #include "vfs.h"
 
+/* Attach an anonymous-node handle to the current process, honouring the
+ * CLOEXEC bit.  Shared by memfd/eventfd and timerfd. */
+int anon_bind(int h, int cloexec);
+
 int64_t sys_memfd_create(uint64_t name, uint64_t flags);
 int64_t sys_eventfd(uint64_t count);
 int64_t sys_eventfd2(uint64_t count, uint64_t flags);

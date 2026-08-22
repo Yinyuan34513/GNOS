@@ -70,6 +70,17 @@ typedef struct addrspace {
      * reference out destroys the space.
      */
     int      refs;
+
+    /*
+     * Anonymous/file mappings handed out in this address space, shared by
+     * every thread that runs on it (clone(CLONE_VM) shares the page tables
+     * and these records).  Keeping them here -- not per-proc -- means a
+     * mmap done by one thread is visible to the fault handler when another
+     * thread touches it, and munmap drops the record for all of them so a
+     * freed region is never lazily re-mapped as a zeroed page.
+     */
+    struct { uint64_t base; uint64_t size; } mmaps[128];
+    int      nmmaps;
 } addrspace_t;
 
 /* Record the kernel's own PML4 so new address spaces can inherit its upper

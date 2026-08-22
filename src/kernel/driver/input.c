@@ -376,11 +376,27 @@ static void kbd_enable_aux(void)
     outb(KBD_CMD, 0xA8);                 /* enable auxiliary port */
     while (inb(KBD_STATUS) & ST_INPT_BUF)
         ;
-    outb(KBD_CMD, 0x60);                 /* write command byte */
+    /*
+     * Read the 8042 command byte, then write it back with the two interrupt
+     * enable bits set: bit0 = keyboard IRQ 1, bit1 = mouse IRQ 12.
+     *
+     * The previous code issued 0x60 ("write command byte") and then *read*
+     * the data port, which returns whatever happens to be there (typically
+     * garbage), ORed 0x02 into that and wrote it back.  The read cleared
+     * bit0 in the process, so the keyboard IRQ was silently disabled for the
+     * whole session -- the "login cannot accept input" symptom.  Reading the
+     * command byte is a separate 0x20 command; 0x60 is write-only.
+     */
+    outb(KBD_CMD, 0x20);                 /* read command byte */
     while (inb(KBD_STATUS) & ST_INPT_BUF)
         ;
     uint8_t cmd = inb(KBD_DATA);
-    cmd |= 0x02;                          /* enable IRQ 12 */
+    cmd |= 0x03;                          /* enable IRQ 1 (kbd) + IRQ 12 (mouse) */
+    while (inb(KBD_STATUS) & ST_INPT_BUF)
+        ;
+    outb(KBD_CMD, 0x60);                 /* write command byte */
+    while (inb(KBD_STATUS) & ST_INPT_BUF)
+        ;
     outb(KBD_DATA, cmd);
     while (inb(KBD_STATUS) & ST_INPT_BUF)
         ;
@@ -422,8 +438,8 @@ void input_init(void)
     kbd_enable_aux();
     irq_install(12, mouse_irq);
 
-    if (vfs_register_dev("input/event0", &g_evdev_ops, &g_kbd_dev) != 0 ||
-        vfs_register_dev("input/event1", &g_evdev_ops, &g_mouse_dev) != 0) {
+    if (vfs_register_devnum("input/event0", &g_evdev_ops, &g_kbd_dev, 13, 64) != 0 ||
+        vfs_register_devnum("input/event1", &g_evdev_ops, &g_mouse_dev, 13, 65) != 0) {
         dbg_puts("INPUT: failed to publish /dev/input/eventN\n");
         return;
     }

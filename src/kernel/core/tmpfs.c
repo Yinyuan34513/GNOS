@@ -40,7 +40,11 @@ struct tmpfs_node {
     struct tmpfs_node *parent;
     struct tmpfs_node *children;     /* linked list of children */
     struct tmpfs_node *next;         /* sibling link */
+    int              refs;          /* 1 = the tree, +1 per open fd */
+    int              unlinked;      /* detached; lives until last fd closes */
 };
+
+static int tmpfs_node_setsize(struct tmpfs_node *n, uint64_t len);
 
 struct tmpfs_inst {
     struct tmpfs_node *root;
@@ -78,6 +82,7 @@ static struct tmpfs_node *node_alloc(void)
     int idx = g_free_stack[--g_free_sp];
     struct tmpfs_node *n = &g_pool[idx];
     memset(n, 0, sizeof *n);
+    n->refs = 1;                  /* the directory tree owns one reference */
     return n;
 }
 
@@ -279,7 +284,64 @@ static int32_t tmpfs_dir_write(struct vfs_node *n, uint64_t off,
 }
 
 static const vfs_ops_t g_tmpfs_dir_ops  = { .read = tmpfs_dir_read, .write = tmpfs_dir_write };
-static const vfs_ops_t g_tmpfs_file_ops = { .read = tmpfs_read,      .write = tmpfs_write };
+/* ---- open-file references (POSIX shm semantics) -----------------------
+ * A vfs_file_t holds a copy of the resolved node whose priv points back at
+ * the tmpfs_node.  Opening a file takes a reference and the last close
+ * (release) drops it, so an unlinked-but-still-open object -- exactly what
+ * shm_open + shm_unlink + ftruncate + mmap produces -- keeps its node and
+ * data until every fd has gone away. */
+
+static int tmpfs_node_truncate(vfs_node_t *n, uint64_t len)
+{
+    return tmpfs_node_setsize((struct tmpfs_node *)n->priv, len);
+}
+
+static void tmpfs_node_release(vfs_node_t *n)
+{
+    struct tmpfs_node *t = (struct tmpfs_node *)n->priv;
+    if (!t)
+        return;
+    if (--t->refs == 0 && t->unlinked)
+        node_free(t);
+}
+
+/* Does this resolved node name a tmpfs file?  (fchmod/ftruncate by fd need
+ * to know so they can act on the node directly instead of by path, which
+ * breaks for an unlinked object.) */
+int tmpfs_is_file_node(const vfs_node_t *n)
+{
+    return n && n->ops == &g_tmpfs_file_ops;
+}
+
+/* Take a reference on a resolved tmpfs file node, for the open fd about to
+ * be created from it.  The ops check is what keeps this from touching the
+ * priv of every other node kind: device drivers and the like carry their
+ * own data in priv, and writing a refcount into that would corrupt it. */
+void tmpfs_retain(const vfs_node_t *n)
+{
+    if (!tmpfs_is_file_node(n))
+        return;
+    struct tmpfs_node *t = (struct tmpfs_node *)n->priv;
+    if (t)
+        t->refs++;
+}
+
+/* The live size of a resolved tmpfs file node.  An fd's vfs_node copy is
+ * frozen at open time, but ftruncate (and the shared-memory keymap dance
+ * where the file is unlinked) can change the real size afterwards, so mmap
+ * and stat read this instead of the stale copy. */
+uint64_t tmpfs_file_size(const vfs_node_t *n)
+{
+    struct tmpfs_node *t = (struct tmpfs_node *)n->priv;
+    return t ? t->size : 0;
+}
+
+static const vfs_ops_t g_tmpfs_file_ops = {
+    .read     = tmpfs_read,
+    .write    = tmpfs_write,
+    .truncate = tmpfs_node_truncate,
+    .release  = tmpfs_node_release,
+};
 
 /* ---- resolve / readdir ------------------------------------------------ */
 int tmpfs_resolve(tmpfs_t *fs, const char *rel, vfs_node_t *out)
@@ -404,7 +466,13 @@ int tmpfs_unlink(tmpfs_t *fs, const char *rel)
     if (n->kind == VFS_DIR)
         return -E_ISDIR;          /* use rmdir for directories */
     detach(parent, n);
-    node_free(n);
+    /* POSIX: an unlinked file lives until the last fd referencing it closes
+     * (that is what makes shm_open + unlink + ftruncate work).  The tree
+     * ref drops now; the file refs drop when their fds close. */
+    if (--n->refs == 0)
+        node_free(n);
+    else
+        n->unlinked = 1;
     return 0;
 }
 
@@ -492,6 +560,13 @@ int tmpfs_setsize(tmpfs_t *fs, const char *rel, uint64_t len)
     struct tmpfs_node *n = walk(fs->root, rel);
     if (!n)
         return -E_NOENT;
+    return tmpfs_node_setsize(n, len);
+}
+
+/* Resize a tmpfs file by node, not by path: ftruncate(2) on a shared-memory
+ * object must work after the object was unlinked but is still open. */
+int tmpfs_node_setsize(struct tmpfs_node *n, uint64_t len)
+{
     if (n->kind == VFS_DIR)
         return -E_ISDIR;
     if (n->kind != VFS_FILE)

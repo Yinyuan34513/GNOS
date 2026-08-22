@@ -77,7 +77,7 @@
 
 /* ---- devices ----------------------------------------------------------- */
 #define MAX_DISKS   4      /* two channels, master and slave on each */
-#define MAX_PARTS   4      /* an MBR has four primary entries and no more */
+#define MAX_PARTS   16     /* MBR has four; GPT commonly has 128, we take the first sixteen */
 
 typedef struct {
     uint16_t io;           /* command block base    */
@@ -425,6 +425,7 @@ static int32_t bdev_write(vfs_node_t *n, uint64_t off, const void *buf,
 #define BLKGETSIZE64  0x80081272
 
 static int ata_scan_partitions(int disk);
+static int ata_scan_gpt(int disk);
 
 static int32_t bdev_ioctl(vfs_node_t *n, uint64_t cmd, uint64_t arg)
 {
@@ -475,25 +476,42 @@ static const vfs_ops_t g_bdev_ops = {
 
 /* ---- the partition table ----------------------------------------------- */
 /*
- * A classic MBR: 446 bytes of boot code, four 16-byte partition entries, and
- * the two-byte 0xAA55 signature.  Each entry is
+ * The partition table, MBR first.  A classic MBR: 446 bytes of boot code,
+ * four 16-byte partition entries, and the two-byte 0xAA55 signature.  Each
+ * entry is
  *
  *   0  status (0x80 = bootable)
  *   4  type   (0x00 = unused, 0x83 = Linux, 0xEE = protective GPT)
  *   8  first LBA, little-endian
  *  12  sector count, little-endian
  *
- * GPT is not handled.  A GPT disk presents a single type-0xEE partition
- * covering the whole device, which this code will publish as sda1 -- wrong,
- * but visibly wrong rather than silently ignored.
+ * A GPT disk is detected through its protective MBR entry (type 0xEE):
+ * the real table then lives in the GPT header at LBA 1 and the entry array
+ * it points to.  Only the type GUID is inspected (all-zero = empty slot);
+ * CRC32 checking is skipped, matching the "small and trusting" style of the
+ * rest of this kernel.
  */
 #define MBR_SIG_OFF   510
 #define MBR_PART_OFF  446
+#define GPT_SIG_OFF   0       /* "EFI PART" at the top of the LBA-1 header */
+#define GPT_ENTRY_LBA 72      /* offset of the partition-entry array LBA */
+#define GPT_ENTRY_NUM 80      /* number of entries */
+#define GPT_ENTRY_SZ  84      /* size of one entry, always >= 128 */
+#define GPT_ENTRY_MIN 128
+#define GPT_TYPE_GUID 0       /* 16-byte type GUID at the top of an entry */
+#define GPT_ENTRY_FIRST 32    /* first LBA of the partition */
+#define GPT_ENTRY_LAST  40    /* last LBA of the partition */
+#define GPT_PROTECTIVE  0xEE  /* MBR type announcing a GPT disk */
 
 static uint32_t rd32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t rd64(const uint8_t *p)
+{
+    return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
 }
 
 static void part_name(char *dst, const char *disk, int idx)
@@ -503,8 +521,13 @@ static void part_name(char *dst, const char *disk, int idx)
         dst[i] = disk[i];
         i++;
     }
-    dst[i++] = (char)('1' + idx);
-    dst[i]   = 0;
+    if (idx < 9)
+        dst[i++] = (char)('1' + idx);
+    else {
+        dst[i++] = (char)('1' + idx / 10);
+        dst[i++] = (char)('0' + idx % 10);
+    }
+    dst[i] = 0;
 }
 
 /*
@@ -533,6 +556,10 @@ static int ata_scan_partitions(int disk)
         return -E_IO;
     if (mbr[MBR_SIG_OFF] != 0x55 || mbr[MBR_SIG_OFF + 1] != 0xAA)
         return 0;                      /* unpartitioned; not an error */
+
+    /* A protective MBR entry (type 0xEE) means the real table is GPT. */
+    if (mbr[MBR_PART_OFF + 4] == GPT_PROTECTIVE)
+        return ata_scan_gpt(disk);
 
     int found = 0;
     for (int i = 0; i < MAX_PARTS; i++) {
@@ -572,6 +599,82 @@ static int ata_scan_partitions(int disk)
         dbg_puts_dec(start);
         dbg_puts(" sectors=");
         dbg_puts_dec(count);
+        dbg_puts("\n");
+    }
+    return found;
+}
+
+/*
+ * Publish the partitions a GPT table declares.  The header at LBA 1 carries
+ * the "EFI PART" signature and the location of the entry array; each entry
+ * is 128 bytes of which we use the type GUID (all zero = unused slot) and
+ * the first/last LBA.  Entries may straddle sectors, so each one is read
+ * through the sector containing its start.
+ */
+static int ata_scan_gpt(int disk)
+{
+    ata_bdev_t *whole = &g_bdevs[disk];
+
+    uint8_t hdr[ATA_SECTOR];
+    if (ata_read_sector(whole->disk, whole->lba0 + 1, hdr) < 0)
+        return -E_IO;
+    if (memcmp(hdr + GPT_SIG_OFF, "EFI PART", 8) != 0)
+        return 0;                      /* protective MBR but no GPT: ignore */
+
+    uint64_t entry_lba = rd64(hdr + GPT_ENTRY_LBA);
+    uint32_t nentries  = rd32(hdr + GPT_ENTRY_NUM);
+    uint32_t entry_sz  = rd32(hdr + GPT_ENTRY_SZ);
+    if (entry_lba == 0 || nentries == 0 || entry_sz < GPT_ENTRY_MIN)
+        return 0;
+    if (nentries > MAX_PARTS)
+        nentries = MAX_PARTS;
+
+    int found = 0;
+    for (uint32_t i = 0; i < nentries; i++) {
+        uint64_t lba = entry_lba + (uint64_t)i * entry_sz / ATA_SECTOR;
+        uint32_t off = (uint32_t)((uint64_t)i * entry_sz % ATA_SECTOR);
+
+        uint8_t ent[ATA_SECTOR];
+        if (ata_read_sector(whole->disk, whole->lba0 + lba, ent) < 0)
+            continue;
+
+        const uint8_t *e   = ent + off;
+        const uint8_t *guid = e + GPT_TYPE_GUID;
+        int empty = 1;
+        for (int g = 0; g < 16; g++)
+            if (guid[g]) { empty = 0; break; }
+        if (empty)
+            continue;
+
+        uint64_t first = rd64(e + GPT_ENTRY_FIRST);
+        uint64_t last  = rd64(e + GPT_ENTRY_LAST);
+        if (!first || last < first)
+            continue;
+        if (first >= whole->nsect || last >= whole->nsect)
+            continue;
+
+        uint64_t count = last - first + 1;
+        ata_bdev_t *p = part_slot(disk, i);
+        p->disk    = whole->disk;
+        p->lba0    = whole->lba0 + first;
+        p->nsect   = count;
+        p->is_part = 1;
+        p->used    = 1;
+        part_name(p->name, whole->name, i);
+
+        if (vfs_register_blkdev(p->name, &g_bdev_ops, p,
+                                p->nsect * ATA_SECTOR) != 0) {
+            p->used = 0;
+            continue;
+        }
+        found++;
+
+        dbg_puts("ATA:   /dev/");
+        dbg_puts(p->name);
+        dbg_puts(" gpt start=");
+        dbg_puts_dec((uint32_t)first);
+        dbg_puts(" sectors=");
+        dbg_puts_dec((uint32_t)count);
         dbg_puts("\n");
     }
     return found;

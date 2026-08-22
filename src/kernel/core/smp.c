@@ -1,11 +1,11 @@
 /*
- * smp.c — minimal multi-core bring-up for GNOS. (GPLv2)
+ * smp.c — multi-core bring-up for GNOS. (GPLv2)
  *
- * Brings the APs reported by Limine online and parks them.  No per-CPU
- * scheduling yet: the BSP keeps running every process, and the APs sit in a
- * cli/hlt loop.  That keeps the whole thing safe while the kernel still has
- * no spinlocks — the only cross-CPU write during start-up is each AP's
- * one-shot `online` flag, which the BSP polls afterwards.
+ * Brings the APs reported by Limine online and runs them into the shared
+ * EEVDF scheduler.  Every core owns its cpu_t slot (found through GS), its
+ * GDT/TSS, its stack and -- once lapic_timer_start() has run -- its own
+ * 100 Hz clock; the run queue and the process table are shared under
+ * g_proc_lock, everything else under the big kernel lock defined here.
  */
 #include <stdint.h>
 #include <limine.h>
@@ -14,10 +14,27 @@
 #include "gdt.h"
 #include "idt.h"
 #include "debugcon.h"
+#include "lapic.h"
+#include "proc.h"
 
 cpu_t g_cpu[MAX_CPUS];
 int   g_ncpus;
 int   g_bsp_id;
+
+/* The big kernel lock.  Taken by isr_dispatch on every trap from ring 3
+ * and dropped before a process parks; the rest of the kernel stays
+ * lock-free exactly as it was on one core. */
+spinlock_t g_bkl;
+
+void bkl_acquire(void)
+{
+    spin_lock(&g_bkl);
+}
+
+void bkl_release(void)
+{
+    spin_unlock(&g_bkl);
+}
 
 /* Static per-CPU stacks, ready before smp_init() runs (no heap needed). */
 uint8_t g_cpu_stack[MAX_CPUS][PERCPU_KSTACK] __attribute__((aligned(16)));
@@ -95,6 +112,15 @@ void smp_init(void)
  * set it before calling), so it is safe to use C here. */
 void ap_main(int cpu)
 {
+    /* Publish the self pointer and point GS at this core's slot *before*
+     * anything touches cpu_self() (gdt_build -> tss_set_rsp0 does). */
+    g_cpu[cpu].self = &g_cpu[cpu];
+    uint64_t base = (uint64_t)(uintptr_t)&g_cpu[cpu];
+    asm volatile("wrmsr" :: "c"((uint32_t)IA32_GS_BASE),
+                            "a"((uint32_t)(base & 0xFFFFFFFFu)),
+                            "d"((uint32_t)(base >> 32))
+                 : "memory");
+
     /* Build and load this core's own GDT/TSS. */
     gdt_build(&g_cpu[cpu]);
 
@@ -114,20 +140,16 @@ void ap_main(int cpu)
         "ltr %%ax\n\t"
         : : "i"(SEL_KDATA), "i"(SEL_TSS) : "rax", "memory");
 
-    /* Point this core's GS base at its own cpu_t, and load the shared IDT as
-     * a safety net (interrupts stay off, so nothing fires). */
-    uint64_t base = (uint64_t)(uintptr_t)&g_cpu[cpu];
-    asm volatile("wrmsr" :: "c"((uint32_t)0xC0000101),
-                            "a"((uint32_t)(base & 0xFFFFFFFFu)),
-                            "d"((uint32_t)(base >> 32))
-                 : "memory");
+    /* The shared IDT is a safety net until interrupts come on. */
     idt_load();
 
     g_cpu[cpu].online = 1;
 
-    /* Parked.  No I/O APIC routes IRQs here, so with IF cleared nothing can
-     * wake this core except an NMI/SMI — exactly the "online but idle" state
-     * we want for this first stage. */
-    asm volatile("cli; 1: hlt; jmp 1b");
+    /* This core's own clock, then join the scheduler.  With an empty run
+     * queue schedule() falls back to hlt until the first process is ready;
+     * the LAPIC timer makes sure a wake-up tick eventually lands. */
+    lapic_init();
+    lapic_timer_start();
+    sched_start();
     __builtin_unreachable();
 }

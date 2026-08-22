@@ -1,0 +1,157 @@
+APinux OS 使用说明文档
+1. 概述
+APinux OS 是专为仿生 AI 计算设计的独立操作系统，内置 ACPNN、ACPU、PCP、OPENPUFF、A2 五大 AI 引擎，支持极简图形桌面与命令行操作。本文档涵盖 WiFi/蓝牙配置、AI 模型部署、浏览器使用、系统快照及常见操作。
+
+2. 首次启动
+将制作好的启动 U 盘插入设备，开机按 F12 (或对应主板的启动选择键) 选择 U 盘启动。
+
+系统将显示开机动画 “APinux OS”，随后进入桌面。
+
+默认分辨率 1024×600，管理员密码 apinux。
+
+3. 网络配置
+3.1 WiFi 连接 (命令行方式)
+打开终端 (CKR)，输入以下命令扫描可用网络：
+
+text
+wlan scan
+系统将列出 SSID 列表。
+
+连接到目标 WiFi：
+
+text
+wlan connect <SSID> <密码>
+示例：wlan connect MyWiFi 12345678
+
+验证连接：
+
+text
+ifconfig
+若 wlan0 显示 IP 地址，则连接成功。
+
+3.2 以太网连接
+插入网线后系统自动通过 DHCP 获取 IP，无需手动配置。
+
+如需静态 IP，编辑 /etc/apinux.conf 中的 ip_addr 字段并重启网络。
+
+3.3 蓝牙配置
+打开蓝牙：
+
+text
+blu power on
+扫描设备：
+
+text
+blu scan
+列表显示设备地址和名称。
+
+配对设备：
+
+text
+blu pair <设备地址>
+示例：blu pair 00:1A:7D:DA:71:13
+
+连接设备（如蓝牙键盘/鼠标）：
+
+text
+blu connect <设备地址>
+4. AI 引擎使用
+APinux 内置五种 AI 引擎，可通过命令行或图形界面调用。
+
+4.1 加载模型
+将模型文件（如 mymodel.bin）放入 /models/ 目录。
+
+切换引擎：
+
+text
+ai select <引擎名>
+引擎名：acpnn, acpu, pcp, openpuff, a2。
+
+加载模型：
+
+text
+ai load <模型文件名>
+4.2 图像识别
+打开摄像头或屏幕捕获：
+
+text
+camera on
+或使用 screen cap 捕获一帧。
+
+运行推理：
+
+text
+ai infer
+结果将显示在终端或桌面通知中。
+
+4.3 文本生成
+进入对话模式：
+
+text
+ai chat
+输入文本，按回车生成回复，输入 quit 退出。
+
+5. 浏览器
+在桌面双击 “Browser” 图标，或终端输入 browser 启动。
+
+地址栏输入 URL（需以 http:// 开头）。
+
+支持超链接点击、滚动（方向键或鼠标拖拽）。
+
+书签和历史记录暂不支持，后续版本添加。
+
+6. 文件系统操作
+6.1 基本命令
+ls [目录] – 列出文件
+
+cat <文件> – 显示文本文件内容
+
+mkdir <目录> – 创建目录
+
+rm <文件> – 删除文件
+
+cp <源> <目标> – 复制
+
+mv <源> <目标> – 移动/重命名
+
+6.2 文件保护（只读/不可变）
+设置只读：protect set <文件>
+
+取消只读：protect clear <文件>
+
+设置不可变（连属性都不能改）：immutable set <文件>
+
+7. 系统快照与回滚
+创建快照：snap create "描述信息"
+
+列出现有快照：snap list
+
+回滚到指定快照：snap rollback <快照ID>
+
+注意：回滚会覆盖当前文件系统，建议操作前确认。
+
+8. 常用快捷键
+Ctrl+Alt+T – 打开终端
+
+Ctrl+Alt+B – 打开浏览器
+
+Alt+F4 – 关闭当前窗口
+
+PrintScreen – 截屏并保存到 /screenshots/
+
+9. 关机与重启
+桌面点击 “开始” → “关机” 或终端输入 shutdown
+
+重启命令：reboot
+
+10. 故障排查
+无法连接 WiFi：确认 SSID 和密码正确；检查 WLAN 驱动是否加载（lsmod | grep wlan）。
+
+蓝牙无法发现设备：尝试 blu reset 重置蓝牙适配器。
+
+AI 引擎报错：检查模型文件路径是否正确，引擎是否已加载。
+
+系统卡顿：可运行 free 查看内存使用，或 top 查看进程负载。
+
+APinux OS 持续更新中，欢迎提交反馈。Enjoy your bionic AI journey!
+

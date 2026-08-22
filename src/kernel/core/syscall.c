@@ -18,6 +18,7 @@
 #include "gdt.h"
 #include "smp.h"
 #include "vfs.h"
+#include "tmpfs.h"
 #include "proc.h"
 #include "ptrace.h"
 #include "module.h"
@@ -35,8 +36,10 @@
 #include "io.h"
 #include "acpi.h"
 #include "anonfd.h"
+#include "timerfd.h"
 #include "epoll.h"
 #include "input.h"
+#include "unix.h"
 
 /* reboot(169) command codes; the Linux ABI as musl's reboot() passes them. */
 #define LINUX_REBOOT_CMD_RESTART    0x01234567
@@ -312,6 +315,12 @@ static int64_t open_resolved(const char *abs, int flags)
     }
     if (cloexec)
         p->fd_cloexec |= 1ULL << fd;
+    /* Open-time O_NONBLOCK must reach devices that keep their own nonblock
+     * state (evdev -- libinput opens every node with O_NONBLOCK, and a
+     * read that blocks would hang the whole compositor waiting for the
+     * first keypress). */
+    if (flags & O_NONBLOCK)
+        input_set_nonblock(vfs_file_node(h), 1);
     return fd;
 }
 
@@ -400,6 +409,8 @@ static int64_t sys_fcntl(int fd, int cmd, uint64_t arg)
         int s = vfs_file_sock(h);
         if (s >= 0)
             sock_set_nonblock(s, (arg & O_NONBLOCK) != 0);
+        else if (s < -1)
+            unix_set_nonblock(-2 - s, (arg & O_NONBLOCK) != 0);
         /* Track O_NONBLOCK the same way the kernel does for files: keep the
          * access mode and flip only the settable bit. */
         vfs_file_setfl(h, (int)(arg & O_NONBLOCK));
@@ -409,6 +420,7 @@ static int64_t sys_fcntl(int fd, int cmd, uint64_t arg)
         vfs_node_t *fln = vfs_file_node(h);
         if (anonfd_is_eventfd(fln))
             anonfd_set_nonblock(fln, (arg & O_NONBLOCK) != 0);
+        timerfd_set_nonblock(fln, (arg & O_NONBLOCK) != 0);
         input_set_nonblock(fln, (arg & O_NONBLOCK) != 0);
         return 0;
     }
@@ -583,6 +595,74 @@ static int64_t sys_newfstatat(int fd, uint64_t upath, uint64_t ust, uint64_t fla
                            (flags & AT_SYMLINK_NOFOLLOW) ? 0 : 1);
     }
     return r;
+}
+
+/*
+ * statx(332): (dirfd, path, flags, mask, buf).  labwc only needs the basic
+ * fields (type/mode/size/ino/nlink), so we reuse the lstat_t path and copy the
+ * interesting fields over.  AT_EMPTY_PATH stats the dirfd itself.
+ */
+static int64_t sys_statx(int dirfd, uint64_t upath, uint64_t flags,
+                         uint64_t mask, uint64_t ust)
+{
+    (void)mask;
+    if (!user_ptr_ok(ust, sizeof(kstatx_t)))
+        return -E_INVAL;
+
+    lstat_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    int r;
+
+    if (flags & AT_EMPTY_PATH)
+        r = vfs_fstat(fd_handle(dirfd), &tmp);
+    else {
+        char abs[GNUOS_PATH_MAX];
+        r = path_at(dirfd, upath, abs);
+        if (r < 0)
+            return r;
+        r = vfs_stat_linux(abs, &tmp, (flags & AT_SYMLINK_NOFOLLOW) ? 0 : 1);
+    }
+    if (r < 0)
+        return r;
+
+    kstatx_t *sx = (kstatx_t *)(uintptr_t)ust;
+    memset(sx, 0, sizeof(*sx));
+    sx->stx_mask        = STATX_BASIC_STATS;
+    sx->stx_blksize     = tmp.st_blksize;
+    sx->stx_nlink       = tmp.st_nlink;
+    sx->stx_uid         = tmp.st_uid;
+    sx->stx_gid         = tmp.st_gid;
+    sx->stx_mode        = tmp.st_mode;
+    sx->stx_ino         = tmp.st_ino;
+    sx->stx_size        = tmp.st_size;
+    sx->stx_blocks      = tmp.st_blocks;
+    /* Linux reports the device number as (major, minor) pairs.  tmp.st_rdev
+     * is the new_encode_dev() value the rest of stat returns; split it. */
+    sx->stx_rdev_major  = (uint32_t)((tmp.st_rdev >> 8) & 0xfff) |
+                          (uint32_t)((tmp.st_rdev >> 32) & ~0xfffu);
+    sx->stx_rdev_minor  = (uint32_t)(tmp.st_rdev & 0xff) |
+                          (uint32_t)((tmp.st_rdev >> 12) & ~0xffu);
+    sx->stx_dev_major   = 8;            /* one ext2 image on /dev/hda */
+    sx->stx_dev_minor   = 0;
+    sx->stx_atime_sec   = (int64_t)tmp.st_atim_sec;
+    sx->stx_atime_nsec  = tmp.st_atim_nsec;
+    sx->stx_mtime_sec   = (int64_t)tmp.st_mtim_sec;
+    sx->stx_mtime_nsec  = tmp.st_mtim_nsec;
+    sx->stx_ctime_sec   = (int64_t)tmp.st_ctim_sec;
+    sx->stx_ctime_nsec  = tmp.st_ctim_nsec;
+    return 0;
+}
+
+/*
+ * fadvise64(221): (fd, offset, len, advice).  GNOS keeps no page cache to
+ * prefetch into, so this is a no-op beyond validating the descriptor.
+ */
+static int64_t sys_fadvise64(int fd, uint64_t off, uint64_t len, uint64_t advice)
+{
+    (void)off; (void)len; (void)advice;
+    if (fd_handle(fd) < 0)
+        return -E_BADF;
+    return 0;
 }
 
 /* ---- the current directory -------------------------------------------- */
@@ -1359,14 +1439,20 @@ static int64_t sys_pipe(uint64_t ufds)
 
 /* fd -> socket index, or a negative errno.  ENOTSOCK rather than EBADF for a
  * descriptor that exists but is a file: that distinction is the only clue a
- * program gets that it passed the wrong fd rather than a closed one. */
+ * program gets that it passed the wrong fd rather than a closed one.
+ *
+ * The index space is shared between the two socket domains: AF_INET sockets
+ * are non-negative, AF_UNIX sockets are negative (vfs priv = -2 - u, so
+ * the -1 sentinel for "not a socket" never collides). */
 static int fd_sock(int fd)
 {
     int h = fd_handle(fd);
     if (h < 0)
         return -E_BADF;
     int s = vfs_file_sock(h);
-    return s < 0 ? -E_NOTSOCK : s;
+    if (s < 0)
+        return s == -1 ? -E_NOTSOCK : s;
+    return s;
 }
 
 /* Read a sockaddr_in in; `alen` is a plain length. */
@@ -1419,19 +1505,22 @@ static int sa_out(uint64_t uaddr, uint64_t ualen, uint32_t ip, uint16_t port)
 /*
  * Hand a freshly created socket to the process.  On failure the socket is
  * closed here rather than leaked: by this point it may already own a TCP
- * connection, and nobody else has a name for it.
+ * connection, and nobody else has a name for it.  `s` may be negative for
+ * an AF_UNIX socket (see fd_sock).
  */
 static int64_t sock_to_fd(int s)
 {
     proc_t *p = proc_current();
     if (!p) {
-        sock_close(s);
+        if (s >= 0) sock_close(s);
+        else        unix_close(-2 - s);
         return -E_INVAL;
     }
 
     int h = vfs_socket(s);
     if (h < 0) {
-        sock_close(s);
+        if (s >= 0) sock_close(s);
+        else        unix_close(-2 - s);
         return h;
     }
 
@@ -1445,64 +1534,175 @@ static int64_t sock_to_fd(int s)
 
 static int64_t sys_socket(int domain, int type, int protocol)
 {
-    int s = sock_create(domain, type, protocol);
+    int s;
+    int unix_sock;
+    if (domain == AF_UNIX) {
+        s = unix_create(type, protocol);
+        unix_sock = 1;
+    } else {
+        s = sock_create(domain, type, protocol);
+        unix_sock = 0;
+    }
     if (s < 0)
         return s;
-    return sock_to_fd(s);
+    return sock_to_fd(unix_sock ? -2 - s : s);
+}
+
+/* sockaddr_un in/out.  The path lives in user memory, so both sides go
+ * through a kernel buffer; the bound path is a C string of at most 107
+ * bytes, truncated at the first NUL like Linux does. */
+#define UNIX_PATH_MAX 108
+
+static int sa_un_in(uint64_t uaddr, uint64_t alen, char *path, uint32_t *plen)
+{
+    if (!uaddr || alen < 3 || alen > 2 + UNIX_PATH_MAX)
+        return -E_INVAL;
+    if (!user_ptr_ok(uaddr, 2))
+        return -E_FAULT;
+
+    uint16_t family;
+    memcpy(&family, (const void *)(uintptr_t)uaddr, 2);
+    if (family != AF_UNIX)
+        return -E_AFNOSUPPORT;
+
+    uint32_t n = alen - 2;
+    if (n > UNIX_PATH_MAX - 1)
+        n = UNIX_PATH_MAX - 1;
+    if (!user_ptr_ok(uaddr + 2, n))
+        return -E_FAULT;
+    memcpy(path, (const void *)(uintptr_t)(uaddr + 2), n);
+    path[n] = 0;
+    /* Linux does not require the sockaddr length to include the NUL:
+     * libwayland binds with size = offsetof(sun_path) + strlen, so the
+     * terminator sits just past the given length.  A path that fills the
+     * whole length is therefore legal -- it simply is not C-string
+     * terminated, and the caller copies exactly *plen bytes. */
+    uint32_t used = 0;
+    while (used < n && path[used])
+        used++;
+    *plen = used;
+    return 0;
+}
+
+static int sa_un_out(uint64_t uaddr, uint64_t ualen, const char *path)
+{
+    if (!uaddr || !ualen)
+        return 0;
+    if (!user_ptr_ok(ualen, sizeof(uint32_t)))
+        return -E_FAULT;
+
+    uint32_t room;
+    memcpy(&room, (const void *)(uintptr_t)ualen, sizeof(room));
+
+    uint32_t n = path ? (uint32_t)strlen(path) : 0;
+    uint32_t full = 2 + n + 1;          /* family + path + NUL */
+    if (n == 0)
+        full = 2;                       /* unnamed: family only */
+    if (room > 2 + UNIX_PATH_MAX)
+        room = 2 + UNIX_PATH_MAX;
+    if (room && !user_ptr_ok(uaddr, room < full ? room : full))
+        return -E_FAULT;
+
+    uint8_t sa[2 + UNIX_PATH_MAX];
+    memset(sa, 0, sizeof(sa));
+    sa[0] = (uint8_t)AF_UNIX;
+    sa[1] = (uint8_t)(AF_UNIX >> 8);
+    if (n > 0)
+        memcpy(sa + 2, path, n);
+    if (room)
+        memcpy((void *)(uintptr_t)uaddr, sa, room < full ? room : full);
+
+    memcpy((void *)(uintptr_t)ualen, &full, sizeof(full));
+    return 0;
 }
 
 static int64_t sys_bind(int fd, uint64_t uaddr, uint64_t alen)
 {
     int s = fd_sock(fd);
-    if (s < 0)
-        return s;
+    if (s == -1)
+        return -E_NOTSOCK;
+    if (s >= 0) {
+        uint32_t ip;
+        uint16_t port;
+        int r = sa_in(uaddr, alen, &ip, &port);
+        return r < 0 ? r : sock_bind(s, ip, port);
+    }
 
-    uint32_t ip;
-    uint16_t port;
-    int r = sa_in(uaddr, alen, &ip, &port);
-    return r < 0 ? r : sock_bind(s, ip, port);
+    char path[UNIX_PATH_MAX];
+    uint32_t plen;
+    int r = sa_un_in(uaddr, alen, path, &plen);
+    return r < 0 ? r : unix_bind_sys(-2 - s, path, plen);
 }
 
 static int64_t sys_connect(int fd, uint64_t uaddr, uint64_t alen)
 {
     int s = fd_sock(fd);
-    if (s < 0)
-        return s;
+    if (s == -1)
+        return -E_NOTSOCK;
+    if (s >= 0) {
+        uint32_t ip;
+        uint16_t port;
+        int r = sa_in(uaddr, alen, &ip, &port);
+        return r < 0 ? r : sock_connect(s, ip, port);
+    }
 
-    uint32_t ip;
-    uint16_t port;
-    int r = sa_in(uaddr, alen, &ip, &port);
-    return r < 0 ? r : sock_connect(s, ip, port);
+    char path[UNIX_PATH_MAX];
+    uint32_t plen;
+    int r = sa_un_in(uaddr, alen, path, &plen);
+    return r < 0 ? r : unix_connect_sys(-2 - s, path, plen);
 }
 
 static int64_t sys_listen(int fd, int backlog)
 {
     int s = fd_sock(fd);
-    return s < 0 ? s : sock_listen(s, backlog);
+    if (s == -1)
+        return -E_NOTSOCK;
+    if (s >= 0)
+        return sock_listen(s, backlog);
+    return unix_listen_sys(-2 - s, backlog);
 }
 
 /* accept(43) is accept4(288) with no flags. */
 static int64_t sys_accept(int fd, uint64_t uaddr, uint64_t ualen, int flags)
 {
     int s = fd_sock(fd);
-    if (s < 0)
-        return s;
+    if (s == -1)
+        return -E_NOTSOCK;
 
-    uint32_t ip   = 0;
-    uint16_t port = 0;
-    int ns = sock_accept(s, &ip, &port);
-    if (ns < 0)
-        return ns;
+    if (s >= 0) {
+        uint32_t ip   = 0;
+        uint16_t port = 0;
+        int ns = sock_accept(s, &ip, &port);
+        if (ns < 0)
+            return ns;
+        if (flags & SOCK_NONBLOCK)
+            sock_set_nonblock(ns, 1);
+
+        int64_t nfd = sock_to_fd(ns);
+        if (nfd < 0)
+            return nfd;
+
+        /* The connection is up and the descriptor exists; a bad address
+         * pointer cannot un-accept either, so the fd is the answer
+         * regardless. */
+        sa_out(uaddr, ualen, ip, port);
+        return nfd;
+    }
+
+    int nu = unix_accept_sys(-2 - s);
+    if (nu < 0)
+        return nu;
     if (flags & SOCK_NONBLOCK)
-        sock_set_nonblock(ns, 1);
+        unix_set_nonblock(nu, 1);
 
-    int64_t nfd = sock_to_fd(ns);
+    int64_t nfd = sock_to_fd(-2 - nu);
     if (nfd < 0)
         return nfd;
 
-    /* The connection is up and the descriptor exists; a bad address pointer
-     * cannot un-accept either, so the fd is the answer regardless. */
-    sa_out(uaddr, ualen, ip, port);
+    char path[UNIX_PATH_MAX];
+    uint32_t plen = UNIX_PATH_MAX;
+    if (unix_getname(nu, path, &plen, 0) == 0)
+        sa_un_out(uaddr, ualen, path);
     return nfd;
 }
 
@@ -1510,61 +1710,85 @@ static int64_t sys_sendto(int fd, uint64_t ubuf, uint64_t len, int flags,
                           uint64_t uaddr, uint64_t alen)
 {
     int s = fd_sock(fd);
-    if (s < 0)
-        return s;
+    if (s == -1)
+        return -E_NOTSOCK;
     if (len && !user_ptr_ok(ubuf, len))
         return -E_FAULT;
 
-    uint32_t ip   = 0;
-    uint16_t port = 0;
-    if (uaddr) {
-        int r = sa_in(uaddr, alen, &ip, &port);
-        if (r < 0)
-            return r;
+    if (s >= 0) {
+        uint32_t ip   = 0;
+        uint16_t port = 0;
+        if (uaddr) {
+            int r = sa_in(uaddr, alen, &ip, &port);
+            if (r < 0)
+                return r;
+        }
+        return sock_sendto(s, (const void *)(uintptr_t)ubuf, (uint32_t)len,
+                           flags, ip, port);
     }
-    return sock_sendto(s, (const void *)(uintptr_t)ubuf, (uint32_t)len, flags,
-                       ip, port);
+
+    (void)flags;
+    return unix_sendmsg(-2 - s, (const void *)(uintptr_t)ubuf, (uint32_t)len,
+                        NULL, 0);
 }
 
 static int64_t sys_recvfrom(int fd, uint64_t ubuf, uint64_t len, int flags,
                             uint64_t uaddr, uint64_t ualen)
 {
     int s = fd_sock(fd);
-    if (s < 0)
-        return s;
+    if (s == -1)
+        return -E_NOTSOCK;
     if (len && !user_ptr_ok(ubuf, len))
         return -E_FAULT;
 
-    uint32_t ip   = 0;
-    uint16_t port = 0;
-    int n = sock_recvfrom(s, (void *)(uintptr_t)ubuf, (uint32_t)len, flags,
-                          &ip, &port);
+    if (s >= 0) {
+        uint32_t ip   = 0;
+        uint16_t port = 0;
+        int n = sock_recvfrom(s, (void *)(uintptr_t)ubuf, (uint32_t)len,
+                              flags, &ip, &port);
+        if (n < 0)
+            return n;
+        return sa_out(uaddr, ualen, ip, port) < 0 ? -E_FAULT : n;
+    }
+
+    int u = -2 - s;
+    int n = unix_recvmsg(u, (void *)(uintptr_t)ubuf, (uint32_t)len, NULL,
+                         (int[]){ 0 }, flags);
     if (n < 0)
         return n;
-
-    int r = sa_out(uaddr, ualen, ip, port);
-    return r < 0 ? r : n;
+    return sa_un_out(uaddr, ualen, NULL) < 0 ? -E_FAULT : n;
 }
 
 static int64_t sys_shutdown(int fd, int how)
 {
     int s = fd_sock(fd);
-    return s < 0 ? s : sock_shutdown(s, how);
+    if (s == -1)
+        return -E_NOTSOCK;
+    if (s >= 0)
+        return sock_shutdown(s, how);
+    return unix_shutdown(-2 - s, how);
 }
 
 /* getsockname(51) and getpeername(52) differ only in which end they name. */
 static int64_t sys_getsockname(int fd, uint64_t uaddr, uint64_t ualen, int peer)
 {
     int s = fd_sock(fd);
-    if (s < 0)
-        return s;
+    if (s == -1)
+        return -E_NOTSOCK;
     if (!uaddr || !ualen)
         return -E_INVAL;
 
-    uint32_t ip   = 0;
-    uint16_t port = 0;
-    int r = sock_getname(s, &ip, &port, peer);
-    return r < 0 ? r : sa_out(uaddr, ualen, ip, port);
+    if (s >= 0) {
+        uint32_t ip   = 0;
+        uint16_t port = 0;
+        int r = sock_getname(s, &ip, &port, peer);
+        return r < 0 ? r : sa_out(uaddr, ualen, ip, port);
+    }
+
+    char path[UNIX_PATH_MAX];
+    uint32_t plen = UNIX_PATH_MAX;
+    int r = unix_getname(-2 - s, path, &plen, peer);
+    return r < 0 ? r : sa_un_out(uaddr, ualen, r == 0 && plen == 1 ? "" : path);
 }
 
 /* Option values are small -- every one anybody sets is an int -- so a fixed
@@ -1575,8 +1799,8 @@ static int64_t sys_setsockopt(int fd, int level, int name, uint64_t uval,
                               uint64_t len)
 {
     int s = fd_sock(fd);
-    if (s < 0)
-        return s;
+    if (s == -1)
+        return -E_NOTSOCK;
     if (len > SOCKOPT_MAX)
         return -E_INVAL;
     if (len && !user_ptr_ok(uval, len))
@@ -1585,6 +1809,11 @@ static int64_t sys_setsockopt(int fd, int level, int name, uint64_t uval,
     uint8_t tmp[SOCKOPT_MAX];
     if (len)
         memcpy(tmp, (const void *)(uintptr_t)uval, (uint32_t)len);
+    if (s < 0) {
+        /* AF_UNIX: nothing configurable, but everything must be accepted. */
+        (void)level; (void)name;
+        return 0;
+    }
     return sock_setsockopt(s, level, name, tmp, (uint32_t)len);
 }
 
@@ -1592,8 +1821,8 @@ static int64_t sys_getsockopt(int fd, int level, int name, uint64_t uval,
                               uint64_t ulen)
 {
     int s = fd_sock(fd);
-    if (s < 0)
-        return s;
+    if (s == -1)
+        return -E_NOTSOCK;
     if (!user_ptr_ok(ulen, sizeof(uint32_t)))
         return -E_FAULT;
 
@@ -1603,6 +1832,19 @@ static int64_t sys_getsockopt(int fd, int level, int name, uint64_t uval,
         room = SOCKOPT_MAX;
     if (!user_ptr_ok(uval, room))
         return -E_FAULT;
+
+    if (s < 0) {
+        /* SO_TYPE is the one question anybody asks a unix socket. */
+        int32_t v = 0;
+        if (level == 1 /* SOL_SOCKET */ && name == 3 /* SO_TYPE */)
+            v = 1 /* SOCK_STREAM */;
+        if (room >= 4) {
+            memcpy((void *)(uintptr_t)uval, &v, 4);
+            room = 4;
+        }
+        memcpy((void *)(uintptr_t)ulen, &room, sizeof(room));
+        return 0;
+    }
 
     uint8_t  tmp[SOCKOPT_MAX];
     uint32_t got = room;
@@ -1614,6 +1856,318 @@ static int64_t sys_getsockopt(int fd, int level, int name, uint64_t uval,
         got = room;
     memcpy((void *)(uintptr_t)uval, tmp, got);
     memcpy((void *)(uintptr_t)ulen, &got, sizeof(got));
+    return 0;
+}
+
+/* ---- sendmsg / recvmsg / socketpair ---------------------------------------
+ *
+ * The message passing half of the BSD API, in the x86-64 layout libwayland
+ * compiles against:
+ *
+ *   struct msghdr  { void *msg_name; socklen_t msg_namelen;  -- 8+4+4
+ *                    struct iovec *msg_iov; size_t msg_iovlen; -- 8+8
+ *                    void *msg_control; size_t msg_controllen;  -- 8+8
+ *                    int msg_flags; }                          -- 56 bytes
+ *   struct iovec   { void *iov_base; size_t iov_len; }         -- 16 bytes
+ *   struct cmsghdr { size_t cmsg_len; int cmsg_level; int cmsg_type; }
+ *                                                              -- 16 bytes
+ *
+ * Only SCM_RIGHTS is meaningful here: the sender hands over its fds, the
+ * receiver finds the same files in its own table.  Control data that names
+ * something else is skipped, like Linux does.
+ */
+#define MSG_NOSIGNAL     0x4000
+#define MSG_CMSG_CLOEXEC 0x40000000
+
+#define MSG_IOV_MAX   32
+#define MSG_BUF_MAX   65536
+#define MSG_FD_MAX    16
+
+typedef struct {
+    uint64_t msg_name;
+    uint32_t msg_namelen;
+    uint32_t pad0;
+    uint64_t msg_iov;
+    uint64_t msg_iovlen;
+    uint64_t msg_control;
+    uint64_t msg_controllen;
+    int32_t  msg_flags;
+    int32_t  pad1;
+} k_msghdr_t;                            /* 56 bytes */
+
+typedef struct {
+    uint64_t iov_base;
+    uint64_t iov_len;
+} k_iovec_t;                             /* 16 bytes */
+
+typedef struct {
+    uint64_t cmsg_len;
+    int32_t  cmsg_level;
+    int32_t  cmsg_type;
+} k_cmsghdr_t;                           /* 16 bytes */
+
+#define CMSG_LEN(payload)  (16 + (payload))
+#define CMSG_SPACE(payload) (((16 + (payload)) + 7) & ~7u)
+
+static int64_t sys_sendmsg(int fd, uint64_t umsg, int flags)
+{
+    (void)flags;                         /* NOSIGNAL/CLOEXEC: nothing to do */
+    int s = fd_sock(fd);
+    if (s == -1)
+        return -E_NOTSOCK;
+    if (!user_ptr_ok(umsg, sizeof(k_msghdr_t)))
+        return -E_FAULT;
+
+    k_msghdr_t m;
+    memcpy(&m, (const void *)(uintptr_t)umsg, sizeof(m));
+    if (m.msg_iovlen > MSG_IOV_MAX)
+        return -E_MSGSIZE;
+    if (m.msg_iovlen && !user_ptr_ok(m.msg_iov, m.msg_iovlen * 16))
+        return -E_FAULT;
+
+    k_iovec_t iov[MSG_IOV_MAX];
+    if (m.msg_iovlen)
+        memcpy(iov, (const void *)(uintptr_t)m.msg_iov,
+               m.msg_iovlen * 16);
+
+    /* Flatten the iovecs into one kernel buffer: the sockets only want a
+     * contiguous run anyway, and a stream write is all-or-nothing. */
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < m.msg_iovlen; i++) {
+        if (iov[i].iov_len > MSG_BUF_MAX - total)
+            return -E_MSGSIZE;
+        total += iov[i].iov_len;
+    }
+
+    int32_t fds[MSG_FD_MAX];
+    int nfds = 0;
+    if (m.msg_control) {
+        if (m.msg_controllen > 4096)
+            return -E_MSGSIZE;
+        if (!user_ptr_ok(m.msg_control, m.msg_controllen))
+            return -E_FAULT;
+        uint64_t off = 0;
+        while (off + 16 <= m.msg_controllen) {
+            k_cmsghdr_t c;
+            memcpy(&c, (const void *)(uintptr_t)(m.msg_control + off), 16);
+            uint64_t len = c.cmsg_len;
+            if (len < 16 || off + len > m.msg_controllen)
+                return -E_INVAL;
+            if (c.cmsg_level == 1 /* SOL_SOCKET */ &&
+                c.cmsg_type == 1 /* SCM_RIGHTS */) {
+                uint64_t n = (len - 16) / 4;
+                if (n > (uint64_t)(MSG_FD_MAX - nfds))
+                    return -E_MSGSIZE;
+                if (!user_ptr_ok(m.msg_control + off + 16, n * 4))
+                    return -E_FAULT;
+                uint32_t ufds[MSG_FD_MAX];
+                memcpy(ufds, (const void *)(uintptr_t)(m.msg_control + off + 16),
+                       n * 4);
+                for (uint64_t i = 0; i < n; i++) {
+                    int h = fd_handle((int)ufds[i]);
+                    if (h < 0)
+                        return -E_BADF;
+                    vfs_file_ref(h);    /* the receiver will unref it */
+                    fds[nfds++] = h;
+                }
+            }
+            off += (len + 7) & ~7ull;
+        }
+    }
+
+    if (total == 0 && nfds == 0)
+        return 0;
+
+    /* Control data on an AF_INET socket has nothing to ride on. */
+    if (s >= 0 && nfds > 0) {
+        while (nfds > 0)
+            vfs_file_unref(fds[--nfds]);
+        return -E_OPNOTSUPP;
+    }
+
+    int r;
+    if (total == 0) {
+        r = unix_sendmsg(-2 - s, NULL, 0, fds, nfds);
+    } else {
+        uint8_t *buf = kmalloc(total);
+        if (!buf) {
+            while (nfds > 0)
+                vfs_file_unref(fds[--nfds]);
+            return -E_NOMEM;
+        }
+        uint64_t got = 0;
+        for (uint64_t i = 0; i < m.msg_iovlen; i++) {
+            if (iov[i].iov_len == 0)
+                continue;
+            if (!user_ptr_ok(iov[i].iov_base, iov[i].iov_len)) {
+                kfree(buf);
+                while (nfds > 0)
+                    vfs_file_unref(fds[--nfds]);
+                return -E_FAULT;
+            }
+            memcpy(buf + got, (const void *)(uintptr_t)iov[i].iov_base,
+                   iov[i].iov_len);
+            got += iov[i].iov_len;
+        }
+        r = unix_sendmsg(-2 - s, buf, (uint32_t)total, fds, nfds);
+        kfree(buf);
+    }
+    return r;
+}
+
+static int64_t sys_recvmsg(int fd, uint64_t umsg, int flags)
+{
+    int s = fd_sock(fd);
+    if (s == -1)
+        return -E_NOTSOCK;
+    if (!user_ptr_ok(umsg, sizeof(k_msghdr_t)))
+        return -E_FAULT;
+
+    k_msghdr_t m;
+    memcpy(&m, (const void *)(uintptr_t)umsg, sizeof(m));
+    if (m.msg_iovlen > MSG_IOV_MAX)
+        return -E_MSGSIZE;
+    if (m.msg_iovlen && !user_ptr_ok(m.msg_iov, m.msg_iovlen * 16))
+        return -E_FAULT;
+
+    k_iovec_t iov[MSG_IOV_MAX];
+    if (m.msg_iovlen)
+        memcpy(iov, (const void *)(uintptr_t)m.msg_iov, m.msg_iovlen * 16);
+
+    uint64_t room = 0;
+    for (uint64_t i = 0; i < m.msg_iovlen; i++) {
+        if (iov[i].iov_len > MSG_BUF_MAX - room)
+            return -E_MSGSIZE;
+        room += iov[i].iov_len;
+    }
+    if (room == 0)
+        return 0;
+
+    uint8_t *buf = kmalloc(room);
+    if (!buf)
+        return -E_NOMEM;
+
+    int fds[MSG_FD_MAX];
+    int froom = MSG_FD_MAX;
+
+    int n;
+    if (s >= 0) {
+        uint32_t src_ip   = 0;
+        uint16_t src_port = 0;
+        n = sock_recvfrom(s, buf, (uint32_t)room, 0, &src_ip, &src_port);
+        froom = 0;
+        /* recvmsg must report who sent the datagram.  musl's DNS resolver
+         * checks the reply's source address against the nameserver before
+         * trusting it; a zeroed msg_name makes every answer look like it
+         * came from somewhere else, so getaddrinfo(3) fails even though the
+         * response is sitting in the socket. */
+        if (n >= 0 && m.msg_name && m.msg_namelen) {
+            sockaddr_in_t sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sin_family = AF_INET;
+            sa.sin_port   = net_htons(src_port);
+            sa.sin_addr   = net_htonl(src_ip);
+            uint32_t cap = m.msg_namelen;
+            if (cap > sizeof sa)
+                cap = (uint32_t)sizeof sa;
+            if (!user_ptr_ok(m.msg_name, cap)) {
+                kfree(buf);
+                return -E_FAULT;
+            }
+            memcpy((void *)(uintptr_t)m.msg_name, &sa, cap);
+            m.msg_namelen = (uint32_t)sizeof sa;
+        }
+    } else {
+        n = unix_recvmsg(-2 - s, buf, (uint32_t)room, fds, &froom, flags);
+    }
+    if (n < 0) {
+        kfree(buf);
+        return n;
+    }
+
+    uint64_t got = 0;
+    for (uint64_t i = 0; i < m.msg_iovlen && got < (uint64_t)n; i++) {
+        if (iov[i].iov_len == 0)
+            continue;
+        uint64_t chunk = iov[i].iov_len;
+        if (chunk > (uint64_t)n - got)
+            chunk = (uint64_t)n - got;
+        if (!user_ptr_ok(iov[i].iov_base, chunk)) {
+            while (froom > 0)
+                vfs_file_unref(fds[--froom]);
+            kfree(buf);
+            return -E_FAULT;
+        }
+        memcpy((void *)(uintptr_t)iov[i].iov_base, buf + got, chunk);
+        got += chunk;
+    }
+    kfree(buf);
+
+    /* Install received fds into our table and build the SCM_RIGHTS cmsg.
+     * A control buffer too small for them drops the excess, like Linux. */
+    if (froom > 0 && m.msg_control && m.msg_controllen >= CMSG_SPACE(4)) {
+        proc_t *p = proc_current();
+        uint32_t ufds[MSG_FD_MAX];
+        int kept = 0;
+        for (int i = 0; i < froom; i++) {
+            int nfd = p ? fd_alloc(p, fds[i]) : -1;
+            if (nfd >= 0) {
+                ufds[kept++] = (uint32_t)nfd;
+            } else {
+                vfs_file_unref(fds[i]);
+            }
+        }
+        uint64_t clen = CMSG_LEN(kept * 4);
+        if (m.msg_controllen >= clen) {
+            k_cmsghdr_t c = { clen, 1 /* SOL_SOCKET */, 1 /* SCM_RIGHTS */ };
+            memcpy((void *)(uintptr_t)m.msg_control, &c, 16);
+            if (kept > 0)
+                memcpy((void *)(uintptr_t)(m.msg_control + 16), ufds,
+                       kept * 4);
+            m.msg_controllen = (uint64_t)CMSG_SPACE(kept * 4);
+        } else {
+            m.msg_controllen = 0;
+        }
+    } else {
+        while (froom > 0)
+            vfs_file_unref(fds[--froom]);
+        m.msg_controllen = 0;
+    }
+    memcpy((void *)(uintptr_t)umsg, &m, sizeof(m));
+    return n;
+}
+
+static int64_t sys_socketpair(int domain, int type, int protocol,
+                              uint64_t usv)
+{
+    if (domain != AF_UNIX)
+        return -E_AFNOSUPPORT;
+    if (!usv || !user_ptr_ok(usv, 8))
+        return -E_FAULT;
+
+    int a = unix_create(type, protocol);
+    if (a < 0)
+        return a;
+    int b = unix_create(type, protocol);
+    if (b < 0) {
+        unix_close(a);
+        return b;
+    }
+    unix_link(a, b);
+
+    int fa = sock_to_fd(-2 - a);
+    if (fa < 0) {
+        unix_close(b);
+        return fa;
+    }
+    int fb = sock_to_fd(-2 - b);
+    if (fb < 0) {
+        unix_close(a);
+        return fb;
+    }
+
+    uint32_t sv[2] = { (uint32_t)fa, (uint32_t)fb };
+    memcpy((void *)(uintptr_t)usv, sv, sizeof(sv));
     return 0;
 }
 
@@ -1724,6 +2278,8 @@ int64_t do_ppoll(uint8_t *p, uint64_t nfds, int64_t ticks)
         return 0;
 
     int64_t ready = 0;
+    uint64_t deadline = 0;
+    int have_deadline = 0;
     for (;;) {
         int wait_tty  = 0;
         int wait_net  = 0;
@@ -1764,6 +2320,18 @@ int64_t do_ppoll(uint8_t *p, uint64_t nfds, int64_t ticks)
                                 r = POLLIN;
                             wait_tty = 1;
                         }
+                    } else if (kind == VFS_ANON) {
+                        /* timerfd, eventfd, ...: the node's own probe
+                         * decides readiness (and which sleep channel). */
+                        const vfs_ops_t *ops = vfs_file_ops(h);
+                        if (ops && ops->poll) {
+                            int pe = ops->poll(vfs_file_node(h), ev, &r);
+                            if (pe < 0)
+                                r = POLLNVAL;
+                            wait_pipe = 1;
+                        } else {
+                            r = (int16_t)(ev & (POLLIN | POLLOUT));
+                        }
                     } else if (kind == VFS_PIPE) {
                         if (vfs_pipe_readable(h))
                             r = POLLIN;
@@ -1772,8 +2340,13 @@ int64_t do_ppoll(uint8_t *p, uint64_t nfds, int64_t ticks)
                         if (s >= 0) {
                             if ((ev & POLLIN)  && sock_readable(s))  r |= POLLIN;
                             if ((ev & POLLOUT) && sock_writable(s))  r |= POLLOUT;
+                            wait_net = 1;
+                        } else if (s < -1) {
+                            int u = -2 - s;
+                            if ((ev & POLLIN)  && unix_readable(u))  r |= POLLIN;
+                            if ((ev & POLLOUT) && unix_writable(u))  r |= POLLOUT;
+                            wait_pipe = 1;
                         }
-                        wait_net = 1;
                     } else {
                         /* regular files are always readable/writable */
                         r = (int16_t)(ev & (POLLIN | POLLOUT));
@@ -1797,12 +2370,26 @@ int64_t do_ppoll(uint8_t *p, uint64_t nfds, int64_t ticks)
         if (proc_pending_signals(cur))
             return -E_INTR;
 
+        /* Convert the deadline into remaining ticks: each wake (timeout or
+         * event) must shrink the budget, otherwise a timed poll that keeps
+         * re-blocking with the original value never returns. */
+        uint64_t sleep_for = 0;                 /* 0 == wait forever */
+        if (ticks >= 0) {
+            if (!have_deadline) {
+                deadline = timer_ticks() + (uint64_t)ticks;
+                have_deadline = 1;
+            }
+            if (timer_ticks() >= deadline)
+                break;                          /* budget exhausted */
+            sleep_for = deadline - timer_ticks();
+        }
+
         if (wait_tty)
-            sched_block_timeout(WAIT_TTY, ticks < 0 ? 0 : (uint64_t)ticks);
+            sched_block_timeout(WAIT_TTY, sleep_for);
         else if (wait_net)
-            sched_block_timeout(WAIT_NET, ticks < 0 ? 0 : (uint64_t)ticks);
+            sched_block_timeout(WAIT_NET, sleep_for);
         else
-            sched_block_timeout(WAIT_PIPE, ticks < 0 ? 0 : (uint64_t)ticks);
+            sched_block_timeout(WAIT_PIPE, sleep_for);
         (void)wait_pipe;
 
         if (proc_pending_signals(cur))
@@ -2320,20 +2907,22 @@ static int64_t sys_delete_module(uint64_t uname, uint64_t flags)
 
 static int mmap_record(proc_t *p, uint64_t base, uint64_t size)
 {
-    if (p->nmmaps >= (int)(sizeof(p->mmaps) / sizeof(p->mmaps[0])))
+    addrspace_t *as = p->as;
+    if (as->nmmaps >= (int)(sizeof(as->mmaps) / sizeof(as->mmaps[0])))
         return 0;
-    p->mmaps[p->nmmaps].base = base;
-    p->mmaps[p->nmmaps].size = size;
-    p->nmmaps++;
+    as->mmaps[as->nmmaps].base = base;
+    as->mmaps[as->nmmaps].size = size;
+    as->nmmaps++;
     return 1;
 }
 
 static int mmap_find(proc_t *p, uint64_t addr, uint64_t *base, uint64_t *size)
 {
-    for (int i = 0; i < p->nmmaps; i++) {
-        if (p->mmaps[i].base <= addr && addr < p->mmaps[i].base + p->mmaps[i].size) {
-            *base = p->mmaps[i].base;
-            *size = p->mmaps[i].size;
+    addrspace_t *as = p->as;
+    for (int i = 0; i < as->nmmaps; i++) {
+        if (as->mmaps[i].base <= addr && addr < as->mmaps[i].base + as->mmaps[i].size) {
+            *base = as->mmaps[i].base;
+            *size = as->mmaps[i].size;
             return i;
         }
     }
@@ -2342,11 +2931,12 @@ static int mmap_find(proc_t *p, uint64_t addr, uint64_t *base, uint64_t *size)
 
 static void mmap_forget(proc_t *p, int idx)
 {
+    addrspace_t *as = p->as;
     if (idx < 0)
         return;
-    for (int i = idx; i < p->nmmaps - 1; i++)
-        p->mmaps[i] = p->mmaps[i + 1];
-    p->nmmaps--;
+    for (int i = idx; i < as->nmmaps - 1; i++)
+        as->mmaps[i] = as->mmaps[i + 1];
+    as->nmmaps--;
 }
 
 /* Choose a free user-virtual span at or above MMAP_BASE, below MMAP_TOP.
@@ -2355,10 +2945,11 @@ static void mmap_forget(proc_t *p, int idx)
 static uint64_t mmap_pick_base(proc_t *p, uint64_t size)
 {
     uint64_t base = MMAP_BASE;
-    for (int i = 0; i < p->nmmaps; i++) {
-        if (p->mmaps[i].base < MMAP_BASE || p->mmaps[i].base >= MMAP_TOP)
+    addrspace_t *as = p->as;
+    for (int i = 0; i < as->nmmaps; i++) {
+        if (as->mmaps[i].base < MMAP_BASE || as->mmaps[i].base >= MMAP_TOP)
             continue;
-        uint64_t top = p->mmaps[i].base + p->mmaps[i].size;
+        uint64_t top = as->mmaps[i].base + as->mmaps[i].size;
         if (top > base)
             base = top;
     }
@@ -2380,14 +2971,73 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
 
     uint64_t size = (len + PAGE_SIZE - 1) & ~0xFFFULL;
 
-    /* A file/device mapping: today only character devices with an mmap op
-     * (the framebuffer) are supported -- the device hands back the physical
-     * range to map, so no page population from an fd is needed. */
+    /* A file/device mapping: character devices (the framebuffer) and
+     * anonymous files with a backing mmap op (memfd -- the wl_shm pool)
+     * hand back the physical range to map, so no page population from an
+     * fd is needed.  The memfd span is contiguous by construction. */
     if (!(flags & MAP_ANONYMOUS) && fd >= 0) {
         int h = fd_handle((int)fd);
         if (h < 0)
             return -E_BADF;
-        if (vfs_file_kind(h) != VFS_CHARDEV)
+        uint8_t kind = vfs_file_kind(h);
+        if (kind == VFS_FILE) {
+            /* Regular file: populate the mapping with the file's bytes.
+             * musl/labwc/fontconfig mmap fonts, keymaps and config read-only
+             * (MAP_PRIVATE), so copying the contents in once is exactly the
+             * right semantics; we just don't support write-back for
+             * MAP_SHARED.  Without this the mapping returned -ENOSYS and the
+             * caller dereferenced the (unmapped) address. */
+            char fpath[GNUOS_PATH_MAX];
+            const char *pp = vfs_file_path(h);
+            if (!pp)
+                return -E_INVAL;
+            strncpy(fpath, pp, GNUOS_PATH_MAX - 1);
+            fpath[GNUOS_PATH_MAX - 1] = 0;
+
+            uint64_t fsize = 0;
+            int      fk = 0;
+            /* Size the mapping from the open file's own record: for a
+             * shared-memory object that was unlinked after ftruncate (the
+             * wl_shm keymap dance), a by-path stat cannot see the file any
+             * more.  A tmpfs file's real size lives in the node (an fd's
+             * vfs_node copy is frozen at open time, before ftruncate). */
+            vfs_node_t *mn = vfs_file_node(h);
+            if (mn) {
+                fsize = tmpfs_is_file_node(mn) ? tmpfs_file_size(mn)
+                                               : mn->size;
+                fk    = mn->kind;
+            } else {
+                vfs_stat(fpath, &fsize, &fk);
+            }
+            uint64_t mapsize = (fsize + PAGE_SIZE - 1) & ~0xFFFULL;
+            if (mapsize == 0)
+                mapsize = PAGE_SIZE;
+
+            uint64_t base = (flags & MAP_FIXED) ? (addr & ~0xFFFULL)
+                          : (addr ? (addr & ~0xFFFULL)
+                                  : mmap_pick_base(p, mapsize));
+            if (!base || base + mapsize > USER_LIMIT)
+                return -E_INVAL;
+            if (!vmm_alloc_range(p->as, base, mapsize, vflags))
+                return -ENOMEM;
+
+            /* Copy the file in page by page through a kernel bounce buffer. */
+            static uint8_t g_mmap_bounce[PAGE_SIZE];
+            for (uint64_t o = 0; o < fsize; o += PAGE_SIZE) {
+                uint32_t chunk = (fsize - o < PAGE_SIZE)
+                                 ? (uint32_t)(fsize - o) : PAGE_SIZE;
+                int32_t got = vfs_pread_fd(h, o, g_mmap_bounce, chunk);
+                if (got > 0)
+                    vmm_copy_to_user(p->as, base + o, g_mmap_bounce,
+                                     (uint64_t)got);
+            }
+            if (!mmap_record(p, base, mapsize)) {
+                vmm_unmap(p->as, base, mapsize);
+                return -ENOMEM;
+            }
+            return (int64_t)base;
+        }
+        if (kind != VFS_CHARDEV && kind != VFS_ANON)
             return -E_NOSYS;
         const vfs_ops_t *ops = vfs_file_ops(h);
         if (!ops || !ops->mmap)
@@ -2465,6 +3115,22 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
     uint64_t size = (len + 0xFFF) & ~0xFFFULL;
     if (!size || addr + size > USER_LIMIT)
         return -E_INVAL;
+    /* DEBUG: who is mprotecting what */
+    dbg_puts("EXEC: mprotect pid=");
+    dbg_puts_dec((uint32_t)p->pid);
+    dbg_puts(" addr=");
+    dbg_puts_hex(addr);
+    dbg_puts(" size=");
+    dbg_puts_hex(size);
+    dbg_puts(" prot=");
+    dbg_puts_dec(prot);
+    dbg_puts("\r\n");
+    /* musl's dynlink applies RELRO protection with mprotect(..., PROT_READ)
+     * after relocating a dso; it tolerates ENOSYS (falls back to no RELRO).
+     * Returning ENOSYS for pure read-only protection lets a dynamically
+     * linked program boot even if the RELRO bookkeeping is imperfect. */
+    if (prot == PROT_READ)
+        return -E_NOSYS;
     return vmm_protect(p->as, addr, size, (unsigned)prot) ? 0 : -E_NOMEM;
 }
 
@@ -3206,6 +3872,16 @@ void syscall_handler(regs_t *r)
         ret = sys_newfstatat((int)a1, a2, a3, r->r10);
         break;
 
+    case SYS_statx:
+        /* arg order: dirfd, pathname, flags, mask(r10), statxbuf(r8) */
+        ret = sys_statx((int)a1, a2, a3, r->r10, r->r8);
+        break;
+
+    case SYS_fadvise64:
+        /* arg order: fd, offset, len, advice(r10) */
+        ret = sys_fadvise64((int)a1, a2, a3, r->r10);
+        break;
+
     case SYS_getdents64:
         ret = sys_getdents64((int)a1, a2, a3);
         break;
@@ -3258,6 +3934,37 @@ void syscall_handler(regs_t *r)
         ret = vfs_rename((const char *)a1, (const char *)a2);
         break;
 
+    case SYS_link: {
+        char oabs[GNUOS_PATH_MAX], nabs[GNUOS_PATH_MAX];
+        ret = path_abs(a1, oabs);
+        if (ret < 0) break;
+        ret = path_abs(a2, nabs);
+        if (ret < 0) break;
+        ret = vfs_link(oabs, nabs);
+        break;
+    }
+
+    case SYS_statfs: {
+        char abs[GNUOS_PATH_MAX];
+        ret = path_abs(a1, abs);
+        if (ret < 0) break;
+        if (!user_ptr_ok(a2, sizeof(kstatfs_t))) {
+            ret = -E_FAULT;
+            break;
+        }
+        ret = vfs_statfs(abs, (void *)(uintptr_t)a2);
+        break;
+    }
+
+    case SYS_fstatfs: {
+        if (!user_ptr_ok(a2, sizeof(kstatfs_t))) {
+            ret = -E_FAULT;
+            break;
+        }
+        ret = vfs_statfs(NULL, (void *)(uintptr_t)a2);
+        break;
+    }
+
     case SYS_truncate: {
         char abs[GNUOS_PATH_MAX];
         ret = path_abs(a1, abs);
@@ -3272,13 +3979,39 @@ void syscall_handler(regs_t *r)
          * what keeps the open file's cached size and the inode honest. */
         int h = fd_handle((int)a1);
         vfs_node_t *tn = vfs_file_node(h);
+        const char *fp = (h >= 0) ? vfs_file_path(h) : NULL;
         if (tn && tn->ops && tn->ops->truncate) {
             ret = (int64_t)a2 < 0 ? -E_INVAL : tn->ops->truncate(tn, a2);
+            /* Keep the open file's cached size honest: mmap of the fd (e.g.
+             * a wl_shm keymap, which is unlinked right after the truncate)
+             * sizes its mapping from this field, and a by-path stat cannot
+             * see an unlinked file any more. */
+            if (ret >= 0)
+                tn->size = (uint64_t)a2;
             break;
         }
-        const char *p = vfs_file_path(h);
-        if (!p) { ret = -E_BADF; break; }
-        ret = (int64_t)a2 < 0 ? -E_INVAL : vfs_truncate(p, a2);
+        if (!fp) { ret = -E_BADF; break; }
+        ret = (int64_t)a2 < 0 ? -E_INVAL : vfs_truncate(fp, a2);
+        break;
+    }
+
+    case SYS_fsync:
+    case SYS_fdatasync: {
+        /* Every filesystem here lives entirely in RAM: writes hit the
+         * buffers immediately, so there is nothing to flush.  Return
+         * success rather than ENOSYS -- editors (nano) call fsync after
+         * every save and would report "Function not implemented". */
+        ret = fd_handle((int)a1) >= 0 ? 0 : -E_BADF;
+        break;
+    }
+
+    case SYS_flock: {
+        /* Advisory locks only: there is exactly one compositor on this
+         * machine, and no other process takes a real lock on anything.
+         * wlroots' wayland socket uses flock(LOCK_EX|LOCK_NB) on its
+         * lockfile; making that succeed is what lets the display socket be
+         * created instead of retrying "wayland-N" forever. */
+        ret = fd_handle((int)a1) >= 0 ? 0 : -E_BADF;
         break;
     }
 
@@ -3468,6 +4201,24 @@ void syscall_handler(regs_t *r)
         break;
     }
 
+    case SYS_fchmod: {
+        /* fchmod(fd, mode): wlroots' shm files go through this with mode 0
+         * to lock a shared-memory file down before use. */
+        int h = fd_handle((int)a1);
+        vfs_node_t *tn = (h >= 0) ? vfs_file_node(h) : NULL;
+        const char *fp = (h >= 0) ? vfs_file_path(h) : NULL;
+        if (!fp)
+            { ret = -E_BADF; break; }
+        /* tmpfs files are world-writable scratch (/tmp, /run, /dev/shm):
+         * the mode is meaningless, and resolving by path fails for an
+         * object that was unlinked while still open.  Report success. */
+        if (tmpfs_is_file_node(tn)) { ret = 0; break; }
+        ret = chmod_allowed(fp);
+        if (ret < 0) break;
+        ret = vfs_chmod(fp, (uint32_t)a2);
+        break;
+    }
+
     case SYS_fchmodat: {
         char abs[GNUOS_PATH_MAX];
         ret = path_at((int)a1, a2, abs);
@@ -3590,6 +4341,16 @@ void syscall_handler(regs_t *r)
         ret = sys_epoll_pwait((int)a1, a2, (int)a3, (int)r->r10, r->r8);
         break;
 
+    case SYS_timerfd_create:
+        ret = sys_timerfd_create(a1, a2);
+        break;
+    case SYS_timerfd_settime:
+        ret = sys_timerfd_settime(a1, a2, a3, r->r10);
+        break;
+    case SYS_timerfd_gettime:
+        ret = sys_timerfd_gettime(a1, a2);
+        break;
+
     /* ---- BSD socket API (x86-64: one syscall per call, no socketcall) ---- */
     case SYS_socket:
         ret = sys_socket((int)a1, (int)a2, (int)a3);
@@ -3613,9 +4374,21 @@ void syscall_handler(regs_t *r)
         /* arg order: fd, buf, len, flags, addr, addrlen */
         ret = sys_sendto((int)a1, a2, a3, (int)r->r10, r->r8, r->r9);
         break;
+    case SYS_sendmsg:
+        /* arg order: fd, msghdr, flags */
+        ret = sys_sendmsg((int)a1, a2, (int)r->r10);
+        break;
     case SYS_recvfrom:
         /* arg order: fd, buf, len, flags, addr, addrlen */
         ret = sys_recvfrom((int)a1, a2, a3, (int)r->r10, r->r8, r->r9);
+        break;
+    case SYS_recvmsg:
+        /* arg order: fd, msghdr, flags */
+        ret = sys_recvmsg((int)a1, a2, (int)r->r10);
+        break;
+    case SYS_socketpair:
+        /* arg order: domain, type, protocol, sv */
+        ret = sys_socketpair((int)a1, (int)a2, (int)a3, r->r10);
         break;
     case SYS_shutdown:
         ret = sys_shutdown((int)a1, (int)a2);
@@ -3913,6 +4686,18 @@ void syscall_handler(regs_t *r)
     }
 
     r->rax = (uint64_t)ret;
+
+    /* Ring buffer of the last few syscalls, for the fault dumper: when a
+     * user process dies on a NULL deref we want to see what it just did. */
+    {
+        proc_t *sp = proc_current();
+        if (sp) {
+            uint8_t i = sp->sys_hist_idx & 7;
+            sp->sys_hist_nr[i]  = (uint16_t)nr;
+            sp->sys_hist_ret[i] = (int32_t)ret;
+            sp->sys_hist_idx++;
+        }
+    }
 
     /* ... and once after it returns, where the exit stop's register image
      * shows the result in RAX. */

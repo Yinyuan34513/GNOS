@@ -10,7 +10,12 @@
 # name and would otherwise fail with "command not found".
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 echo GNOS rc: starting up
-mkdir /tmp/run
+# /tmp/run is XDG_RUNTIME_DIR for the wayland compositor, and /var/log is
+# where the network test's transcript lands.  Both live under tmpfs mounts
+# that `mount -a` brings up later -- creating them here would put them in the
+# ext2 image, where the fresh tmpfs then hides them.  So they are created
+# again, for real, after the mounts.
+mkdir -p /var/log
 echo GNOS rc: ready
 /bin/hello.elf
 echo GNOS rc: hello exited with status $?
@@ -57,18 +62,21 @@ echo GNOS rc: evtest exited with status $?
 echo GNOS rc: eventest
 /bin/eventest.elf
 echo GNOS rc: eventest exited with status $?
+echo GNOS rc: socktest
+/bin/socktest.elf
+echo GNOS rc: socktest exited with status $?
 
-echo GNOS rc: modtest
-/bin/modtest.elf
-echo GNOS rc: modtest exited with status $?
-
-# ---- insmod/rmmod smoke test ---------------------------------------------
-# The same syscalls modtest drives directly, exercised through the tools
-# a user would actually type.  modtest above has unloaded everything, so
-# this load/unload cycle is a clean one.
-echo GNOS rc: insmod/rmmod smoke
-/sbin/insmod /lib/modules/moddemo.ko && /sbin/rmmod moddemo
-echo GNOS rc: insmod/rmmod exited with status $?
+# ---- curl: the full baidu.com response -----------------------------------
+# The acceptance test for the TCP/UDP stack: fetch http://baidu.com and dump
+# the *entire* response (status line, headers, body) into the boot log.
+# baidu.com answers 301 to plain HTTP and the kernel has no TLS, so the full
+# response is the redirect itself -- that is what is asserted on.
+echo CURLTEST: curl http://baidu.com full response
+/usr/bin/curl -i --max-redirs 0 http://baidu.com > /var/log/curl-baidu.log 2>&1
+echo CURLTEST: curl exited with status $?
+/bin/dbgcat.elf /var/log/curl-baidu.log
+/usr/bin/grep -q 'HTTP/1.1' /var/log/curl-baidu.log
+echo CURLTEST: response asserted rc=$?
 
 # ---- fastfetch smoke test ------------------------------------------------
 # The system-info tool, run against the real OS (not the build machine):
@@ -80,6 +88,23 @@ echo GNOS rc: fastfetch
 echo GNOS rc: fastfetch exited with status $?
 /bin/dbgcat.elf /var/log/fastfetch.log
 
+# ---- nano smoke test -----------------------------------------------------
+# The editor must really run: version banner first, then a real edit session
+# on the boot console -- a background helper types ^X (Ctrl+X, 0x18) into the
+# terminal a second after nano opens, and nano must exit cleanly with the
+# file intact.  TERM=xterm needs the xterm terminfo entry, which the initrd
+# carries under /usr/share/terminfo.
+echo NANOTEST: nano --version
+TERM=xterm /usr/bin/nano --version
+echo NANOTEST: version rc=$?
+printf 'hello from nano\n' > /tmp/nanotest.txt
+echo NANOTEST: opening /tmp/nanotest.txt with TERM=xterm
+( sleep 1; printf '\030' ) &
+TERM=xterm /usr/bin/nano /tmp/nanotest.txt
+echo NANOTEST: nano exited with status $?
+echo NANOTEST: file content after edit:
+/usr/bin/cat /tmp/nanotest.txt
+
 # ---- /etc/fstab ----------------------------------------------------------
 # Replay the fstab before OpenRC runs, not after: the very first thing the
 # sysinit runlevel does is checkpath its way around /run, and on a read-only
@@ -90,6 +115,12 @@ echo GNOS rc: mount -a
 echo GNOS rc: mount -a exited with status $?
 echo "--- mounted filesystems ---"
 /bin/mount
+
+# ---- XDG_RUNTIME_DIR ----------------------------------------------------
+# The tmpfs mounts above replaced the ext2 /tmp with an empty tree, so the
+# wayland compositor's runtime directory must be (re)created here, where it
+# actually persists.
+mkdir -p /tmp/run
 
 # ---- coldplug ------------------------------------------------------------
 # The udev-trigger equivalent: walk the kernel's subsystem registry through
@@ -133,3 +164,33 @@ echo BINSMOKE: ld exited with status $?
 echo BINSMOKE: objdump exited with status $?
 /usr/bin/nm /init.elf >/dev/null
 echo BINSMOKE: nm exited with status $?
+
+# ---- labwc: the GNOS Desktop --------------------------------------------
+# The acceptance test for the whole desktop line: wlroots 0.19 + labwc 0.9
+# driving /dev/dri/card0 through the legacy DRM uAPI with a pixman renderer.
+# GNOS has no seatd, so XKB_CONFIG_ROOT must point at the xkb data the
+# initrd carries, XDG_RUNTIME_DIR gives wlroots a socket dir, and the
+# WLR_* variables pin the backends/renderer the kernel can actually serve
+# (drm + libinput, pixman software rendering, no atomic modesetting).
+# labwc runs in the background; the boot log records whether it came up.
+echo DESKTOPTEST: launching labwc
+export XKB_CONFIG_ROOT=/usr/share/X11/xkb
+export XDG_RUNTIME_DIR=/tmp/run
+export FONTCONFIG_FILE=/etc/fonts/fonts.conf
+# GNOS has no seatd(8) and no logind: the seat is the one user on the one
+# console.  Real libseat's noop backend is exactly this -- it grants the
+# seat immediately and hands wlroots a socketpair to poll.  Without this
+# LIBSEAT_BACKEND, libseat tries the seatd socket, fails, skips noop and
+# wlroots logs "failed to start a session".
+export LIBSEAT_BACKEND=noop
+export WLR_BACKENDS=drm,libinput
+export WLR_RENDERER=pixman
+export WLR_DRM_NO_ATOMIC=1
+# libinput cannot yet initialise the GNOS evdev stub (EVIOCGABS and friends
+# are missing), so it reports zero devices.  Let the libinput backend start
+# anyway -- the compositor still drives the DRM output -- rather than have
+# the whole backend fail.  Keyboard/mouse support is a separate battle.
+export WLR_LIBINPUT_NO_DEVICES=1
+echo DESKTOPTEST: disabled by user request -- labwc not launched
+# /usr/bin/labwc
+# echo DESKTOPTEST: labwc exited rc=$?

@@ -43,7 +43,8 @@ static void report(const char *fmt, ...)
 
 static void check(int ok, int n, const char *what)
 {
-    report("EVENTEST: %s %d (%s)", ok ? "PASS" : "FAIL", n, what);
+    report("EVENTEST: %s %d (%s) errno=%d", ok ? "PASS" : "FAIL", n, what,
+           errno);
     if (!ok && !g_failed)
         g_failed = n;
 }
@@ -69,10 +70,16 @@ int main(void)
         check(write(mfd, tag, sizeof tag - 1) == (ssize_t)sizeof tag - 1 &&
               memcmp(p, tag, sizeof tag - 1) == 0, 4,
               "write() lands in the mapping");
-        /* Fresh ftruncate extension reads as zero (shmem semantics). */
-        check(ftruncate(mfd, 8192) == 0 && p[4096] == 0 && p[5000] == 0, 5,
-              "extended pages are zeroed");
+        /* Fresh ftruncate extension reads as zero (shmem semantics):
+         * grow the file, then re-map to the new size -- the order real
+         * wl_shm pools use. */
+        check(ftruncate(mfd, 8192) == 0, 5, "ftruncate to 8192");
         munmap(p, 4096);
+        p = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+        check(p != MAP_FAILED && p[4096] == 0 && p[5000] == 0, 5,
+              "extended pages are zeroed");
+        if (p != MAP_FAILED)
+            munmap(p, 8192);
     }
 
     /* fork() shares the mapping: child writes, parent reads. */
@@ -132,11 +139,11 @@ int main(void)
                   "epoll_ctl ADD");
             struct epoll_event out;
             memset(&out, 0, sizeof out);
+            u = 0;
+            read(sfd, &u, 8);                /* drain the one left over */
+            read(sfd, &u, 8);                /* and the EAGAIN hit */
             errno = 0;
             check(epoll_wait(ep, &out, 1, 10) == 0, 17, "empty wait times out");
-            u = 0;
-            read(sfd, &u, 8);                /* drain: sfd holds one left */
-            read(sfd, &u, 8);
             errno = 0;
             check(epoll_wait(ep, &out, 1, 10) == 0, 18, "drained wait times out");
             u = 9;

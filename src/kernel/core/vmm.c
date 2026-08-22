@@ -160,6 +160,7 @@ addrspace_t *vmm_create(void)
     g_used[slot] = 1;
     g_spaces[slot].pml4_phys = pml4;
     g_spaces[slot].refs      = 1;
+    g_spaces[slot].nmmaps    = 0;
     return &g_spaces[slot];
 }
 
@@ -571,6 +572,11 @@ addrspace_t *vmm_clone(addrspace_t *src)
         vmm_destroy(dst);
         return NULL;
     }
+    /* Carry the mmap records across a fork so the child's fault handler and
+     * munmap see the same mappings until it execve's a fresh image. */
+    dst->nmmaps = src->nmmaps;
+    for (int i = 0; i < src->nmmaps; i++)
+        dst->mmaps[i] = src->mmaps[i];
     return dst;
 }
 

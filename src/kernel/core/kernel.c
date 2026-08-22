@@ -43,6 +43,7 @@
 #include "subsys.h"
 #include "module.h"
 #include "acpi.h"
+#include "lapic.h"
 #include "proc.h"
 #include "timer.h"
 #include "syscall.h"
@@ -133,7 +134,6 @@ void kernel_entry(void)
     /* ---- CPU tables --------------------------------------------------- */
     gdt_init();
     idt_init();
-    smp_init();
 
     /* The driver registry has to exist before the first driver init runs,
      * because every one of them announces itself into it. */
@@ -158,6 +158,14 @@ void kernel_entry(void)
                   ? (uint64_t)(uintptr_t)rsdp_request.response->address : 0);
     acpi_dump();
     acpi_pm1_init();
+
+    /* ---- SMP and the local APIC -----------------------------------------
+     * After ACPI (the MADT is where each LAPIC's MMIO base and the APs'
+     * lapic ids come from) and before the filesystem, so a wedged AP shows
+     * up early.  The APs reach ap_main() and idle in the scheduler; the
+     * BSP enables its own LAPIC here (the PIT stays its clock). */
+    smp_init();
+    lapic_init();
 
     /* ---- PCI devices --------------------------------------------------
      * After the allocators, because every driver here needs DMA buffers and

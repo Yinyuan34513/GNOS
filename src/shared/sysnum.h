@@ -132,6 +132,8 @@
 #define SYS_sigsuspend   130
 #define SYS_statfs       137
 #define SYS_fstatfs      138
+#define SYS_fadvise64    221
+#define SYS_flock         73
 #define SYS_fsync         74
 #define SYS_fdatasync     75
 #define SYS_ftruncate     77
@@ -157,6 +159,7 @@
 #define SYS_mkdirat      258
 #define SYS_renameat     264
 #define SYS_renameat2    316
+#define SYS_statx        332
 #define SYS_fchmodat     268
 #define SYS_fchownat     260
 #define SYS_clone         56
@@ -184,6 +187,9 @@
 #define SYS_eventfd       284
 #define SYS_eventfd2      290
 #define SYS_epoll_create1 291
+#define SYS_timerfd_create 283
+#define SYS_timerfd_settime 286
+#define SYS_timerfd_gettime 287
 #define SYS_memfd_create  319
 #define SYS_clock_getres 229
 #define SYS_clock_nanosleep 230
@@ -630,6 +636,57 @@ typedef struct {
 } lstat_t;
 
 /*
+ * Linux x86-64 struct statx musl decodes.  Layout copied from musl's
+ * sys/stat.h; each statx_timestamp is {int64_t tv_sec; uint32_t tv_nsec,__pad}
+ * (16 bytes).  MUST stay 256 bytes to match the user-space contract.
+ */
+typedef struct {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t __pad0;
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    int64_t  stx_atime_sec;
+    uint32_t stx_atime_nsec;
+    uint32_t stx_atime_pad;
+    int64_t  stx_btime_sec;
+    uint32_t stx_btime_nsec;
+    uint32_t stx_btime_pad;
+    int64_t  stx_ctime_sec;
+    uint32_t stx_ctime_nsec;
+    uint32_t stx_ctime_pad;
+    int64_t  stx_mtime_sec;
+    uint32_t stx_mtime_nsec;
+    uint32_t stx_mtime_pad;
+    uint32_t stx_rdev_major;
+    uint32_t stx_rdev_minor;
+    uint32_t stx_dev_major;
+    uint32_t stx_dev_minor;
+    uint64_t __pad1[14];
+} kstatx_t;
+
+#define STATX_TYPE      0x0001
+#define STATX_MODE      0x0002
+#define STATX_NLINK     0x0004
+#define STATX_UID       0x0008
+#define STATX_GID       0x0010
+#define STATX_ATIME     0x0020
+#define STATX_MTIME     0x0040
+#define STATX_CTIME     0x0080
+#define STATX_INO       0x0100
+#define STATX_SIZE      0x0200
+#define STATX_BLOCKS    0x0400
+#define STATX_BASIC_STATS 0x07ff
+#define STATX_BTIME     0x0800
+
+/*
  * Reading a directory descriptor yields a whole number of these records
  * instead of raw bytes.  Fixed-size records mean no getdents-style parsing
  * and no allocator in user space: read() into an array and you are done.
@@ -808,6 +865,7 @@ typedef struct {
 #define AT_PHENT    4
 #define AT_PHNUM    5
 #define AT_PAGESZ   6
+#define AT_BASE     7
 #define AT_ENTRY    9
 #define AT_UID      11
 #define AT_EUID     12

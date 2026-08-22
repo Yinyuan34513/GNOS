@@ -33,8 +33,8 @@
 
 /* ---- eventfd ------------------------------------------------------------ */
 #define EFD_SEMAPHORE 0x0001
-#define EFD_CLOEXEC   0x8000
-#define EFD_NONBLOCK  0x8000
+#define EFD_CLOEXEC   0x80000
+#define EFD_NONBLOCK  O_NONBLOCK        /* 0x800, same as Linux */
 
 typedef struct {
     uint64_t count;
@@ -149,6 +149,14 @@ static int memfd_grow(memfd_t *m, uint64_t len)
         memcpy(pmm_virt(span), memfd_virt(m, 0), m->npages * PAGE_SIZE);
         pmm_free(m->first);
     }
+    /* Freshly extended pages read as zero, the way shmem's ftruncate
+     * guarantees -- pmm_alloc_contiguous does not promise a clean span. */
+    {
+        uint64_t keep = m->npages * PAGE_SIZE;
+        if (keep < need * PAGE_SIZE)
+            memset((uint8_t *)pmm_virt(span) + keep, 0,
+                   (size_t)(need * PAGE_SIZE - keep));
+    }
     m->first  = span;
     m->npages = need;
     return 0;
@@ -197,8 +205,11 @@ static int memfd_mmap(vfs_node_t *n, uint64_t offset, uint64_t *phys,
                       uint64_t *size)
 {
     memfd_t *m = (memfd_t *)n->priv;
-    if (offset >= m->npages * PAGE_SIZE)
-        return -E_INVAL;
+    /* mmap() on a file that has not been written yet must work: wl_shm
+     * pools are created empty and only ftruncate()d to size before any
+     * pixel lands.  Back at least the page the caller asked for. */
+    if (memfd_grow(m, offset + PAGE_SIZE) < 0)
+        return -E_NOMEM;
     *phys = m->first + offset;
     *size = m->npages * PAGE_SIZE - offset;
     return 0;
@@ -235,7 +246,7 @@ static const vfs_ops_t g_memfd_ops = {
 #define MFD_CLOEXEC       0x0001
 #define MFD_ALLOW_SEALING 0x0002
 
-static int anon_bind(int h, int cloexec)
+int anon_bind(int h, int cloexec)
 {
     int fd = fd_alloc(proc_current(), h);
     if (fd < 0) {
@@ -281,7 +292,7 @@ static int64_t eventfd_common(uint64_t count, uint64_t flags)
     e->flags = (int)flags;
 
     int h = vfs_anon_open(VFS_ANON, &g_eventfd_ops, e,
-                          (flags & EFD_NONBLOCK) ? O_NONBLOCK : O_RDWR);
+                          (flags & EFD_NONBLOCK) ? (O_RDWR | O_NONBLOCK) : O_RDWR);
     if (h < 0) {
         kfree(e);
         return h;

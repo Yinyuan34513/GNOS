@@ -34,6 +34,8 @@
 #include "io.h"
 #include "kstring.h"
 #include "debugcon.h"
+#include "proc.h"
+#include "timer.h"
 
 extern uint64_t g_hhdm;
 
@@ -236,12 +238,21 @@ static int32_t drm_ioctl_version(uint64_t arg)
     static const char date[] = "20250101";
     static const char desc[] = "GNOS bochs-display DRM driver";
     v.version_major = 1; v.version_minor = 0; v.version_patchlevel = 0;
-    if (v.name && v.name_len) copy_to_user((uint64_t)(uintptr_t)v.name, name,
-                                           v.name_len < sizeof name ? v.name_len : sizeof name);
-    if (v.date && v.date_len) copy_to_user((uint64_t)(uintptr_t)v.date, date,
-                                           v.date_len < sizeof date ? v.date_len : sizeof date);
-    if (v.desc && v.desc_len) copy_to_user((uint64_t)(uintptr_t)v.desc, desc,
-                                           v.desc_len < sizeof desc ? v.desc_len : sizeof desc);
+    /* The lengths must come back filled in: libdrm's drmGetVersion() makes
+     * the first ioctl with NULL buffers purely to learn name_len/date_len/
+     * desc_len, mallocs exactly that much, and then calls again.  A driver
+     * that leaves them at 0 makes libdrm leave name == NULL, and wlroots'
+     * "Initializing DRM backend for %s (%s)" does strlen() on it -- a NULL
+     * deref on the very first compositor frame. */
+    v.name_len = sizeof name - 1;
+    v.date_len = sizeof date - 1;
+    v.desc_len = sizeof desc - 1;
+    if (v.name && v.name_len)
+        copy_to_user((uint64_t)(uintptr_t)v.name, name, v.name_len);
+    if (v.date && v.date_len)
+        copy_to_user((uint64_t)(uintptr_t)v.date, date, v.date_len);
+    if (v.desc && v.desc_len)
+        copy_to_user((uint64_t)(uintptr_t)v.desc, desc, v.desc_len);
     return copy_to_user(arg, &v, sizeof v);
 }
 
@@ -268,6 +279,19 @@ static int32_t drm_ioctl_get_cap(uint64_t arg)
     case DRM_CAP_DUMB_PREFER_SHADOW:    c.value = 0; break;
     case DRM_CAP_TIMESTAMP_MONOTONIC:   c.value = 1; break;
     case DRM_CAP_ADDFB2_MODIFIERS:      c.value = 0; break; /* linear only */
+    case DRM_CAP_PRIME:
+        /* wlroots' check_drm_features refuses the backend unless PRIME
+         * import is advertised.  Dumb buffers are imported through the
+         * handle->map dance rather than dmabuf fds, but the capability is
+         * what the stack demands, so grant both directions. */
+        c.value = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
+        break;
+    case DRM_CAP_CRTC_IN_VBLANK_EVENT:
+        /* wlroots requires vblank events for its page-flip completion
+         * tracking.  GNOS synthesises DRM_EVENT_FLIP_COMPLETE on the
+         * (synchronous) flip ioctl, which satisfies the same contract. */
+        c.value = 1;
+        break;
     default:                            c.value = 0; break;
     }
     return copy_to_user(arg, &c, sizeof c);
@@ -350,19 +374,18 @@ static int32_t drm_ioctl_get_connector(uint64_t arg)
         copy_to_user((uint64_t)(uintptr_t)c.modes_ptr, modes,
                      sizeof(modes[0]) * N_MODES);
     }
-    if (c.props_ptr && c.count_props >= 2) {
-        static const uint32_t props[2] = { DRM_PROP_ID_DPMS,
-                                           DRM_PROP_ID_EDID };
+    if (c.props_ptr && c.count_props >= 1) {
+        static const uint32_t props[1] = { DRM_PROP_ID_DPMS };
         copy_to_user((uint64_t)(uintptr_t)c.props_ptr, props, sizeof props);
     }
-    if (c.prop_values_ptr && c.count_props >= 2) {
-        static const uint64_t vals[2] = { 0, 0 };   /* DPMS On, no EDID */
+    if (c.prop_values_ptr && c.count_props >= 1) {
+        static const uint64_t vals[1] = { 0 };   /* DPMS On */
         copy_to_user((uint64_t)(uintptr_t)c.prop_values_ptr, vals,
                      sizeof vals);
     }
 
     c.count_modes = N_MODES;
-    c.count_props = 2;
+    c.count_props = 1;
     c.count_encoders = 1;
     c.encoder_id = 1;
     c.connector_type = DRM_MODE_CONNECTOR_VIRTUAL;
@@ -700,12 +723,6 @@ static int32_t drm_fill_property(drm_mode_get_property_t *p)
                          enums, sizeof enums);
         }
         return 0;
-    case DRM_PROP_ID_EDID:              /* connector: blob, none fitted */
-        p->flags = DRM_MODE_PROP_BLOB;
-        memcpy(p->name, "EDID", 5);
-        p->count_values = 0;
-        p->count_enum_blobs = 0;
-        return 0;
     case DRM_PROP_ID_PLANE_TYPE:        /* plane: enum, value 1 = Primary */
         p->flags = DRM_MODE_PROP_ENUM;
         memcpy(p->name, "type", 5);
@@ -743,21 +760,34 @@ static int32_t drm_ioctl_obj_get_properties(uint64_t arg)
     if (copy_from_user(&o, arg, sizeof o) < 0)
         return -E_FAULT;
 
-    static const uint32_t conn_props[2] = { DRM_PROP_ID_DPMS,
-                                            DRM_PROP_ID_EDID };
-    static const uint64_t conn_vals[2] = { 0, 0 };
+    static const uint32_t conn_props[1] = { DRM_PROP_ID_DPMS };
+    static const uint64_t conn_vals[1] = { 0 };
     static const uint32_t plane_props[1] = { DRM_PROP_ID_PLANE_TYPE };
     static const uint64_t plane_vals[1] = { 1 };
+    /* wlroots' get_drm_prop() asks with DRM_MODE_OBJECT_ANY: it wants a
+     * specific property and filters the returned list by id itself.  With
+     * one connector and one plane -- both object id 1 -- there is no way to
+     * tell which kind was meant, so answer with the union.  A caller
+     * looking for "type" finds it, one looking for "DPMS" finds it, and
+     * anything else comes back missing, exactly as it should. */
+    static const uint32_t any_props[2] = { DRM_PROP_ID_DPMS,
+                                           DRM_PROP_ID_PLANE_TYPE };
+    static const uint64_t any_vals[2] = { 0, 1 };
 
     const uint32_t *props = NULL;
     const uint64_t *vals = NULL;
     uint32_t n = 0;
 
     switch (o.obj_type) {
+    case DRM_MODE_OBJECT_ANY:
+        if (o.obj_id != 1)
+            return -E_NOENT;
+        props = any_props; vals = any_vals; n = 2;
+        break;
     case DRM_MODE_OBJECT_CONNECTOR:
         if (o.obj_id != 1)
             return -E_NOENT;
-        props = conn_props; vals = conn_vals; n = 2;
+        props = conn_props; vals = conn_vals; n = 1;
         break;
     case DRM_MODE_OBJECT_PLANE:
         if (o.obj_id != 1)
@@ -789,6 +819,53 @@ static int32_t drm_ioctl_atomic(uint64_t arg)
     return -E_OPNOTSUPP;
 }
 
+/* drm_mode.h: connector property set.  wlroots' legacy commit turns DPMS on
+ * before every SETCRTC, so the one property this driver exposes must be
+ * writable. */
+static int32_t drm_ioctl_set_property(uint64_t arg)
+{
+    drm_mode_connector_set_property_t s;
+    if (copy_from_user(&s, arg, sizeof s) < 0)
+        return -E_FAULT;
+    if (s.connector_id != 1 || s.prop_id != DRM_PROP_ID_DPMS)
+        return -E_INVAL;
+    /* DPMS value accepted and ignored: the panel is always on. */
+    return 0;
+}
+
+/* drm_mode.h: object property set (atomic-style).  Nothing the legacy path
+ * drives through this ioctl is state we keep, so accept any well-formed
+ * write to a known object. */
+static int32_t drm_ioctl_obj_set_property(uint64_t arg)
+{
+    drm_mode_obj_set_property_t s;
+    if (copy_from_user(&s, arg, sizeof s) < 0)
+        return -E_FAULT;
+    switch (s.obj_type) {
+    case DRM_MODE_OBJECT_CRTC:
+    case DRM_MODE_OBJECT_CONNECTOR:
+    case DRM_MODE_OBJECT_PLANE:
+        break;
+    default:
+        return -E_NOENT;
+    }
+    return 0;
+}
+
+/* drm_mode.h: property blob get.  This driver creates no blobs (no EDID
+ * fitted), so every id is unknown -- exactly what Linux answers for a
+ * connector without a fitted monitor. */
+static int32_t drm_ioctl_get_prop_blob(uint64_t arg)
+{
+    drm_mode_get_blob_t b;
+    if (copy_from_user(&b, arg, sizeof b) < 0)
+        return -E_FAULT;
+    (void)b;
+    return -E_NOENT;
+}
+
+static void drm_queue_event(uint64_t user_data);   /* defined below, called by page_flip */
+
 static int32_t drm_ioctl_page_flip(uint64_t arg)
 {
     struct {
@@ -799,8 +876,8 @@ static int32_t drm_ioctl_page_flip(uint64_t arg)
         return -E_FAULT;
     if (p.crtc_id != 1)
         return -E_NOENT;
-    if (p.flags)
-        return -E_INVAL;                /* no async, no vblank events: say so */
+    if (p.flags & ~DRM_MODE_PAGE_FLIP_EVENT)
+        return -E_INVAL;                /* no async; the event flag is served */
     fb_t *f = fb_by_id(p.fb_id);
     if (!f)
         return -E_NOENT;
@@ -810,17 +887,143 @@ static int32_t drm_ioctl_page_flip(uint64_t arg)
     /* No vblank here: a page flip is an immediate blit. */
     blit_fb(d->phys, d->pitch, f->width, f->height, 0, 0);
     g_cur_fb = f->fb_id;
+
+    /* The flip is done; satisfy the client that asked for an event. */
+    if (p.flags & DRM_MODE_PAGE_FLIP_EVENT)
+        drm_queue_event(p.user_data);
+
     return 0;
+}
+
+/* ---- kernel->user event queue ----------------------------------------------
+ * wlroots' legacy uAPI path requests DRM_MODE_PAGE_FLIP_EVENT on every flip
+ * and then blocks in drmHandleEvent() reading the flip-complete event back
+ * off the fd.  GNOS's flip is synchronous, so the event is queued the moment
+ * the ioctl returns and drained by a read() of the expected struct.  A
+ * ring buffer keeps several in flight (a client can queue flips ahead of
+ * display while later ones complete), and the poll() probe reports
+ * readiness so wlroots' epoll integration wakes instead of busy-looping.
+ */
+#define DRM_EVQ_CAP 8
+
+typedef struct {
+    drm_event_vblank_t ev[DRM_EVQ_CAP];
+    unsigned head, count;
+    uint32_t seq;
+    uint64_t now_ms;
+} drm_evq_t;
+
+static drm_evq_t g_evq;
+
+static void drm_queue_event(uint64_t user_data)
+{
+    g_evq.seq++;
+    drm_event_vblank_t *e = &g_evq.ev[(g_evq.head + g_evq.count) % DRM_EVQ_CAP];
+    e->base.length = sizeof(drm_event_vblank_t);
+    e->base.type = DRM_EVENT_FLIP_COMPLETE;
+    e->user_data = user_data;
+    e->tv_sec = 0;
+    e->tv_usec = 0;
+    e->sequence = g_evq.seq;
+    e->crtc_id = 1;
+    if (g_evq.count < DRM_EVQ_CAP)
+        g_evq.count++;
+    else
+        g_evq.head = (g_evq.head + 1) % DRM_EVQ_CAP;
+    sched_wake_reason(WAIT_PIPE);       /* a poll() sleeper may be parked */
+}
+
+static int32_t drm_read(vfs_node_t *n, uint64_t off, void *buf, uint32_t len)
+{
+    (void)n;
+    (void)off;
+    if (!buf || len < sizeof(drm_event_t))
+        return -E_INVAL;
+
+    /* Block until an event arrives (test-and-sleep like the pipe, atomic
+     * against the flip ioctl on a single CPU with cli). */
+    proc_t *me = proc_current();
+    asm volatile("cli");
+    while (g_evq.count == 0) {
+        if (!me || proc_pending_signals(me)) {
+            asm volatile("sti");
+            return -E_INTR;
+        }
+        sched_block_irqoff(WAIT_PIPE);
+    }
+    if (len >= sizeof(drm_event_vblank_t)) {
+        drm_event_vblank_t e = g_evq.ev[g_evq.head];
+        g_evq.head = (g_evq.head + 1) % DRM_EVQ_CAP;
+        g_evq.count--;
+        asm volatile("sti");
+        memcpy(buf, &e, sizeof e);
+        return (int32_t)sizeof e;
+    }
+    drm_event_t e = { .length = g_evq.ev[g_evq.head].base.length,
+                      .type = g_evq.ev[g_evq.head].base.type };
+    g_evq.head = (g_evq.head + 1) % DRM_EVQ_CAP;
+    g_evq.count--;
+    asm volatile("sti");
+    memcpy(buf, &e, sizeof e);
+    return (int32_t)sizeof e;
+}
+
+static int drm_poll(vfs_node_t *n, int16_t events, int16_t *revents)
+{
+    (void)n;
+    int16_t r = 0;
+    if (events & POLLIN)
+        r |= (g_evq.count > 0) ? POLLIN : 0;
+    *revents = r;
+    return 0;
+}
+
+/* The render node has no scanout: it exists for buffer allocation and
+ * rendering, and libdrm's drmIsKMS() probes exactly this by asking for the
+ * mode resources.  Refuse the modeset family here so a render node is not
+ * mistaken for a second GPU -- wlroots would otherwise create a second DRM
+ * backend for /dev/dri/renderD128, and both would fight over crtc 1.  The
+ * dumb-buffer and ADDFB2 ioctls stay valid: they are render-node ops. */
+static int drm_is_kms_ioctl(uint64_t cmd)
+{
+    uint32_t nr = cmd & 0xFF;
+    if (nr < 0xA0 || nr > 0xBF)
+        return 0;
+    switch (nr) {
+    case 0xB2: case 0xB3: case 0xB4:   /* dumb create/map/destroy */
+    case 0xB8:                          /* addfb2 */
+        return 0;
+    }
+    return 1;
 }
 
 static int32_t drm_ioctl(vfs_node_t *n, uint64_t cmd, uint64_t arg)
 {
-    (void)n;
+    if (n && strcmp(n->name, "dri/renderD128") == 0 && drm_is_kms_ioctl(cmd))
+        return -E_OPNOTSUPP;
+    if ((cmd & 0xFF) == 0xC6)   /* DRM_IOCTL_MODE_CREATE_LEASE: no leasing */
+        return -E_OPNOTSUPP;
     switch (cmd) {
     case DRM_IOCTL_VERSION:        return drm_ioctl_version(arg);
     case DRM_IOCTL_GET_UNIQUE:     return drm_ioctl_get_unique(arg);
     case DRM_IOCTL_GET_CAP:        return drm_ioctl_get_cap(arg);
     case DRM_IOCTL_SET_CLIENT_CAP: return drm_ioctl_set_client_cap(arg);
+    /* The magic-number dance is how libdrm's drmIsMaster() and wlroots'
+     * allocator verify DRM master.  GNOS has no master concept: every
+     * opener is master, so GET_MAGIC hands out a token and AUTH_MAGIC
+     * accepts it.  drmIsMaster() then reports true and wlroots uses the
+     * (working) dumb-buffer allocator instead of giving up. */
+    case DRM_IOCTL_GET_MAGIC: {
+        static uint32_t next_magic = 0x1000;
+        drm_auth_t a = { next_magic++ };
+        return copy_to_user(arg, &a, sizeof a);
+    }
+    case DRM_IOCTL_AUTH_MAGIC:     return 0;
+    /* Master acquisition is a no-op: GNOS has no master concept, every
+     * opener is master, so wlroots' drmDropMaster() on device teardown must
+     * succeed rather than log "Failed to drop master: Not a tty". */
+    case DRM_IOCTL_SET_MASTER:
+    case DRM_IOCTL_DROP_MASTER:    return 0;
     case DRM_IOCTL_MODE_GETRESOURCES: return drm_ioctl_get_resources(arg);
     case DRM_IOCTL_MODE_GETCONNECTOR: return drm_ioctl_get_connector(arg);
     case DRM_IOCTL_MODE_GETENCODER:   return drm_ioctl_get_encoder(arg);
@@ -837,6 +1040,9 @@ static int32_t drm_ioctl(vfs_node_t *n, uint64_t cmd, uint64_t arg)
     case DRM_IOCTL_MODE_ADDFB:        return drm_ioctl_addfb(arg);
     case DRM_IOCTL_MODE_ADDFB2:       return drm_ioctl_addfb2(arg);
     case DRM_IOCTL_MODE_RMFB:         return drm_ioctl_rmfb(arg);
+    case DRM_IOCTL_MODE_SETPROPERTY:  return drm_ioctl_set_property(arg);
+    case DRM_IOCTL_MODE_OBJ_SETPROPERTY: return drm_ioctl_obj_set_property(arg);
+    case DRM_IOCTL_MODE_GETPROPBLOB:  return drm_ioctl_get_prop_blob(arg);
     case DRM_IOCTL_MODE_PAGE_FLIP:    return drm_ioctl_page_flip(arg);
     default:
         return -E_NOTTY;
@@ -861,6 +1067,8 @@ static int drm_mmap(vfs_node_t *n, uint64_t offset, uint64_t *phys,
 static const vfs_ops_t g_drm_ops = {
     .ioctl = drm_ioctl,
     .mmap  = drm_mmap,
+    .read  = drm_read,
+    .poll  = drm_poll,
 };
 
 int drm_init(const bootinfo_t *bi)
@@ -885,8 +1093,8 @@ int drm_init(const bootinfo_t *bi)
     }
 
     int slot = subsys_register("drm", "card0", SUBSYS_CLASS_GRAPHIC, 29, 1);
-    if (vfs_register_dev("dri/card0", &g_drm_ops, NULL) != 0 ||
-        vfs_register_dev("dri/renderD128", &g_drm_ops, NULL) != 0) {
+    if (vfs_register_devnum("dri/card0", &g_drm_ops, NULL, 226, 0) != 0 ||
+        vfs_register_devnum("dri/renderD128", &g_drm_ops, NULL, 226, 128) != 0) {
         subsys_set_state(slot, SUBSYS_STATE_FAILED);
         dbg_puts("DRM: device registration failed\n");
         return 0;
