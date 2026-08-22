@@ -1,0 +1,78 @@
+#!/bin/sh
+# startxfce -- bring up the Xfce desktop on the labwc compositor. (GPLv2)
+#
+# Run after a console login (see /root/.profile).  Sets up everything the
+# desktop stack needs that GNOS does not provide for itself yet: no seatd,
+# no logind, no system bus, no machine-id, and libxkbcommon/libinput/fontconfig
+# all need pointing at the copies of their data this initrd carries.
+#
+# Everything below runs in the login's environment; nothing here is inherited
+# from rc on purpose -- the desktop must come up exactly the same way whether
+# rc launched it or a user typed startxfce.
+
+echo STARTXFCE: preparing environment
+
+# ---- runtime directory -------------------------------------------------
+export XDG_RUNTIME_DIR=/tmp/run
+mkdir -p /tmp/run
+chmod 700 /tmp/run 2>/dev/null
+
+# ---- XDG base directories ----------------------------------------------
+# Spec defaults: config/data/cache under $HOME.  xfconfd, the panel and
+# xfce4-session all write here on first run, and a missing parent directory
+# turns those writes into silent failures.  Create them before anything in
+# the session can want them, and pin the variables so nothing guesses.
+: "${HOME:=/root}"
+for d in "$HOME/.config" "$HOME/.local/share" "$HOME/.cache"; do
+    mkdir -p "$d"
+done
+export XDG_CONFIG_HOME="$HOME/.config"
+export XDG_DATA_HOME="$HOME/.local/share"
+export XDG_CACHE_HOME="$HOME/.cache"
+echo "STARTXFCE: XDG dirs $XDG_CONFIG_HOME $XDG_DATA_HOME $XDG_CACHE_HOME runtime=$XDG_RUNTIME_DIR"
+
+# ---- data paths baked into the initrd ----------------------------------
+# libxkbcommon resolves keymaps through XKB_CONFIG_ROOT; without it the
+# compiled-in default points at the build host.
+export XKB_CONFIG_ROOT=/usr/share/X11/xkb
+export FONTCONFIG_FILE=/etc/fonts/fonts.conf
+export LIBINPUT_QUIRKS_DIR=/usr/share/libinput
+
+# ---- wlroots/labwc backend selection -----------------------------------
+# No seatd(8) and no logind: libseat's noop backend grants the seat
+# immediately.  The kernel serves legacy DRM uAPI with software rendering,
+# and libinput cannot initialise the evdev stub yet, so tell wlroots to
+# carry on with zero input devices rather than fail the backend.
+export LIBSEAT_BACKEND=noop
+export WLR_BACKENDS=drm,libinput
+export WLR_RENDERER=pixman
+export WLR_DRM_NO_ATOMIC=1
+export WLR_LIBINPUT_NO_DEVICES=1
+
+# ---- session bus --------------------------------------------------------
+mkdir -p /var/lib/dbus
+if [ ! -f /var/lib/dbus/machine-id ]; then
+    # dbus-uuidgen segfaults under the current kernel; a fixed 32-hex-char
+    # id is exactly as good for a session bus.
+    echo 00000000000000000000000000000000 > /var/lib/dbus/machine-id
+fi
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/run/bus
+if [ ! -S /tmp/run/bus ]; then
+    echo STARTXFCE: launching dbus-daemon
+    /usr/bin/dbus-daemon --session --address=unix:path=/tmp/run/bus \
+        --nopidfile --nofork \
+        --config-file=/usr/share/dbus-1/session.conf &
+    sleep 1
+fi
+
+# ---- compositor ---------------------------------------------------------
+echo STARTXFCE: launching labwc
+/usr/bin/labwc -d &
+export WAYLAND_DISPLAY=wayland-0
+# labwc needs a moment to create its socket before clients connect; there is
+# no portable way to poll for it here, so just give it two seconds.
+sleep 2
+
+# ---- the session --------------------------------------------------------
+echo STARTXFCE: launching xfce4-session
+exec /usr/bin/xfce4-session

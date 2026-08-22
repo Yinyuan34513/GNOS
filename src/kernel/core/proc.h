@@ -58,6 +58,7 @@ typedef enum {
     WAIT_NET,
     WAIT_SLEEP,                     /* nanosleep: waiting only on the clock */
     WAIT_FUTEX,                     /* futex wait: keyed by (as, futex_addr) */
+    WAIT_DRM,                       /* DRM wait_queue (vblank/commit/event) */
 } wait_reason_t;
 
 /* Signal numbers, wait() flags and the rest of the user-visible constants
@@ -146,6 +147,7 @@ typedef struct proc {
     wait_reason_t wait_reason;
     int           wait_pid;         /* which child waitpid() is after, -1 = any */
     uint64_t      wake_tick;        /* timer tick to wake at, 0 = no deadline */
+    void         *wait_q;           /* DRM wait_queue this proc sleeps on */
 
     /* The tick this process was created on.  There is no per-process CPU
      * accounting here, so times() and getrusage() report elapsed lifetime
@@ -366,8 +368,25 @@ void sched_block_timeout(wait_reason_t why, uint64_t ticks);
 void sched_wake(proc_t *p);
 /* Wake everybody sleeping for the same reason (a driver got some data). */
 void sched_wake_reason(wait_reason_t why);
+/* Wake every process blocked on the given DRM wait_queue. */
+void sched_wake_queue(void *q);
 /* Wake anyone whose deadline has passed.  Called from the timer interrupt. */
 void sched_expire_timeouts(void);
+
+/* ---- kernel threads ----------------------------------------------------
+ * A kthread is a task whose entry point is a kernel function rather than a
+ * user program: it runs on the kernel page tables (vmm_kernel_as), owns no
+ * user address space, and its first scheduling returns into
+ * kthread_trampoline instead of ret_to_user.  kthread_create() hands the
+ * bootstrap block to the trampoline, which runs entry(arg) and then exits
+ * the thread. */
+typedef struct kthread_bootstrap {
+    void (*entry)(void *arg);
+    void *arg;
+} kthread_bootstrap_t;
+
+void kthread_bootstrap(kthread_bootstrap_t *b) __attribute__((noreturn));
+proc_t *kthread_create(const char *name, void (*entry)(void *), void *arg);
 
 /* ---- signals ---------------------------------------------------------- */
 int  proc_signal(proc_t *p, int sig);

@@ -172,6 +172,30 @@ void *kmalloc(size_t size)
     return NULL;
 }
 
+/* Resize a block, moving it if the old block cannot grow in place.  The old
+ * payload size comes from the block header (payload = size - HDR_SIZE -
+ * FOOT_SIZE), which is what lets us copy the right amount before freeing. */
+void *krealloc(void *p, size_t size)
+{
+    if (!p)
+        return kmalloc(size);
+    if (!size) {
+        kfree(p);
+        return NULL;
+    }
+
+    kheap_hdr_t *b  = (kheap_hdr_t *)((uint8_t *)p - HDR_SIZE);
+    uint64_t oldpay = b->size - HDR_SIZE - FOOT_SIZE;
+
+    void *np = kmalloc(size);
+    if (!np)
+        return NULL;
+    uint64_t copy = (oldpay < (uint64_t)size) ? oldpay : (uint64_t)size;
+    memcpy(np, p, copy);
+    kfree(p);
+    return np;
+}
+
 void kfree(void *p)
 {
     if (!p)

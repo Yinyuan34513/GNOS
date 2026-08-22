@@ -30,10 +30,11 @@ BASEFLAGS := -m64 -ffreestanding -nostdlib -fno-stack-protector -fno-builtin \
              -nostdinc -std=gnu11 -mno-red-zone -mgeneral-regs-only \
              -mno-sse -mno-sse2 -mno-mmx -mno-80387 -fvisibility=hidden \
              -Wall -Wextra -O2 -g -Isrc/include -Isrc/shared \
-             -Isrc/kernel/core -Isrc/kernel/driver
+             -Isrc/kernel/core -Isrc/kernel/driver -Isrc/kernel/driver/drm \
+             -Isrc/kernel/driver/drm/ported
 
 # kernel: PIE so Limine can relocate it into the higher half
-KCFLAGS := $(BASEFLAGS) -fpie
+KCFLAGS := $(BASEFLAGS) -fpie -DSYSTRACE
 # user programs: linked at a fixed address by src/user/user.ld
 UCFLAGS := $(BASEFLAGS) -Isrc/user -fno-pie -fno-pic
 
@@ -48,7 +49,21 @@ ISO     := $(BUILD)/gnos.iso
 ISO_ROOT := $(BUILD)/iso
 
 KOBJS := $(BUILD)/kernel.o $(BUILD)/loader.o $(BUILD)/fbcon.o $(BUILD)/gfx.o \
-         $(BUILD)/fbdev.o $(BUILD)/drm.o $(BUILD)/subsys.o $(BUILD)/acpi.o \
+         $(BUILD)/fbdev.o \
+         $(BUILD)/drm_drv.o $(BUILD)/drm_file.o $(BUILD)/drm_auth.o \
+         $(BUILD)/drm_ioctl.o $(BUILD)/drm_init.o $(BUILD)/drm_devtmpfs.o \
+         $(BUILD)/intrusive_list.o $(BUILD)/rbtree.o \
+         $(BUILD)/drm_idr.o $(BUILD)/drm_hashtab.o $(BUILD)/drm_rect.o \
+         $(BUILD)/drm_mm.o $(BUILD)/drm_vsnprintf.o $(BUILD)/drm_print.o \
+         $(BUILD)/drm_modeset_lock.o \
+         $(BUILD)/drm_connector.o $(BUILD)/drm_crtc.o $(BUILD)/drm_encoder.o \
+         $(BUILD)/drm_plane.o $(BUILD)/drm_mode_config.o \
+         $(BUILD)/drm_mode_object.o $(BUILD)/drm_modes.o $(BUILD)/drm_blend.o \
+         $(BUILD)/drm_atomic.o $(BUILD)/drm_atomic_helper.o \
+         $(BUILD)/drm_atomic_uapi.o $(BUILD)/drm_vblank.o \
+         $(BUILD)/drm_gem.o $(BUILD)/drm_framebuffer.o \
+         $(BUILD)/drm_property.o $(BUILD)/drm_libc.o \
+         $(BUILD)/subsys.o $(BUILD)/acpi.o \
          $(BUILD)/debugcon.o $(BUILD)/ext2.o $(BUILD)/panic.o \
          $(BUILD)/gdt.o $(BUILD)/idt.o $(BUILD)/isr.o \
          $(BUILD)/kstring.o $(BUILD)/vfs.o $(BUILD)/procfs.o $(BUILD)/tmpfs.o $(BUILD)/tty.o $(BUILD)/heap.o \
@@ -62,13 +77,13 @@ KOBJS := $(BUILD)/kernel.o $(BUILD)/loader.o $(BUILD)/fbcon.o $(BUILD)/gfx.o \
         $(BUILD)/hda.o $(BUILD)/ata.o $(BUILD)/cjkfont.o \
         $(BUILD)/cjkfont_data.o \
         $(BUILD)/input.o \
-        $(BUILD)/anonfd.o $(BUILD)/epoll.o $(BUILD)/timerfd.o \
+        $(BUILD)/anonfd.o $(BUILD)/epoll.o $(BUILD)/timerfd.o $(BUILD)/signalfd.o \
         $(BUILD)/unix.o \
         $(BUILD)/module.o $(BUILD)/module_elf.o $(BUILD)/exports.o \
         $(BUILD)/limine_requests.o
 
 # User programs: name -> build/<name>.elf, all linked from crt0 + ulib.
-UPROGS  := init shell count ls cat tail tac rm mkdir touch scan dbgcat
+UPROGS  := init shell count ls cat tail tac rm mkdir touch scan dbgcat envtest
 UELFS   := $(addprefix $(BUILD)/,$(addsuffix .elf,$(UPROGS)))
 UCRT    := $(BUILD)/user/crt0.o $(BUILD)/user/ulib.o
 
@@ -252,6 +267,7 @@ BU_SRC := $(BUILD)/busrcc/binutils-2.47
 # silently reads back as zero.  User mode is safe here -- vmm.c sets
 # CR4.OSFXSR and proc.c fxsaves/fxrstors per process.
 MUSLCFLAGS := $(filter-out -Isrc/include -Isrc/kernel/core -Isrc/kernel/driver \
+                           -Isrc/kernel/driver/drm \
                            -mgeneral-regs-only \
                            -mno-sse -mno-sse2 -mno-mmx -mno-80387,$(BASEFLAGS)) \
               -isystem $(MUSL_INC) -Isrc/user -fno-pie -fno-pic
@@ -291,13 +307,19 @@ QEMU_DISK := -drive file=$(DISK),format=raw,if=ide,index=0,media=disk
 # exactly what must not happen: the kernel mounts this read-write in RAM and
 # every byte the filesystem grows at runtime comes out of this headroom.
 # fastfetch alone added ~4 MiB of binaries, so 96M.
-INITRD_MB ?= 96
+INITRD_MB ?= 256
 
 # Number of virtual cores QEMU exposes.  The SMP bring-up path brings up
 # every core Limine reports, so changing this also changes what smpinfo.elf
 # (run from /etc/rc) must assert -- keep the two in sync.
 SMP_CPUS ?= 4
 QEMU_SMP := -smp $(SMP_CPUS)
+
+# RAM the VM gets.  The initrd is now a 256 MiB ext2 image (Xfce desktop
+# binaries are ~18 MiB each), so 512M leaves too little for the kernel plus
+# the running session and the guest dies with "Failed to allocate memory".
+QEMU_MEM ?= 8G
+QEMU_MEM_ARG := -m $(QEMU_MEM)
 
 QEMU_DEVICES := $(QEMU_NET) $(QEMU_AUDIO) $(QEMU_DISK) $(QEMU_SMP)
 
@@ -407,7 +429,8 @@ DEPS := $(KOBJS:.o=.d) $(UOBJS:.o=.d) $(MUSL_OBJS:.o=.d) $(UCRT:.o=.d) \
 # (hardware-facing) subdirectories plus the root for the two entry-point
 # files -- while every .o lands flat in $(BUILD).  vpath lets the %.o rules
 # below find a source by bare name no matter which directory it is in.
-vpath %.c src/kernel src/kernel/core src/kernel/driver
+vpath %.c src/kernel src/kernel/core src/kernel/driver src/kernel/driver/drm \
+        src/kernel/driver/drm/ported
 vpath %.asm src/kernel src/kernel/core src/kernel/driver
 vpath %.S src/kernel src/kernel/core src/kernel/driver
 
@@ -725,9 +748,24 @@ $(INITRD): $(UELFS) $(MUSL_ELFS) $(BUILD)/dynhello.elf $(BB_BIN) $(BASH_BIN) \
 	strip $(BUILD)/initrd-root/usr/bin/labwc
 	mkdir -p $(BUILD)/initrd-root/usr/share/X11/xkb
 	cp -a /usr/share/X11/xkb/. $(BUILD)/initrd-root/usr/share/X11/xkb/
+	# libinput's device-quirk database: libinput bakes LIBINPUT_QUIRKS_DIR to
+	# the build prefix at compile time, but the booted GNOS root is / and the
+	# data lives at /usr/share.  Copy it into the initrd and point labwc at it
+	# via LIBINPUT_QUIRKS_DIR (see src/user/rc); without it libinput logs
+	# "failed to find files" and the compositor's input init is unhappy.
+	mkdir -p $(BUILD)/initrd-root/usr/share/libinput
+	cp -a $(DESK_STAGE)/share/libinput/. $(BUILD)/initrd-root/usr/share/libinput/
 	mkdir -p $(BUILD)/initrd-root/etc/xdg/labwc
 	cp $(DESK_STAGE)/../labwc-etc/rc.xml $(BUILD)/initrd-root/etc/xdg/labwc/rc.xml
 	cp $(DESK_STAGE)/../labwc-etc/menu.xml $(BUILD)/initrd-root/etc/xdg/labwc/menu.xml
+	# libxkbcommon resolves keymaps through XKB_CONFIG_ROOT (rc exports
+	# /usr/share/X11/xkb); without the rules/symbols/keycodes tree every
+	# keyboard init fails and labwc refuses to start.  The data is plain
+	# text keymap files, so it is taken from the build host's
+	# xkeyboard-config package rather than built from source.
+	mkdir -p $(BUILD)/initrd-root/usr/share/X11
+	cp -a /usr/share/X11/xkb $(BUILD)/initrd-root/usr/share/X11/xkb
+	cp -a /usr/share/X11/locale $(BUILD)/initrd-root/usr/share/X11/locale
 	# labwc draws text through pango/cairo/fontconfig: the initrd must carry
 	# fontconfig's config tree (fonts.conf + conf.d) and at least one
 	# TrueType face, or pango fails font resolution and the compositor
@@ -738,7 +776,60 @@ $(INITRD): $(UELFS) $(MUSL_ELFS) $(BUILD)/dynhello.elf $(BB_BIN) $(BASH_BIN) \
 	cp /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
 	   /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf \
 	   $(BUILD)/initrd-root/usr/share/fonts/truetype/dejavu/
+	# ---- Xfce (Wayland) session -------------------------------------------
+	# xfce4-session + panel + desktop + settings daemon, statically linked
+	# against the desk stack, plus the XDG data (icons, applications,
+	# gtk-3.0 settings, glib schemas, dbus session services) the session
+	# reads at runtime.  dbus-daemon/dbus-launch provide the session bus
+	# xfconf and the rest of Xfce talk over; the compositor (labwc) stays
+	# the one compositor, Xfce just runs as clients on top of it.
+	mkdir -p $(BUILD)/initrd-root/usr/bin
+	for b in xfce4-session xfce4-panel xfdesktop xfsettingsd \
+	         xfce4-appfinder thunar dbus-daemon dbus-launch dbus-uuidgen Thunar; do \
+	  cp $(DESK_STAGE)/bin/$$b $(BUILD)/initrd-root/usr/bin/$$b; \
+	  strip $(BUILD)/initrd-root/usr/bin/$$b; \
+	done
+	# D-Bus activated daemons live in libexec dirs, not /bin.
+	mkdir -p $(BUILD)/initrd-root/usr/lib/xfce4/xfconf
+	mkdir -p $(BUILD)/initrd-root/usr/lib/tumbler-1
+	cp $(DESK_STAGE)/lib/xfce4/xfconf/xfconfd $(BUILD)/initrd-root/usr/lib/xfce4/xfconf/xfconfd
+	cp $(DESK_STAGE)/lib/tumbler-1/tumblerd $(BUILD)/initrd-root/usr/lib/tumbler-1/tumblerd
+	-strip $(BUILD)/initrd-root/usr/lib/xfce4/xfconf/xfconfd \
+	    $(BUILD)/initrd-root/usr/lib/tumbler-1/tumblerd
+	# The .service files were generated at build time with the staging
+	mkdir -p $(BUILD)/initrd-root/usr/share/xfce4
+	cp -a $(DESK_STAGE)/share/xfce4/. $(BUILD)/initrd-root/usr/share/xfce4/
+	mkdir -p $(BUILD)/initrd-root/usr/share/applications
+	cp -a $(DESK_STAGE)/share/applications/. $(BUILD)/initrd-root/usr/share/applications/
+	mkdir -p $(BUILD)/initrd-root/usr/share/icons
+	cp -a $(DESK_STAGE)/share/icons/. $(BUILD)/initrd-root/usr/share/icons/
+	mkdir -p $(BUILD)/initrd-root/usr/share/gtk-3.0
+	cp -a $(DESK_STAGE)/share/gtk-3.0/. $(BUILD)/initrd-root/usr/share/gtk-3.0/
+	mkdir -p $(BUILD)/initrd-root/usr/share/glib-2.0
+	cp -a $(DESK_STAGE)/share/glib-2.0/. $(BUILD)/initrd-root/usr/share/glib-2.0/
+	mkdir -p $(BUILD)/initrd-root/usr/share/dbus-1
+	cp -a $(DESK_STAGE)/share/dbus-1/. $(BUILD)/initrd-root/usr/share/dbus-1/
+	mkdir -p $(BUILD)/initrd-root/usr/share/wayland-sessions
+	cp -a $(DESK_STAGE)/usr/share/wayland-sessions/. $(BUILD)/initrd-root/usr/share/wayland-sessions/
+	mkdir -p $(BUILD)/initrd-root/etc/dbus-1
+	cp -a $(DESK_STAGE)/etc/dbus-1/. $(BUILD)/initrd-root/etc/dbus-1/
+	# prefix baked into Exec=.  On the target that path does not exist, so
+	# every activation died with ENOENT and the session stalled waiting for
+	# Xfconf.  Rewrite the prefix to /usr -- matching where everything was
+	# installed above -- before packing.  Same treatment for the dbus conf
+	# files, whose listen/pidfile/include paths carry the prefix too.
+	abs_stage=$$(realpath $(DESK_STAGE)); \
+	for f in $(BUILD)/initrd-root/usr/share/dbus-1/services/*.service \
+	         $(BUILD)/initrd-root/usr/share/dbus-1/*.conf \
+	         $(BUILD)/initrd-root/etc/dbus-1/*.conf; do \
+	  [ -f "$$f" ] && sed -i "s|$$abs_stage|/usr|g; s|$(DESK_STAGE)|/usr|g" $$f || true; \
+	done
+	
 	cp src/user/rc $(BUILD)/initrd-root/etc/rc            # run once at boot by init
+	# startxfce: post-login desktop launcher (see /root/.profile).  Installed
+	# executable because the kernel honours the #! line only on a real exec.
+	cp src/user/startxfce $(BUILD)/initrd-root/usr/bin/startxfce
+	chmod 755 $(BUILD)/initrd-root/usr/bin/startxfce
 	# Static system config (hosts, resolv.conf, nsswitch, services, protocols,
 	# passwd/group, hostname).  These make the BusyBox network tools and the
 	# C resolver actually work: ping/wget do DNS via /etc/resolv.conf, getent
@@ -828,10 +919,10 @@ $(DISK):
 	qemu-img create -f raw $@ $(DISK_MB)M
 
 run: $(ISO) $(DISK)
-	qemu-system-x86_64 -cdrom $(ISO) -m 512M -display gtk $(QEMU_DEVICES)
+	qemu-system-x86_64 -cdrom $(ISO) $(QEMU_MEM_ARG) -display gtk $(QEMU_DEVICES)
 
 run-uefi: $(ISO) $(DISK)
-	qemu-system-x86_64 -cdrom $(ISO) -m 512M -bios $(OVMF) -display gtk \
+	qemu-system-x86_64 -cdrom $(ISO) $(QEMU_MEM_ARG) -bios $(OVMF) -display gtk \
 	  $(QEMU_DEVICES)
 
 # guistart — the "just show me the OS" target.
@@ -847,7 +938,7 @@ run-uefi: $(ISO) $(DISK)
 guistart: $(ISO) $(DISK)
 	@echo "GNOS: booting in a window (audio backend: $(AUDIO_BACKEND));"
 	@echo "      boot log is also being written to $(BUILD)/dbg.log"
-	qemu-system-x86_64 -cdrom $(ISO) -m 512M \
+	qemu-system-x86_64 -cdrom $(ISO) $(QEMU_MEM_ARG) \
 	  $(QEMU_NET) $(GUI_AUDIO) $(QEMU_DISK) \
 	  -device isa-debugcon,chardev=dbg -chardev file,id=dbg,path=$(BUILD)/dbg.log \
 	  -display gtk -no-reboot
@@ -857,7 +948,7 @@ guistart: $(ISO) $(DISK)
 # `make headless; grep PASS build/dbg.log` is the whole verification loop.
 headless: $(ISO) $(DISK)
 	@echo "GNOS: booting headless; log is $(BUILD)/dbg.log"
-	qemu-system-x86_64 -cdrom $(ISO) -m 512M \
+	qemu-system-x86_64 -cdrom $(ISO) $(QEMU_MEM_ARG) \
 	  $(QEMU_NET) $(QEMU_DISK) \
 	  -device isa-debugcon,chardev=dbg -chardev file,id=dbg,path=$(BUILD)/dbg.log \
 	  -display none -no-reboot -smp 4

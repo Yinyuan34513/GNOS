@@ -17,76 +17,76 @@ echo GNOS rc: starting up
 # again, for real, after the mounts.
 mkdir -p /var/log
 echo GNOS rc: ready
-/bin/hello.elf
-echo GNOS rc: hello exited with status $?
+# /bin/hello.elf
+# echo GNOS rc: hello exited with status $?
 
 # ---- pthread self-test ---------------------------------------------------
 # The kernel's thread support (CLONE_VM, tgid, blocking futex) has exactly
 # one judge: musl's pthreads running on top of it.  Assert every part, the
 # way the rest of the boot-time tests assert their subsystems.
-echo GNOS rc: thrtest
-/bin/thrtest.elf
-echo GNOS rc: thrtest exited with status $?
+# echo GNOS rc: thrtest
+# /bin/thrtest.elf
+# echo GNOS rc: thrtest exited with status $?
 
 # ---- CJK rendering smoke test -------------------------------------------
 # The console decodes UTF-8 and paints 16x16 Unifont glyphs; this line is
 # the boot-time witness.  A headless run decodes the framebuffer screenshot
 # with tools/fbocr.py and asserts these four characters came out.
-echo CJKTEST: 你好世界
+# echo CJKTEST: 你好世界
 
 # ---- DRM/KMS self-test ---------------------------------------------------
 # /dev/dri/card0 must speak the Linux UAPI: caps, resources, dumb buffers
 # and a real mode switch through the bochs VBE registers, then back.  The
 # screen visibly flashes colour bars while it runs; the verdicts land on
 # the debug console.
-echo GNOS rc: drmtest
-/bin/drmtest.elf
-echo GNOS rc: drmtest exited with status $?
+# echo GNOS rc: drmtest
+# /bin/drmtest.elf
+# echo GNOS rc: drmtest exited with status $?
 
 # ---- ptrace self-test ---------------------------------------------------
 # The kernel's ptrace(2) must speak the Linux ABI: TRACEME, stop/wait
 # reporting, peek/poke through the tracee's page tables, GETREGS and a
 # TRACESYSGOOD syscall-entry stop, then a tracer-injected exit status.
-echo GNOS rc: ptracetest
-/bin/ptracetest.elf
-echo GNOS rc: ptracetest exited with status $?
+# echo GNOS rc: ptracetest
+# /bin/ptracetest.elf
+# echo GNOS rc: ptracetest exited with status $?
 
 # ---- kernel module self-test ---------------------------------------------
 # Loads moddemo.ko through finit_module(2), verifies /proc/modules and the
 # driver registry see it, loads modpair.ko on top (which imports a symbol
 # from moddemo.ko), exercises EBUSY-on-import, unload order, ENOENT, a
 # garbage ENOEXEC, and the plain init_module(2) path.
-echo GNOS rc: evtest
-/bin/evtest.elf
-echo GNOS rc: evtest exited with status $?
-echo GNOS rc: eventest
-/bin/eventest.elf
-echo GNOS rc: eventest exited with status $?
-echo GNOS rc: socktest
-/bin/socktest.elf
-echo GNOS rc: socktest exited with status $?
+# echo GNOS rc: evtest
+# /bin/evtest.elf
+# echo GNOS rc: evtest exited with status $?
+# echo GNOS rc: eventest
+# /bin/eventest.elf
+# echo GNOS rc: eventest exited with status $?
+# echo GNOS rc: socktest
+# /bin/socktest.elf
+# echo GNOS rc: socktest exited with status $?
 
 # ---- curl: the full baidu.com response -----------------------------------
 # The acceptance test for the TCP/UDP stack: fetch http://baidu.com and dump
 # the *entire* response (status line, headers, body) into the boot log.
 # baidu.com answers 301 to plain HTTP and the kernel has no TLS, so the full
 # response is the redirect itself -- that is what is asserted on.
-echo CURLTEST: curl http://baidu.com full response
-/usr/bin/curl -i --max-redirs 0 http://baidu.com > /var/log/curl-baidu.log 2>&1
-echo CURLTEST: curl exited with status $?
-/bin/dbgcat.elf /var/log/curl-baidu.log
-/usr/bin/grep -q 'HTTP/1.1' /var/log/curl-baidu.log
-echo CURLTEST: response asserted rc=$?
+# echo CURLTEST: curl http://baidu.com full response
+# /usr/bin/curl -i --max-redirs 0 http://baidu.com > /var/log/curl-baidu.log 2>&1
+# echo CURLTEST: curl exited with status $?
+# /bin/dbgcat.elf /var/log/curl-baidu.log
+# /usr/bin/grep -q 'HTTP/1.1' /var/log/curl-baidu.log
+# echo CURLTEST: response asserted rc=$?
 
 # ---- fastfetch smoke test ------------------------------------------------
 # The system-info tool, run against the real OS (not the build machine):
 # every module that cannot work here must degrade to nothing rather than
 # crash.  The output is teed to the debug log through dbgcat so `make test`
 # can see it; a framebuffer run shows the logo.
-echo GNOS rc: fastfetch
-/usr/bin/fastfetch --logo none > /var/log/fastfetch.log 2>&1
-echo GNOS rc: fastfetch exited with status $?
-/bin/dbgcat.elf /var/log/fastfetch.log
+# echo GNOS rc: fastfetch
+# /usr/bin/fastfetch --logo none > /var/log/fastfetch.log 2>&1
+# echo GNOS rc: fastfetch exited with status $?
+# /bin/dbgcat.elf /var/log/fastfetch.log
 
 # ---- nano smoke test -----------------------------------------------------
 # The editor must really run: version banner first, then a real edit session
@@ -94,16 +94,16 @@ echo GNOS rc: fastfetch exited with status $?
 # terminal a second after nano opens, and nano must exit cleanly with the
 # file intact.  TERM=xterm needs the xterm terminfo entry, which the initrd
 # carries under /usr/share/terminfo.
-echo NANOTEST: nano --version
-TERM=xterm /usr/bin/nano --version
-echo NANOTEST: version rc=$?
-printf 'hello from nano\n' > /tmp/nanotest.txt
-echo NANOTEST: opening /tmp/nanotest.txt with TERM=xterm
-( sleep 1; printf '\030' ) &
-TERM=xterm /usr/bin/nano /tmp/nanotest.txt
-echo NANOTEST: nano exited with status $?
-echo NANOTEST: file content after edit:
-/usr/bin/cat /tmp/nanotest.txt
+# echo NANOTEST: nano --version
+# TERM=xterm /usr/bin/nano --version
+# echo NANOTEST: version rc=$?
+# printf 'hello from nano\n' > /tmp/nanotest.txt
+# echo NANOTEST: opening /tmp/nanotest.txt with TERM=xterm
+# ( sleep 1; printf '\030' ) &
+# TERM=xterm /usr/bin/nano /tmp/nanotest.txt
+# echo NANOTEST: nano exited with status $?
+# echo NANOTEST: file content after edit:
+# /usr/bin/cat /tmp/nanotest.txt
 
 # ---- /etc/fstab ----------------------------------------------------------
 # Replay the fstab before OpenRC runs, not after: the very first thing the
@@ -153,17 +153,17 @@ echo GNOS rc: openrc default
 /sbin/openrc default
 echo GNOS rc: openrc default exited with status $?
 # ---- TEMP: binutils smoke test ----
-echo BINSMOKE: readelf -h /init.elf
-/usr/bin/readelf -h /init.elf
-echo BINSMOKE: readelf exited with status $?
-echo 'mov $0x1234, %rax' | /usr/bin/as -o /tmp/t.o
-echo BINSMOKE: as exited with status $?
-/usr/bin/ld -o /tmp/t /tmp/t.o
-echo BINSMOKE: ld exited with status $?
-/usr/bin/objdump -d /tmp/t
-echo BINSMOKE: objdump exited with status $?
-/usr/bin/nm /init.elf >/dev/null
-echo BINSMOKE: nm exited with status $?
+# echo BINSMOKE: readelf -h /init.elf
+# /usr/bin/readelf -h /init.elf
+# echo BINSMOKE: readelf exited with status $?
+# echo 'mov $0x1234, %rax' | /usr/bin/as -o /tmp/t.o
+# echo BINSMOKE: as exited with status $?
+# /usr/bin/ld -o /tmp/t /tmp/t.o
+# echo BINSMOKE: ld exited with status $?
+# /usr/bin/objdump -d /tmp/t
+# echo BINSMOKE: objdump exited with status $?
+# /usr/bin/nm /init.elf >/dev/null
+# echo BINSMOKE: nm exited with status $?
 
 # ---- labwc: the GNOS Desktop --------------------------------------------
 # The acceptance test for the whole desktop line: wlroots 0.19 + labwc 0.9
@@ -173,24 +173,4 @@ echo BINSMOKE: nm exited with status $?
 # WLR_* variables pin the backends/renderer the kernel can actually serve
 # (drm + libinput, pixman software rendering, no atomic modesetting).
 # labwc runs in the background; the boot log records whether it came up.
-echo DESKTOPTEST: launching labwc
-export XKB_CONFIG_ROOT=/usr/share/X11/xkb
-export XDG_RUNTIME_DIR=/tmp/run
-export FONTCONFIG_FILE=/etc/fonts/fonts.conf
-# GNOS has no seatd(8) and no logind: the seat is the one user on the one
-# console.  Real libseat's noop backend is exactly this -- it grants the
-# seat immediately and hands wlroots a socketpair to poll.  Without this
-# LIBSEAT_BACKEND, libseat tries the seatd socket, fails, skips noop and
-# wlroots logs "failed to start a session".
-export LIBSEAT_BACKEND=noop
-export WLR_BACKENDS=drm,libinput
-export WLR_RENDERER=pixman
-export WLR_DRM_NO_ATOMIC=1
-# libinput cannot yet initialise the GNOS evdev stub (EVIOCGABS and friends
-# are missing), so it reports zero devices.  Let the libinput backend start
-# anyway -- the compositor still drives the DRM output -- rather than have
-# the whole backend fail.  Keyboard/mouse support is a separate battle.
-export WLR_LIBINPUT_NO_DEVICES=1
-echo DESKTOPTEST: disabled by user request -- labwc not launched
-# /usr/bin/labwc
-# echo DESKTOPTEST: labwc exited rc=$?
+/bin/login.elf

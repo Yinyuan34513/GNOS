@@ -56,6 +56,7 @@
 #define SYS_mprotect     10
 #define SYS_mmap         9
 #define SYS_munmap       11
+#define SYS_mremap       25
 #define SYS_brk          12
 #define SYS_rt_sigaction 13
 #define SYS_rt_sigprocmask 14
@@ -190,6 +191,7 @@
 #define SYS_timerfd_create 283
 #define SYS_timerfd_settime 286
 #define SYS_timerfd_gettime 287
+#define SYS_signalfd4     289
 #define SYS_memfd_create  319
 #define SYS_clock_getres 229
 #define SYS_clock_nanosleep 230

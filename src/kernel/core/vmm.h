@@ -78,8 +78,14 @@ typedef struct addrspace {
      * mmap done by one thread is visible to the fault handler when another
      * thread touches it, and munmap drops the record for all of them so a
      * freed region is never lazily re-mapped as a zeroed page.
+     *
+     * `flags' carries the VM_* protection the mapping was created with (and
+     * whatever mprotect later rewrote it to).  Anonymous mappings are backed
+     * lazily -- the pages are allocated by the #PF handler on first touch --
+     * so the fault path needs the original protection to back a page with
+     * the right permissions and to keep PROT_NONE guard pages faulting.
      */
-    struct { uint64_t base; uint64_t size; } mmaps[128];
+    struct { uint64_t base; uint64_t size; unsigned flags; } mmaps[128];
     int      nmmaps;
 } addrspace_t;
 
@@ -159,6 +165,11 @@ void vmm_switch(addrspace_t *as);
 /* Go back to the bootloader's (kernel-only) page tables.  Needed before an
  * address space can be torn down by the very task that is running on it. */
 void vmm_switch_kernel(void);
+
+/* A static address space over the running kernel's own page tables, for
+ * kernel threads: vmm_switch() needs a valid addrspace_t and a kthread has
+ * no user memory of its own, so it runs on the kernel PML4 instead. */
+addrspace_t *vmm_kernel_as(void);
 
 /* Copy into a user address space that may not be the current one. */
 int vmm_copy_to_user(addrspace_t *as, uint64_t dst, const void *src, uint64_t n);

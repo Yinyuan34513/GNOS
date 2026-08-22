@@ -123,6 +123,22 @@ void unix_close(int u)
     unix_t *s = unix_at(u);
     if (!s)
         return;
+#ifdef SYSTRACE
+    {
+        extern void dbg_puts(const char *);
+        extern void dbg_puts_dec(uint32_t);
+        extern void dbg_puts_hex(unsigned long);
+        dbg_puts("UCLOSE p=");
+        dbg_puts_dec((uint32_t)(proc_current() ? proc_current()->pid : 0));
+        dbg_puts(" u=");
+        dbg_puts_dec((uint32_t)u);
+        dbg_puts(" lst=");
+        dbg_puts_dec((uint32_t)s->listening);
+        dbg_puts(" path=");
+        dbg_puts(s->has_path ? s->bound : "-");
+        dbg_puts("\n");
+    }
+#endif
 
     /* Wake the peer so a parked reader sees EOF; break its back-pointer so
      * a later write from that side gets -EPIPE instead of a stale pointer.
@@ -282,8 +298,27 @@ static int unix_recv_data(unix_t *s, void *buf, uint32_t len, int peek,
         }
         if (got > 0)
             break;                      /* deliver the partial read */
-        if (s->peer_closed || s->shut_rx)
+        if (s->peer_closed || s->shut_rx) {
+#ifdef SYSTRACE
+            {
+                extern void dbg_puts(const char *);
+                extern void dbg_puts_dec(uint32_t);
+                static unsigned ue;
+                if (++ue < 30) {
+                    dbg_puts("UEOF u=");
+                    dbg_puts_dec((uint32_t)(s - g_unix));
+                    dbg_puts(" pc=");
+                    dbg_puts_dec((uint32_t)s->peer_closed);
+                    dbg_puts(" srx=");
+                    dbg_puts_dec((uint32_t)s->shut_rx);
+                    dbg_puts(" lst=");
+                    dbg_puts_dec((uint32_t)s->listening);
+                    dbg_puts("\n");
+                }
+            }
+#endif
             return 0;                   /* EOF */
+        }
         if (nonblock || s->nonblock)
             return -E_AGAIN;
         sched_block_timeout(WAIT_PIPE, 0);

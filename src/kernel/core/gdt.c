@@ -105,6 +105,16 @@ void gdt_init(void)
         : "m"(gdtr), "i"(SEL_KDATA), "i"(SEL_KCODE), "i"(SEL_TSS)
         : "rax", "memory");
 
+    /* `mov %ax,%gs` above reloaded the GS *selector*, and in long mode
+     * loading a non-null selector zeroes IA32_GS_BASE -- the MSR that made
+     * cpu_self() work a moment ago.  Point GS back at this core's cpu_t or
+     * every %gs-relative access from here on faults at address 0. */
+    g_cpu[0].self = &g_cpu[0];
+    asm volatile("wrmsr" :: "c"((uint32_t)IA32_GS_BASE),
+                            "a"((uint32_t)(gsbase & 0xFFFFFFFFu)),
+                            "d"((uint32_t)(gsbase >> 32))
+                 : "memory");
+
     dbg_puts("GNOS: GDT/TSS installed (BSP), rsp0=");
     dbg_puts_hex(g_cpu[0].tss.rsp[0]);
     dbg_puts("\r\n");

@@ -15,6 +15,9 @@ bits 64
 
 global switch_context
 global ret_to_user
+global kthread_trampoline
+
+extern kthread_bootstrap
 
 section .text
 
@@ -58,5 +61,20 @@ ret_to_user:
     pop rax
     add rsp, 16             ; discard vector + error code
     iretq
+
+; Kernel-thread trampoline.  A kthread's fabricated stack (see
+; kthread_create in proc.c) looks like a switch_context frame: six saved
+; callee-saved registers, then a return address of kthread_trampoline.
+; switch_context pops R12 = bootstrap and rets here; we hand the bootstrap
+; block to the C bootstrap routine, which runs the thread's entry and then
+; never returns.
+kthread_trampoline:
+    mov  rdi, r12           ; kthread_bootstrap_t * (planted in the frame)
+    call kthread_bootstrap
+    ; kthread_bootstrap must not return; park the CPU if it ever does.
+    cli
+.hang:
+    hlt
+    jmp .hang
 
 section .note.GNU-stack noalloc noexec nowrite progbits

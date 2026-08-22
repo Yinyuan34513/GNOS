@@ -39,6 +39,7 @@ int  getpid(void);
 int  getppid(void);
 int  fork(void);
 int  execv(const char *path, char *const argv[]);
+int  execve(const char *path, char *const argv[], char *const envp[]);
 void exit(int status) __attribute__((noreturn));
 int  waitpid(int pid, int *status, int options);
 

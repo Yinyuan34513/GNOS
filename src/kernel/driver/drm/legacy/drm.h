@@ -47,6 +47,19 @@ typedef struct {
     uint32_t magic;
 } drm_auth_t;                           /* 4 bytes */
 
+/* drm.h: PRIME handle <-> dmabuf fd conversion */
+typedef struct {
+    uint32_t handle;
+    uint32_t flags;                 /* DRM_CLOEXEC for handle->fd */
+    int32_t  fd;                    /* returned dmabuf fd */
+} drm_prime_handle_t;               /* 12 bytes */
+
+/* drm.h: GEM handle close */
+typedef struct {
+    uint32_t handle;
+    uint32_t pad;
+} drm_gem_close_t;                  /* 8 bytes */
+
 typedef struct {
     uint64_t unique_len;
     void    *unique;
@@ -60,10 +73,16 @@ typedef struct {
 #define DRM_IOCTL_AUTH_MAGIC    0x40046411
 #define DRM_IOCTL_SET_MASTER    0x4000641e
 #define DRM_IOCTL_DROP_MASTER   0x4000641f
+#define DRM_IOCTL_PRIME_HANDLE_TO_FD 0xc00c642d
+#define DRM_IOCTL_PRIME_FD_TO_HANDLE 0xc00c642e
+#define DRM_IOCTL_GEM_CLOSE     0x40086409
 
 #define DRM_CAP_DUMB_BUFFER             1
 #define DRM_CAP_DUMB_PREFERRED_DEPTH    3
 #define DRM_CAP_DUMB_PREFER_SHADOW      4
+
+/* drm.h: PRIME flags (same bit as O_CLOEXEC) */
+#define DRM_CLOEXEC  0x80000
 
 /* ---- drm_mode.h ---------------------------------------------------------- */
 
@@ -156,6 +175,12 @@ typedef struct {
     uint32_t handle;
 } drm_mode_fb_cmd_t;                    /* 28 bytes */
 
+/* drm_mode.h: close fb (drmModeCloseFB) */
+typedef struct {
+    uint32_t fb_id;
+    uint32_t pad;
+} drm_mode_closefb_t;                   /* 8 bytes */
+
 typedef struct {
     uint32_t fb_id;
     uint32_t width, height;
@@ -245,6 +270,10 @@ typedef struct {
 #define DRM_IOCTL_MODE_GETENCODER    0xc01464a6
 #define DRM_IOCTL_MODE_GETCONNECTOR  0xc05064a7
 #define DRM_IOCTL_MODE_GETPROPERTY   0xc04064aa
+#define DRM_IOCTL_MODE_SETPROPERTY    0xc01064ab
+#define DRM_IOCTL_MODE_GETPROPBLOB    0xc01064ac
+#define DRM_IOCTL_MODE_GETFB          0xc01c64ad
+#define DRM_IOCTL_MODE_ADDFB         0xc01c64ae
 #define DRM_IOCTL_MODE_RMFB          0xc00464af
 #define DRM_IOCTL_MODE_PAGE_FLIP     0xc01864b0
 #define DRM_IOCTL_MODE_CREATE_DUMB   0xc02064b2
@@ -252,19 +281,18 @@ typedef struct {
 #define DRM_IOCTL_MODE_DESTROY_DUMB  0xc00464b4
 #define DRM_IOCTL_MODE_GETPLANERESOURCES 0xc01064b5
 #define DRM_IOCTL_MODE_GETPLANE      0xc02064b6
-#define DRM_IOCTL_MODE_ADDFB         0xc01c64ae
 #define DRM_IOCTL_MODE_ADDFB2        0xc06864b8
 #define DRM_IOCTL_MODE_OBJ_GETPROPERTIES 0xc02064b9
-#define DRM_IOCTL_MODE_SETPROPERTY    0xc01064ab
-#define DRM_IOCTL_MODE_GETPROPBLOB    0xc01064ac
 #define DRM_IOCTL_MODE_OBJ_SETPROPERTY 0xc01464ba
 #define DRM_IOCTL_MODE_ATOMIC        0xc03864bc
+#define DRM_IOCTL_MODE_CLOSEFB       0xc00864c8
 
 #define DRM_MODE_CONNECTOR_VGA        1
 #define DRM_MODE_CONNECTOR_VIRTUAL   15
-#define DRM_MODE_CONNECTED            0
-#define DRM_MODE_DISCONNECTED         1
-#define DRM_MODE_UNKNOWNCONNECTION    2
+#define DRM_MODE_UNCONNECTED          0
+#define DRM_MODE_CONNECTED            1
+#define DRM_MODE_DISCONNECTED         2
+#define DRM_MODE_UNKNOWNCONNECTION    3
 #define DRM_MODE_ENCODER_NONE         0
 #define DRM_MODE_ENCODER_DAC          1
 #define DRM_MODE_ENCODER_TMDS         2
@@ -332,7 +360,9 @@ typedef struct {
 /* Object ids and property ids this driver hands out (kernel-side, not UAPI).
  * crtc 1 and connector 1 also appear in GETRESOURCES/GETCONNECTOR. */
 #define DRM_PROP_ID_DPMS               1
+#define DRM_PROP_ID_EDID               2
 #define DRM_PROP_ID_PLANE_TYPE         3
+#define DRM_BLOB_ID_EDID               1
 
 /* ---- kernel-side entry (not part of the UAPI) ---------------------------- */
 #include "bootinfo.h"

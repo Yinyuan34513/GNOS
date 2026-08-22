@@ -154,6 +154,43 @@ static void __attribute__((noreturn)) fault_halt(regs_t *r, const char *tag)
 }
 
 /* ---- dispatch -------------------------------------------------------- */
+/*
+ * Back a not-yet-present page that falls inside one of the address space's
+ * recorded mmap regions.  Returns 1 when the page was backed and the
+ * faulting instruction may be retried, 0 when the address is nobody's
+ * business or the access violates the mapping's protection.
+ *
+ * Used from both fault paths: ring 3 (the normal lazy-mmap case) and,
+ * just as important, ring 0 -- syscalls that memcpy straight into user
+ * buffers (read, getcwd, ...) now regularly land on anonymous pages no
+ * user code has touched yet, and a kernel-mode fault there used to be
+ * instantly fatal.
+ */
+static int fault_back_lazy(addrspace_t *as, uint64_t cr2, int is_write)
+{
+    if (!as)
+        return 0;
+    for (int i = 0; i < as->nmmaps; i++) {
+        uint64_t mb = as->mmaps[i].base;
+        uint64_t ms = as->mmaps[i].size;
+        if (cr2 < mb || cr2 >= mb + ms)
+            continue;
+        unsigned vf = as->mmaps[i].flags;
+        /* A write into a mapping that is not writable is a REAL fault --
+         * thread-stack guard pages live on this path.  Backing them
+         * silently would turn a runaway recursion into a machine that
+         * eats one zeroed frame per iteration instead of just killing
+         * the offender. */
+        if (is_write && !(vf & VM_WRITE))
+            return 0;
+        uint64_t frame = pmm_alloc_zeroed();
+        if (!frame)
+            return 0;
+        return vmm_map(as, cr2 & ~0xFFFULL, frame, vf);
+    }
+    return 0;
+}
+
 void isr_dispatch(regs_t *r)
 {
     /* A trap taken from ring 3 runs in the interrupted process's kernel
@@ -200,7 +237,7 @@ void isr_dispatch(regs_t *r)
                 uint64_t cr2;
                 asm volatile("mov %%cr2, %0" : "=r"(cr2));
                 if (vmm_grow_stack(proc_current()->as, cr2))
-                    return;
+                    goto out;   /* retry the faulting instruction */
                 /* Demand-paging for recorded anonymous mmap regions: musl and
                  * labwc expect a freshly-mmap'd region to be lazily backed, so
                  * the first touch of a mapping that has no PTE yet just gets a
@@ -209,19 +246,9 @@ void isr_dispatch(regs_t *r)
                  * the process mapped is served -- but a region that was
                  * munmap'd (record dropped) is NOT resurrected, which keeps
                  * freed stacks/heaps from being silently zeroed. */
-                proc_t *fp = proc_current();
-                addrspace_t *as = fp->as;
-                for (int i = 0; i < as->nmmaps; i++) {
-                    uint64_t mb = as->mmaps[i].base;
-                    uint64_t ms = as->mmaps[i].size;
-                    if (cr2 >= mb && cr2 < mb + ms) {
-                        uint64_t frame = pmm_alloc_zeroed();
-                        if (frame && vmm_map(as, cr2 & ~0xFFFULL,
-                                            frame, VM_USER | VM_WRITE))
-                            return;
-                        break;
-                    }
-                }
+                if (fault_back_lazy(proc_current()->as, cr2,
+                                    (int)(r->errcode & 2)))
+                    goto out;   /* retry the faulting instruction */
             }
 
             dbg_puts("GNOS: fault in user pid ");
@@ -241,6 +268,22 @@ void isr_dispatch(regs_t *r)
                 dbg_puts(" err=");
                 dbg_puts_hex(r->errcode);
                 vmm_pte_dump(cr2);
+                {
+                    extern void dbg_puts(const char *);
+                    addrspace_t *as = proc_current()->as;
+                    dbg_puts("\nMMAP-RECORDS n=");
+                    dbg_puts_dec((uint32_t)as->nmmaps);
+                    for (unsigned i = 0; i < as->nmmaps; i++) {
+                        dbg_puts(" [");
+                        dbg_puts_hex(as->mmaps[i].base);
+                        dbg_puts("+");
+                        dbg_puts_hex(as->mmaps[i].size);
+                        dbg_puts(" f=");
+                        dbg_puts_hex((uint64_t)as->mmaps[i].flags);
+                        dbg_puts("]");
+                    }
+                    dbg_puts("\n");
+                }
             }
             dbg_puts(" rsp=");
             dbg_puts_hex(r->rsp);
@@ -250,7 +293,20 @@ void isr_dispatch(regs_t *r)
             dbg_puts_hex(r->rsi);
             dbg_puts(" rax=");
             dbg_puts_hex(r->rax);
+            dbg_puts(" r12=");
+            dbg_puts_hex(r->r12);
+            dbg_puts(" r13=");
+            dbg_puts_hex(r->r13);
+            dbg_puts(" r15=");
+            dbg_puts_hex(r->r15);
             dbg_puts("\r\n");
+            {
+                uint32_t flo, fhi;
+                asm volatile("rdmsr" : "=a"(flo), "=d"(fhi) : "c"((uint32_t)0xC0000100));
+                dbg_puts("  fsbase=");
+                dbg_puts_hex(((uint64_t)fhi << 32) | flo);
+                dbg_puts("\r\n");
+            }
             /* Dump the last few syscalls so a NULL-deref shows what led to
              * it: nr=return pairs, oldest-first. */
             proc_t *hp = proc_current();
@@ -305,6 +361,20 @@ void isr_dispatch(regs_t *r)
             proc_signal(proc_current(), SIGSEGV);
             proc_check_signals(r);
             goto out;
+        }
+
+        /*
+         * A kernel-mode fault on a lazily-backed user page: we are inside a
+         * syscall memcpy'ing into a buffer no user code has touched yet.
+         * Back it and retry -- same context, the BKL is already held by us,
+         * so no extra locking.  Anything else stays fatal.
+         */
+        if (r->vector == 14 && proc_current()) {
+            uint64_t kcr2;
+            asm volatile("mov %%cr2, %0" : "=r"(kcr2));
+            if (fault_back_lazy(proc_current()->as, kcr2,
+                                (int)(r->errcode & 2)))
+                goto out;
         }
 
         fault_halt(r, "GNOS: RING0 FAULT");

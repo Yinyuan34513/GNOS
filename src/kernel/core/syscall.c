@@ -37,6 +37,7 @@
 #include "acpi.h"
 #include "anonfd.h"
 #include "timerfd.h"
+#include "signalfd.h"
 #include "epoll.h"
 #include "input.h"
 #include "unix.h"
@@ -421,6 +422,7 @@ static int64_t sys_fcntl(int fd, int cmd, uint64_t arg)
         if (anonfd_is_eventfd(fln))
             anonfd_set_nonblock(fln, (arg & O_NONBLOCK) != 0);
         timerfd_set_nonblock(fln, (arg & O_NONBLOCK) != 0);
+        signalfd_set_nonblock(fln, (arg & O_NONBLOCK) != 0);
         input_set_nonblock(fln, (arg & O_NONBLOCK) != 0);
         return 0;
     }
@@ -1649,6 +1651,13 @@ static int64_t sys_connect(int fd, uint64_t uaddr, uint64_t alen)
     char path[UNIX_PATH_MAX];
     uint32_t plen;
     int r = sa_un_in(uaddr, alen, path, &plen);
+    if (r == 0) {
+        dbg_puts("UCONN pid=");
+        dbg_puts_dec((uint32_t)(proc_current() ? proc_current()->pid : 0));
+        dbg_puts(" path=");
+        dbg_puts(path);
+        dbg_puts("\n");
+    }
     return r < 0 ? r : unix_connect_sys(-2 - s, path, plen);
 }
 
@@ -2905,14 +2914,34 @@ static int64_t sys_delete_module(uint64_t uname, uint64_t flags)
 #define MMAP_BASE  USER_MMAP_BASE
 #define MMAP_TOP   USER_MMAP_CEIL           /* never climb into the brk heap */
 
-static int mmap_record(proc_t *p, uint64_t base, uint64_t size)
+static int mmap_record(proc_t *p, uint64_t base, uint64_t size, unsigned flags)
 {
     addrspace_t *as = p->as;
     if (as->nmmaps >= (int)(sizeof(as->mmaps) / sizeof(as->mmaps[0])))
         return 0;
-    as->mmaps[as->nmmaps].base = base;
-    as->mmaps[as->nmmaps].size = size;
+    as->mmaps[as->nmmaps].base  = base;
+    as->mmaps[as->nmmaps].size  = size;
+    as->mmaps[as->nmmaps].flags = flags;
     as->nmmaps++;
+
+    /* Coalesce neighbours that are contiguous and equally protected.  GUI
+     * processes mmap thousands of times; without merging the fixed record
+     * array fills up and every later mmap reports ENOMEM even though both
+     * the virtual arena and physical RAM have plenty left. */
+    for (int i = 0; i < as->nmmaps - 1; i++) {
+        for (int j = i + 1; j < as->nmmaps; j++) {
+            if (as->mmaps[j].flags != as->mmaps[i].flags)
+                continue;
+            uint64_t lo = i, hi = j;
+            if (as->mmaps[j].base < as->mmaps[i].base) { lo = j; hi = i; }
+            if (as->mmaps[lo].base + as->mmaps[lo].size != as->mmaps[hi].base)
+                continue;
+            as->mmaps[lo].size += as->mmaps[hi].size;
+            as->mmaps[hi] = as->mmaps[as->nmmaps - 1];
+            as->nmmaps--;
+            j = i;      /* rescan against the merged slot */
+        }
+    }
     return 1;
 }
 
@@ -3031,7 +3060,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                     vmm_copy_to_user(p->as, base + o, g_mmap_bounce,
                                      (uint64_t)got);
             }
-            if (!mmap_record(p, base, mapsize)) {
+            if (!mmap_record(p, base, mapsize, vflags)) {
                 vmm_unmap(p->as, base, mapsize);
                 return -ENOMEM;
             }
@@ -3062,7 +3091,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                 return -ENOMEM;
             }
         }
-        if (!mmap_record(p, base, size))
+        if (!mmap_record(p, base, size, vflags))
             return -ENOMEM;
         return (int64_t)base;
     }
@@ -3082,21 +3111,94 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         if (addr == 0 || addr + size > USER_LIMIT)
             return -E_INVAL;
         base = addr;
+        /* Linux MAP_FIXED semantics: replace whatever is already there.
+         * musl's mallocng MAP_FIXEDs a PROT_NONE guard over the first page
+         * of the brk heap after growing it; leaving the old eager heap page
+         * mapped while the record claimed PROT_NONE made the bookkeeping
+         * diverge from the page tables, and the #PF handler then resurrected
+         * live mallocng state as zeroed frames (meta pointers read back NULL
+         * -> SIGSEGV in calloc's allzero fast path).  Tear the old pages
+         * down first so the record and the PTEs agree again. */
+        vmm_unmap(p->as, base, size);
     } else if (addr != 0) {
-        base = addr & ~0xFFFULL;        /* honour a hint when given */
+        /* Honour a hint -- but NEVER let it land inside a region we
+         * already track.  An overlapping record makes munmap/paging
+         * bookkeeping lie about which pages are live, and the #PF
+         * handler then resurrects freed memory as zeroes. */
+        base = addr & ~0xFFFULL;
+        for (int i = 0; i < p->as->nmmaps; i++) {
+            uint64_t b = p->as->mmaps[i].base;
+            uint64_t e = b + p->as->mmaps[i].size;
+            if (base < e && b < base + size) {
+                base = mmap_pick_base(p, size);
+                if (!base)
+                    return -ENOMEM;
+                break;
+            }
+        }
     } else {
         base = mmap_pick_base(p, size);
         if (!base)
             return -ENOMEM;
     }
 
-    if (!vmm_alloc_range(p->as, base, size, vflags)) {
+    /*
+     * Anonymous memory is backed LAZILY: the record alone is enough here and
+     * the #PF handler (idt.c) allocates a zeroed frame on first touch.  The
+     * eager vmm_alloc_range() this used to do turned every reservation into
+     * real resident RAM immediately -- musl's malloc arenas, thread stacks
+     * and the compositor's wl_shm pools reserve far more than they touch, so
+     * an 8 GiB machine reported ENOMEM with gigabytes still free.  A bonus of
+     * recording before returning: when the record array is full there are no
+     * allocated pages to leak.
+     */
+    if (!mmap_record(p, base, size, vflags))
         return -ENOMEM;
-    }
-    if (!mmap_record(p, base, size))
-        return -ENOMEM;          /* arena full: leak the pages, report */
 
     return (int64_t)base;
+}
+
+/*
+ * Rewrite the recorded protection of every mapping overlapping [addr,
+ * addr+size).  Records that straddle a boundary are split so the untouched
+ * neighbours keep their original protection -- musl maps a thread stack
+ * PROT_NONE and then flips everything above the guard page to read-write,
+ * which must not silently make the guard page writable too.
+ */
+static void mmap_update_flags(proc_t *p, uint64_t addr, uint64_t size,
+                              unsigned flags)
+{
+    addrspace_t *as = p->as;
+    int      cap   = (int)(sizeof(as->mmaps) / sizeof(as->mmaps[0]));
+    uint64_t r_end = addr + size;
+
+    for (int i = 0; i < as->nmmaps; i++) {
+        uint64_t b = as->mmaps[i].base;
+        uint64_t e = b + as->mmaps[i].size;
+        if (e <= addr || b >= r_end)
+            continue;                   /* no overlap with the range */
+
+        /* Split off the part above the range first, so the record being
+         * re-flagged ends at min(e, r_end). */
+        if (e > r_end && as->nmmaps < cap) {
+            as->mmaps[as->nmmaps].base  = r_end;
+            as->mmaps[as->nmmaps].size  = e - r_end;
+            as->mmaps[as->nmmaps].flags = as->mmaps[i].flags;
+            as->nmmaps++;
+            as->mmaps[i].size = r_end - b;
+            e = r_end;
+        }
+        /* Then the part below it. */
+        if (b < addr && as->nmmaps < cap) {
+            as->mmaps[as->nmmaps].base  = b;
+            as->mmaps[as->nmmaps].size  = addr - b;
+            as->mmaps[as->nmmaps].flags = as->mmaps[i].flags;
+            as->nmmaps++;
+            as->mmaps[i].base = addr;
+            as->mmaps[i].size = e - addr;
+        }
+        as->mmaps[i].flags = flags;
+    }
 }
 
 /*
@@ -3115,29 +3217,24 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
     uint64_t size = (len + 0xFFF) & ~0xFFFULL;
     if (!size || addr + size > USER_LIMIT)
         return -E_INVAL;
-    /* DEBUG: who is mprotecting what */
-    dbg_puts("EXEC: mprotect pid=");
-    dbg_puts_dec((uint32_t)p->pid);
-    dbg_puts(" addr=");
-    dbg_puts_hex(addr);
-    dbg_puts(" size=");
-    dbg_puts_hex(size);
-    dbg_puts(" prot=");
-    dbg_puts_dec(prot);
-    dbg_puts("\r\n");
     /* musl's dynlink applies RELRO protection with mprotect(..., PROT_READ)
      * after relocating a dso; it tolerates ENOSYS (falls back to no RELRO).
      * Returning ENOSYS for pure read-only protection lets a dynamically
      * linked program boot even if the RELRO bookkeeping is imperfect. */
     if (prot == PROT_READ)
         return -E_NOSYS;
+
+    unsigned vflags = VM_USER;
+    if (prot & PROT_WRITE) vflags |= VM_WRITE;
+    if (prot & PROT_EXEC)  vflags |= VM_EXEC;
+    mmap_update_flags(p, addr, size, vflags);
+
     return vmm_protect(p->as, addr, size, (unsigned)prot) ? 0 : -E_NOMEM;
 }
 
 static int64_t sys_munmap(uint64_t addr, uint64_t len)
 {
     proc_t *p = proc_current();
-    (void)len;                        /* we only unmap whole mappings today */
     if (!p)
         return -E_INVAL;
 
@@ -3146,14 +3243,108 @@ static int64_t sys_munmap(uint64_t addr, uint64_t len)
     if (idx < 0)
         return -EINVAL;          /* not one of ours; Linux would EINVAL too */
 
-    /* We only support unmapping a whole mapping, which is what libc's free
-     * path hands us; partial unmaps are rare and not needed here yet. */
-    if (addr != base)
-        return -EINVAL;
+    uint64_t ulen = (len + 0xFFF) & ~0xFFFULL;
+    if (ulen > size)
+        ulen = size;
 
+    /* Whole mapping: the common free() path. */
+    if (addr == base && ulen == size) {
+        vmm_unmap(p->as, base, size);
+        mmap_forget(p, idx);
+        return 0;
+    }
+    /* Tail trim: mallocng shaves the unused end off an arena when a large
+     * block is freed.  Refusing it used to strand the pages until exit. */
+    if (addr == base && ulen < size) {
+        vmm_unmap(p->as, base, ulen);
+        p->as->mmaps[idx].base  = base + ulen;
+        p->as->mmaps[idx].size  = size - ulen;
+        return 0;
+    }
+    /* Head trim: same idea from the front. */
+    if (addr + ulen == base + size) {
+        vmm_unmap(p->as, addr, ulen);
+        p->as->mmaps[idx].size = size - ulen;
+        return 0;
+    }
+    return -EINVAL;              /* middle holes are not worth the bookkeeping */
+}
+
+/* Linux' mremap flags; only MAYMOVE is honoured here. */
+#define MREMAP_MAYMOVE  1u
+#define MREMAP_FIXED    2u
+
+/*
+ * mremap(25): resize a mapping.  musl's realloc uses it to grow large
+ * allocations and wayland shm pools grow their memfd mapping with it on
+ * every buffer resize; without it both fall back to allocate-copy-free,
+ * doubling peak memory each time.  Shrink happens in place; growth extends
+ * in place when the span above is still free, otherwise the region moves.
+ */
+static int64_t sys_mremap(uint64_t old_addr, uint64_t old_len,
+                          uint64_t new_len, uint64_t mflags)
+{
+    proc_t *p = proc_current();
+    if (!p || !p->as)
+        return -E_INVAL;
+    if (old_addr & 0xFFF)
+        return -E_INVAL;
+    uint64_t old_size = (old_len + 0xFFF) & ~0xFFFULL;
+    uint64_t new_size = (new_len + 0xFFF) & ~0xFFFULL;
+    if (!old_size || !new_size)
+        return -E_INVAL;
+
+    uint64_t base, size;
+    int idx = mmap_find(p, old_addr, &base, &size);
+    if (idx < 0 || old_addr != base || old_size > size)
+        return -E_INVAL;
+
+    unsigned flags = p->as->mmaps[idx].flags;
+
+    if (new_size <= size) {                    /* shrink (or keep) */
+        if (new_size < size) {
+            vmm_unmap(p->as, base + new_size, size - new_size);
+            p->as->mmaps[idx].size = new_size;
+        }
+        return (int64_t)base;
+    }
+
+    /* Grow in place when nothing else in the arena sits above us. */
+    int clash = 0;
+    for (int i = 0; i < p->as->nmmaps && !clash; i++) {
+        if (i == idx)
+            continue;
+        uint64_t b = p->as->mmaps[i].base;
+        uint64_t e = b + p->as->mmaps[i].size;
+        if (b < base + new_size && e > base + size)
+            clash = 1;
+    }
+    if (!clash && base + new_size <= MMAP_TOP) {
+        p->as->mmaps[idx].size = new_size;
+        return (int64_t)base;
+    }
+
+    if (!(mflags & MREMAP_MAYMOVE))
+        return -E_NOMEM;
+
+    /* Move: fresh lazy region, copy the live bytes across, drop the old. */
+    uint64_t nbase = mmap_pick_base(p, new_size);
+    if (!nbase || !mmap_record(p, nbase, new_size, flags))
+        return -E_NOMEM;
+
+    /* Back both spans eagerly for the copy: these pages are about to be
+     * read and written anyway, so laziness buys nothing here. */
+    vmm_alloc_range(p->as, base, size, flags);
+    vmm_alloc_range(p->as, nbase, size, flags);
+    for (uint64_t o = 0; o < size; o += PAGE_SIZE) {
+        uint64_t sp = vmm_resolve(p->as, base + o);
+        uint64_t dp = vmm_resolve(p->as, nbase + o);
+        if (sp && dp)
+            memcpy(pmm_virt(dp), pmm_virt(sp), PAGE_SIZE);
+    }
     vmm_unmap(p->as, base, size);
     mmap_forget(p, idx);
-    return 0;
+    return (int64_t)nbase;
 }
 
 static int64_t sys_brk(uint64_t addr)
@@ -3799,6 +3990,26 @@ void syscall_handler(regs_t *r)
         if (!user_ptr_ok(a2, a3)) { ret = -E_INVAL; break; }
         ret = vfs_file_read(fd_handle((int)a1), (void *)(uintptr_t)a2,
                             (uint32_t)a3);
+#ifdef SYSTRACE
+        if (ret == 0 && (int)a1 >= 3) {
+            static unsigned r0n;
+            if (++r0n < 400 || (r0n % 5000) == 0) {
+                dbg_puts("READ0 p=");
+                dbg_puts_dec((uint32_t)(proc_current() ? proc_current()->pid : 0));
+                dbg_puts(" fd=");
+                dbg_puts_dec((uint32_t)a1);
+                int h0 = fd_handle((int)a1);
+                const vfs_node_t *nd = h0 >= 0 ? vfs_file_node(h0) : 0;
+                dbg_puts(" kind=");
+                dbg_puts_dec(nd ? (uint32_t)nd->kind : 99);
+                dbg_puts(" name=");
+                dbg_puts(nd ? nd->name : "?");
+                dbg_puts(" n=");
+                dbg_puts_dec(r0n);
+                dbg_puts("\n");
+            }
+        }
+#endif
         break;
 
     case SYS_write:
@@ -4350,6 +4561,9 @@ void syscall_handler(regs_t *r)
     case SYS_timerfd_gettime:
         ret = sys_timerfd_gettime(a1, a2);
         break;
+    case SYS_signalfd4:
+        ret = sys_signalfd4(a1, a2, a3, r->r10);
+        break;
 
     /* ---- BSD socket API (x86-64: one syscall per call, no socketcall) ---- */
     case SYS_socket:
@@ -4494,6 +4708,10 @@ void syscall_handler(regs_t *r)
 
     case SYS_munmap:
         ret = sys_munmap(a1, a2);
+        break;
+
+    case SYS_mremap:
+        ret = sys_mremap(a1, a2, a3, r->r10);
         break;
 
     case SYS_brk:
@@ -4685,6 +4903,26 @@ void syscall_handler(regs_t *r)
         break;
     }
 
+#ifdef SYSTRACE
+    if (nr == 9 || nr == 10 || nr == 12 || nr == 158 || nr == 218 ||
+        nr == 0 || nr == 1 || nr == 7 || nr == 29 || nr == 43 ||
+        nr == 202 || nr == 232 || nr == 257 || nr == 57 ||
+        nr == 217 || nr == 16 || nr == 8 || nr == 59 || nr == 61) {
+        dbg_puts("SY p=");
+        dbg_puts_dec((uint32_t)(proc_current() ? proc_current()->pid : 0));
+        dbg_puts(" nr=");
+        dbg_puts_dec((uint32_t)nr);
+        dbg_puts(" a1=");
+        dbg_puts_hex(a1);
+        dbg_puts(" a2=");
+        dbg_puts_hex(a2);
+        dbg_puts(" a3=");
+        dbg_puts_hex(a3);
+        dbg_puts(" ret=");
+        dbg_puts_hex((uint64_t)(int64_t)ret);
+        dbg_puts("\n");
+    }
+#endif
     r->rax = (uint64_t)ret;
 
     /* Ring buffer of the last few syscalls, for the fault dumper: when a

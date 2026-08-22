@@ -25,6 +25,7 @@
 #include "gdt.h"
 #include "timer.h"
 #include "panic.h"
+#include "heap.h"
 #include "kstring.h"
 #include "debugcon.h"
 #include "smp.h"
@@ -32,6 +33,7 @@
 /* switch.asm */
 extern void switch_context(uint64_t *save_rsp, uint64_t load_rsp);
 extern void ret_to_user(void);
+extern void kthread_trampoline(void);
 
 /*
  * Argument-vector limits.  These are the real ceiling on what a shell can
@@ -49,7 +51,10 @@ extern void ret_to_user(void);
 #define MAX_ARGS      128
 #define MAX_ENVS      128
 #define ARG_BYTES     16384
-#define IMAGE_MAX     (16 * 1024 * 1024)
+/* Whole-image exec buffer.  The statically-linked GTK3 desktop binaries
+ * (xfce4-panel, thunar, ...) are 18-20 MB each; 16 MB made every one of
+ * them fail to exec with a confusing "not found" from the shell. */
+#define IMAGE_MAX     (64 * 1024 * 1024)
 
 /* How many `#!` lines deep execve will chase an interpreter before giving up
  * with ELOOP.  Linux uses 4; a script whose interpreter is a script whose
@@ -345,12 +350,40 @@ static uint64_t push_args(addrspace_t *as, uint64_t stack_top,
      * AT_PHNUM with a NULL AT_PHDR is worse than saying nothing at all: musl's
      * __init_tls walks that many entries unconditionally and faults on the
      * first one.  With the triple absent it falls back to its builtin TLS. */
-    sp &= ~15ULL;
+    /*
+     * Align the WHOLE vector block in one shot: everything from here down
+     * to argc is (auxv pairs) + (argc+envc+3) words, and SysV wants %rsp
+     * 16-byte aligned at process entry.  The pad -- when needed -- goes
+     * HERE, above AT_NULL, where no libc auxv scan can ever reach it.
+     *
+     * It used to sit between envp's NULL and the first auxv pair as an
+     * UNWRITTEN (hence zero) stack word: musl stops its auxv walk at the
+     * first zero type, saw no auxv at all, computed its load base as 0
+     * and died in _dlstart_c self-relocation -- killing exactly those
+     * dynamically-linked binaries whose argument lengths happened to
+     * require the pad, while others booted fine.
+     */
+    {
+        uint64_t vec = 8ULL * (uint64_t)(argc + envc + 3);
+        uint64_t top = sp & ~15ULL;
+        if (((top - vec) & 15) != 0)
+            top -= 8;
+        sp = top;
+    }
     if (!push_aux(as, &sp, AT_NULL, 0))            return 0;
     if (!push_aux(as, &sp, AT_ENTRY, entry))       return 0;
     if (!push_aux(as, &sp, AT_PAGESZ, 4096))       return 0;
     if (!push_aux(as, &sp, AT_CLKTCK, SCHED_HZ))   return 0;
     if (!push_aux(as, &sp, AT_SECURE, 0))          return 0;
+    /* musl computes libc.secure as "(aux[0]&0x7800)!=0x7800 || uid!=euid ||
+     * gid!=egid || AT_SECURE": the 0x7800 mask covers exactly these four
+     * entries, so leaving any of them out marks EVERY process as running
+     * setuid and musl's secure_getenv() then returns NULL unconditionally --
+     * which is how libxkbcommon ended up blind to XKB_CONFIG_ROOT. */
+    if (!push_aux(as, &sp, AT_UID, 0))             return 0;
+    if (!push_aux(as, &sp, AT_EUID, 0))            return 0;
+    if (!push_aux(as, &sp, AT_GID, 0))             return 0;
+    if (!push_aux(as, &sp, AT_EGID, 0))            return 0;
     if (!push_aux(as, &sp, AT_RANDOM, at_random))  return 0;
     /* AT_BASE: the load address of the dynamic linker, if there is one.
      * musl's dynlink derives its own base from this (falling back to
@@ -365,6 +398,11 @@ static uint64_t push_args(addrspace_t *as, uint64_t stack_top,
         dbg_puts("\r\n");
     }
     if (phnum) {
+        dbg_puts("EXEC: auxv phnum=");
+        dbg_puts_dec((uint32_t)phnum);
+        dbg_puts(" phdr=");
+        dbg_puts_hex(phdr);
+        dbg_puts("\r\n");
         if (!push_aux(as, &sp, AT_PHNUM, phnum))                return 0;
         if (!push_aux(as, &sp, AT_PHENT, ELF64_PHDR_SIZE))      return 0;
         if (!push_aux(as, &sp, AT_PHDR, phdr))                  return 0;
@@ -379,10 +417,8 @@ static uint64_t push_args(addrspace_t *as, uint64_t stack_top,
      * %rsp 16-byte aligned at process entry (pointing at argc); that is
      * Linux's STACK_ROUND in create_elf_tables, and it is not the same as the
      * call-site convention where %rsp%16==8 because a return address has been
-     * pushed. */
-    sp &= ~15ULL;
-    if (((sp - 8 * (uint64_t)(argc + envc + 3)) & 15) != 0)
-        sp -= 8;
+     * pushed.  The alignment itself is done above, before AT_NULL is pushed,
+     * so no hole exists inside the vector. */
 
     sp -= 8;
     uint64_t nul = 0;
@@ -451,6 +487,15 @@ static int build_image(const char *path, char *const argv[], int argc,
      * program's own entry travels to it via AT_ENTRY; AT_BASE tells it where
      * it lives.  Load the interpreter into the same fresh address space. */
     uint64_t ldso_base = 0;
+    /* Linux semantics: AT_ENTRY always names the MAIN program's e_entry,
+     * even though the kernel starts the process at the interpreter's entry.
+     * musl's __dls3 ends with CRTJMP(aux[AT_ENTRY], argv-1) -- handing off
+     * to whatever AT_ENTRY names.  Pushing the interpreter's own entry made
+     * every dynamically linked program re-run ld.so from _start after the
+     * link completed: the second __dls3 pass re-ran with mallocng already
+     * initialised and died in calloc's allzero fast path (rc=139), and any
+     * binary that survived a couple of passes only did so by luck. */
+    uint64_t app_entry = entry;
     if (interp[0]) {
         uint32_t isize = 0;
         if (!vfs_read_all(interp, g_image, sizeof(g_image), &isize)) {
@@ -474,7 +519,7 @@ static int build_image(const char *path, char *const argv[], int argc,
         dbg_puts(" ldso_base=");
         dbg_puts_hex(ldso_base);
         dbg_puts(" main_entry=");
-        dbg_puts_hex(entry);
+        dbg_puts_hex(app_entry);
         dbg_puts(" main_phdr=");
         dbg_puts_hex(phdr);
         dbg_puts("\r\n");
@@ -487,7 +532,7 @@ static int build_image(const char *path, char *const argv[], int argc,
     }
 
     uint64_t sp = push_args(as, USER_STACK_TOP - 16, argv, argc, envp, envc,
-                            phdr, phnum, entry, ldso_base);
+                            phdr, phnum, app_entry, ldso_base);
     if (!sp) {
         vmm_destroy(as);
         return -E_NOMEM;
@@ -617,6 +662,72 @@ int proc_spawn_init(const char *path)
     dbg_puts_hex(entry);
     dbg_puts("\r\n");
     return p->pid;
+}
+
+/* ---- kernel threads ----------------------------------------------------
+ * A kthread is a task whose entry is a kernel function, not a user program:
+ * it runs on the shared kernel page tables (vmm_kernel_as), owns no user
+ * memory, and its first scheduling returns into kthread_trampoline instead
+ * of ret_to_user.  The fabricated switch_context frame plants the bootstrap
+ * block in R12; the trampoline hands it to kthread_bootstrap() which runs
+ * entry(arg) and then exits the thread. */
+
+void kthread_bootstrap(kthread_bootstrap_t *b)
+{
+    void    (*entry)(void *) = b->entry;
+    void    *arg             = b->arg;
+    proc_t  *me              = proc_current();
+
+    kfree(b);                   /* entry may need the heap */
+
+    entry(arg);
+
+    /* The thread is done.  It ran on the shared kernel page tables; drop
+     * the address-space reference before proc_exit tears the task down,
+     * or proc_teardown would destroy the kernel PML4 under our feet. */
+    if (me)
+        me->as = NULL;
+    proc_exit(0);
+    __builtin_unreachable();
+}
+
+proc_t *kthread_create(const char *name, void (*entry)(void *), void *arg)
+{
+    proc_t *p = proc_alloc();
+    if (!p)
+        return NULL;
+
+    kthread_bootstrap_t *b = kmalloc(sizeof(*b));
+    if (!b)
+        return NULL;            /* slot left PROC_UNUSED: reusable */
+
+    b->entry = entry;
+    b->arg   = arg;
+
+    p->as       = vmm_kernel_as();
+    p->fs_base  = 0;
+    p->uid = p->euid = p->suid = 0;     /* kernel threads are root */
+    if (name)
+        strncpy(p->name, name, sizeof(p->name) - 1);
+
+    /* Fabricate a switch_context frame: six callee-saved registers (R12 =
+     * bootstrap) and a return address of kthread_trampoline, exactly the
+     * shape ret_to_user frames have except for who the return lands on. */
+    uint64_t sp = p->kstack_top;
+    sp -= 8;
+    *(uint64_t *)(uintptr_t)sp = (uint64_t)(uintptr_t)kthread_trampoline;
+    sp -= 6 * 8;
+    uint64_t *regs = (uint64_t *)(uintptr_t)sp;
+    regs[0] = 0;                            /* r15 */
+    regs[1] = 0;                            /* r14 */
+    regs[2] = 0;                            /* r13 */
+    regs[3] = (uint64_t)(uintptr_t)b;       /* r12 */
+    regs[4] = 0;                            /* rbx */
+    regs[5] = 0;                            /* rbp */
+    p->saved_rsp = sp;
+
+    proc_make_runnable(p);
+    return p;
 }
 
 /* ---- credentials ------------------------------------------------------- */
@@ -1793,7 +1904,6 @@ static int schedule(void)
     }
 
     proc_t *next = rq_pop();
-
     if (!next) {
         /* Nothing runnable.  A caller that is still RUNNING may simply
          * carry on; a blocked one parks this CPU's context in the idle
@@ -1816,13 +1926,21 @@ static int schedule(void)
     next->state = PROC_RUNNING;
     if (next == prev) {
         /* The queue held nothing else: we pushed and re-picked ourselves.
-         * Nothing to load, nothing to park. */
+         * Nothing to load, nothing to park.  The BKL is still held from the
+         * interrupt entry (isr_dispatch) or was dropped by bkl_leave_for_switch;
+         * either way the caller's bkl_return_from_switch() will re-take it, so
+         * hand it back here instead of deadlocking on our own acquisition. */
+        if (prev && prev->bkl_held) {
+            prev->bkl_held = 0;
+            bkl_release();
+        }
         spin_unlock(&g_proc_lock);
         return 1;
     }
 
     next->deadline      = next->vruntime + next->slice;  /* fresh slice */
     next->last_run_tick = timer_ticks();
+    int fresh = (next->on_cpu == -1);   /* never ran: fabricated stack */
     next->on_cpu        = cpu_self()->id;
     cpu_self()->current = next;
 
@@ -1843,6 +1961,14 @@ static int schedule(void)
         prev->bkl_held = 0;
         bkl_release();
     }
+
+    /* A brand-new task's stack (built by build_startup_stack) returns
+     * straight into ret_to_user: it has no schedule() frame that would
+     * run the `spin_unlock` below on resume, so if we carry g_proc_lock
+     * across the switch the first timer tick deadlocks on it.  Drop the
+     * lock before handing the CPU over. */
+    if (fresh)
+        spin_unlock(&g_proc_lock);
 
     uint64_t *save = prev ? &prev->saved_rsp : &cpu_self()->sched_rsp;
     switch_context(save, next->saved_rsp);
@@ -1989,6 +2115,13 @@ void sched_wake_reason(wait_reason_t why)
 {
     for (int i = 0; i < MAX_PROCS; i++)
         if (g_procs[i].state == PROC_BLOCKED && g_procs[i].wait_reason == why)
+            sched_wake(&g_procs[i]);
+}
+
+void sched_wake_queue(void *q)
+{
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (g_procs[i].state == PROC_BLOCKED && g_procs[i].wait_q == q)
             sched_wake(&g_procs[i]);
 }
 

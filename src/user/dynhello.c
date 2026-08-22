@@ -10,9 +10,18 @@
  * interesting; the linkage is.
  */
 #include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 
-int main(void)
+int main(int argc, char **argv, char **envp)
 {
+    (void)argc; (void)argv;
     printf("DYNHELLO: dynamically linked hello from GNOS\n");
+    int n = 0;
+    for (; envp[n]; n++)
+        printf("DYNEV[%d]=%s\n", n, envp[n]);
+    printf("DYNEV total %d\n", n);
+    const char *x = getenv("XKB_CONFIG_ROOT");
+    printf("DYNGETENV XKB_CONFIG_ROOT=%s\n", x ? x : "(null)");
     return 0;
 }

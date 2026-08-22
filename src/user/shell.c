@@ -64,6 +64,47 @@ static stage_t stages[MAX_STAGES];
 static int     shell_pgid;
 
 /*
+ * The environment.  rc drives the whole desktop through this shell, and the
+ * compositor/session need variables it sets (XKB_CONFIG_ROOT,
+ * DBUS_SESSION_BUS_ADDRESS, WAYLAND_DISPLAY, ...).  `export NAME=value`
+ * stores here and every execve hands the table down; without it the shell's
+ * execv ran every child with an empty environment and libxkbcommon fell back
+ * to its compiled-in host path.
+ */
+#define MAX_ENV 64
+#define ENV_LEN 256
+static char   env_tab[MAX_ENV][ENV_LEN];
+static int    env_n;
+static char  *env_p[MAX_ENV + 1];
+
+static void env_set(const char *kv)
+{
+    const char *eq = strchr(kv, '=');
+    if (!eq || eq == kv || !*eq)
+        return;
+    size_t len = strlen(kv);
+    if (len >= ENV_LEN)
+        return;
+    for (int i = 0; i < env_n; i++)
+        if (strncmp(env_tab[i], kv, (size_t)(eq - kv)) == 0 &&
+            env_tab[i][eq - kv] == '=') {
+            strcpy(env_tab[i], kv);
+            return;
+        }
+    if (env_n < MAX_ENV)
+        strcpy(env_tab[env_n++], kv);
+}
+
+static char *const *env_all(void)
+{
+    for (int i = 0; i < env_n; i++)
+        env_p[i] = env_tab[i];
+    env_p[env_n] = 0;
+    return env_p;
+}
+
+
+/*
  * A private descriptor for the terminal, duplicated from stdin at startup.
  * Script mode splices the script onto fd 0, and a redirected fd 0 is not the
  * tty any more -- so every tcsetpgrp() has to go through this one instead, or
@@ -418,7 +459,7 @@ static void run_pipeline(int n, int background, const char *cmd)
                 exit(0);
             }
 
-            execv(stages[i].path, stages[i].av);
+            execve(stages[i].path, stages[i].av, env_all());
             puts_fd(2, "shell: exec failed\n");
             exit(126);
         }
@@ -621,7 +662,7 @@ static void builtin_help(void)
 static int is_builtin(const char *name)
 {
     static const char *names[] = { "help", "echo", "jobs", "fg", "bg",
-                                   "kill", "pid", "exit", 0 };
+                                   "kill", "pid", "exit", "export", 0 };
     for (int i = 0; names[i]; i++)
         if (strcmp(name, names[i]) == 0)
             return 1;
@@ -631,6 +672,11 @@ static int is_builtin(const char *name)
 /* Returns 1 if the line was a builtin. */
 static int run_builtin(char **av)
 {
+    if (strcmp(av[0], "export") == 0) {
+        for (int i = 1; av[i]; i++)
+            env_set(av[i]);
+        return 1;
+    }
     if (strcmp(av[0], "help") == 0) {
         builtin_help();
         return 1;

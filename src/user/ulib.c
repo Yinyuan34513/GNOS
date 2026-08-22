@@ -77,6 +77,11 @@ int execv(const char *path, char *const argv[])
     return (int)syscall3(SYS_execve, (long)path, (long)argv, 0);
 }
 
+int execve(const char *path, char *const argv[], char *const envp[])
+{
+    return (int)syscall3(SYS_execve, (long)path, (long)argv, (long)envp);
+}
+
 void exit(int status)
 {
     syscall3(SYS_exit, status, 0, 0);

@@ -54,6 +54,7 @@
 #include "hda.h"
 #include "ata.h"
 #include "drm.h"
+#include "drm_init.h"
 #include "procfs.h"
 
 extern volatile struct limine_framebuffer_request framebuffer_request;
@@ -252,8 +253,11 @@ void kernel_entry(void)
 
     /* The DRM/KMS driver publishes /dev/dri/card0 and /dev/dri/renderD128 on
      * top of the same framebuffer: dumb-buffer clients modeset through the
-     * bochs VBE registers and blit their buffers to the screen. */
-    drm_init(&g_bi);
+     * bochs VBE registers and blit their buffers to the screen.  The ported
+     * Uinxed core registers the class, then the dummy driver probes the
+     * software KMS pipeline. */
+    drm_init();
+    drm_init_fallback();
 
     /* Disks come after the VFS for the same reason /dev/fb0 does -- they are
      * published as /dev nodes and there is no /dev before the mount.  Note

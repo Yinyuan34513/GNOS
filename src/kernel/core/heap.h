@@ -31,6 +31,9 @@ void *kzalloc(size_t size);
 /* Allocate `n` elements of `size` bytes, zeroed. */
 void *kcalloc(size_t n, size_t size);
 
+/* Resize a block; NULL p means kmalloc, zero size means kfree. */
+void *krealloc(void *p, size_t size);
+
 /* Non-fatal self check: allocate/free a handful of blocks and verify the
  * bookkeeping (no overlaps, coalescing restores a single free span).  Prints
  * a one-line result to the debug console. */

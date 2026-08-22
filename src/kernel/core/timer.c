@@ -40,7 +40,14 @@ static inline uint8_t inb(uint16_t port)
 
 static void timer_irq(regs_t *r)
 {
+    extern void drm_dummy_refresh(void);
+    static unsigned drm_div;
     g_ticks++;
+
+    /* Disabled for diagnosis: a multi-megabyte blit inside the tick
+     * handler starves everything else.  The refresh now runs from its own
+     * kernel thread (see drm_init.c). */
+    (void)drm_div;
 
     /* Deadlines have to be checked even when the interrupt landed in kernel
      * mode: a VTIME sleeper is often the *only* thing on the machine, so the

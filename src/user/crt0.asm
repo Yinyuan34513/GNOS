@@ -7,6 +7,8 @@
 ;     [rsp+8]    argv[0]
 ;     ...
 ;     argv[argc] == NULL
+;     envp[0]
+;     ... envp[envc-1], envp[envc] == NULL, then auxv pairs
 ;     envp[0]    == NULL
 ;
 ; so all _start has to do is turn that into the (argc, argv) pair main()
@@ -23,6 +25,8 @@ section .text.start
 _start:
     mov  rdi, [rsp]          ; argc
     lea  rsi, [rsp + 8]      ; argv
+    lea  rax, [rsp + 8]
+    lea  rdx, [rax + rdi*8 + 8] ; past argv[argc]==NULL: envp[0]
     xor  rbp, rbp            ; end of the frame-pointer chain
     call main
     mov  rdi, rax            ; main's return value becomes the exit status

@@ -7,3 +7,9 @@
 if [ -r "$HOME/.bashrc" ]; then
     . "$HOME/.bashrc"
 fi
+
+# After a console login, bring up the desktop.  startxfce runs in the
+# foreground: when the session ends the shell underneath is still there.
+if [ -x /usr/bin/startxfce ]; then
+    /usr/bin/startxfce
+fi

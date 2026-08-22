@@ -593,3 +593,10 @@ void vmm_switch_kernel(void)
 {
     asm volatile("mov %0, %%cr3" :: "r"(g_kernel_pml4_phys) : "memory");
 }
+
+addrspace_t *vmm_kernel_as(void)
+{
+    static addrspace_t k = { .pml4_phys = 0, .refs = 1 };
+    k.pml4_phys = g_kernel_pml4_phys;
+    return &k;
+}

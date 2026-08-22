@@ -119,9 +119,13 @@ static int load_elf(addrspace_t *as, const uint8_t *img, uint32_t size,
             eh->e_phoff < ph->p_offset + ph->p_filesz)
             phdr_vaddr = base + ph->p_vaddr + (eh->e_phoff - ph->p_offset);
 
-        /* We map every segment writable: the loader has to be able to fill
-         * it in, and without per-segment W^X enforcement there is nothing to
-         * be gained by taking the permission away again afterwards. */
+        /* We map every segment writable for the fill-in below; read-only
+         * segments get their write permission taken back afterwards.  The
+         * dynamic linker's symbol tables (.hash/.gnu.hash/.dynsym/.dynstr)
+         * live in a read-only LOAD segment; leaving it writable lets any
+         * stray relocation write silently corrupt find_sym(), after which
+         * the loader bounces between __dls2b and reloc_all forever instead
+         * of ever reaching the app (observed for every dynamic binary). */
         unsigned flags = VM_USER | VM_WRITE;
         if (ph->p_flags & ELF_PF_X)
             flags |= VM_EXEC;
@@ -134,6 +138,16 @@ static int load_elf(addrspace_t *as, const uint8_t *img, uint32_t size,
             !vmm_copy_to_user(as, base + ph->p_vaddr,
                               img + ph->p_offset, ph->p_filesz))
             return -1;
+
+        /* Take back write on segments the ELF marks read-only.  PROT_READ=1,
+         * PROT_EXEC=4 (loader.c does not include sysnum.h). */
+        if (!(ph->p_flags & ELF_PF_W)) {
+            uint64_t prot = 1;
+            if (ph->p_flags & ELF_PF_X)
+                prot |= 4;
+            vmm_protect(as, base + ph->p_vaddr,
+                        (ph->p_memsz + 0xFFF) & ~0xFFFULL, prot);
+        }
     }
 
     /* A PT_INTERP segment names the dynamic linker to hand the entry point

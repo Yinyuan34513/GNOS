@@ -140,6 +140,14 @@ void ap_main(int cpu)
         "ltr %%ax\n\t"
         : : "i"(SEL_KDATA), "i"(SEL_TSS) : "rax", "memory");
 
+    /* `mov %ax,%gs` zeroed IA32_GS_BASE (long-mode selector reload); restore
+     * the per-CPU pointer set above or cpu_self() faults at address 0. */
+    g_cpu[cpu].self = &g_cpu[cpu];
+    asm volatile("wrmsr" :: "c"((uint32_t)IA32_GS_BASE),
+                            "a"((uint32_t)(base & 0xFFFFFFFFu)),
+                            "d"((uint32_t)(base >> 32))
+                 : "memory");
+
     /* The shared IDT is a safety net until interrupts come on. */
     idt_load();
 
