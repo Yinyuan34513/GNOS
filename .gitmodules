@@ -1,0 +1,21 @@
+[submodule "32os"]
+	path = 32os
+	url = https://github.com/Yinyuan34513/32os.git
+[submodule "DE-CPOS"]
+	path = DE-CPOS
+	url = https://github.com/deeplearning-corporation/DE-CPOS.git
+[submodule "FastOS"]
+	path = FastOS
+	url = https://github.com/laolizhennui/FastOS.git
+[submodule "MWOS"]
+	path = MWOS
+	url = https://github.com/McLDY/MWOS.git
+[submodule "SpiritFoxOS"]
+	path = SpiritFoxOS
+	url = https://github.com/fwqfzqaz/SpiritFoxOS.git
+[submodule "TinyOS-V1"]
+	path = TinyOS-V1
+	url = https://github.com/9178nekomc/TinyOS-V1.git
+[submodule "build-your-operating-system"]
+	path = build-your-operating-system
+	url = https://github.com/deeplearning-corporation/build-your-operating-system.git
